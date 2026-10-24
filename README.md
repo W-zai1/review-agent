@@ -1,8 +1,8 @@
 # 审查 Agent 项目（Demo v0.2.7）
 
-> 来源定义：`review-agent-framework.md`（已随仓库归档，审查 Agent 框架定义 v0.2，实习 Demo 版）
+> 来源定义：`review-agent-framework.md`（已随仓库归档，审查 Agent 框架定义 v0.2，Demo 版）
 > 当前实现：v0.2.7 —— 按诊断报告修复 F1~F5 与 O1/O2/O5：事实维度补齐、规则目录哈希、服务请求防护、合同否定语境、交叉复核用例、ID 锁、日志即时落盘、回归测试。
-> 定位：个人日常 / 实习 Demo。只读、独立裁判、可举证、可迭代。**跑通一次完整审查闭环**即可。
+> 定位：个人日常 / Demo。只读、独立裁判、可举证、可迭代。**跑通一次完整审查闭环**即可。
 
 一句话：**「我不替你写，我只替你查；我给出每一条异议的出处和规则依据。」**
 
@@ -84,6 +84,12 @@ review-agent/
 tests/
 ├── test_review.py          # 审查引擎 golden / 规则状态 / 交叉复核 / 完整性回归
 └── test_api_contract.py    # 前后端接口契约测试（起真实 server.py 逐字段断言）
+state/                      # 自学习闭环的数据（刻意放在 rules/ 之外，见第 25 节）
+├── annotations.jsonl       # 人工标注（误报 / 漏检）
+├── candidates/             # 候选规则 + 门禁指标
+├── shadow/                 # 预演结果
+├── rules_log.jsonl         # 晋升 / 回滚审计（append-only）
+└── rules_snapshots/        # 晋升前的规则库快照
 agents/                     # 审查 Agent（判定标准以数据形式声明，见第 24 节）
 ├── doc-review/manifest.json        # 默认：事实/逻辑/安全/合规/风格
 └── security-audit/                 # 安全审：凭据/注入/配置/依赖
@@ -98,6 +104,7 @@ tools/
 docs/
 ├── API接口对照表.md         # 前端调用点 ↔ 后端路由 ↔ 响应契约 单一事实来源
 ├── 多Agent框架.md           # Agent 抽象：manifest 字段、如何新增 Agent、边界
+├── 自学习闭环.md             # 提案→门禁→受控晋升：威胁模型、指标口径、治理
 └── 本地模型实测报告.md      # deepseek-r1:8b 端到端实测数据与复现步骤
 ```
 
@@ -126,6 +133,13 @@ python review.py --list
 
 # 列出审查 Agent（每个 Agent = 一套判定标准）
 python review.py --list-agents
+
+# 自学习闭环：标注 → 挖掘 → 门禁 → 预演 → 晋升（见第 25 节）
+python tools/annotate.py --kind false_negative --by wang --target targets/x.txt \
+    --dimension logic --quote "同比下降 -3.2%"
+python tools/rule_miner.py mine && python tools/rule_miner.py gate AUTO-LOGIC-XXXX
+python tools/rule_promote.py shadow AUTO-LOGIC-XXXX
+python tools/rule_promote.py promote AUTO-LOGIC-XXXX --by wang
 
 # 审一份（auto：有凭据就调 LLM，否则纯规则）
 python review.py targets/answer_001.txt
@@ -822,12 +836,42 @@ python tools/ocr.py 图片.png            # 单独试跑
 | 维度 | 条数 | 说明 |
 |---|---|---|
 | fact | 4 | 数字/日期/来源可复现、口径、因果依据 |
-| **logic** | **8** | **新增**：内部一致性与论证质量 |
+| **logic** | **9** | 内部一致性与论证质量（含 1 条自动晋升规则） |
 | safety | 4 | 违法指引、隐私、prompt 注入 |
 | compliance | 4 | 合同要件、披露口径 |
 | style | 4 | emoji、口语化、情绪化、硬编码密钥 |
 
+另有安全审 Agent 专属的 14 条 `SEC-*`（不在 `rules/`，只在 `security-audit` 生效）。
+
 契约测试里的规则数断言已改为**动态计算**，以后加规则不会让测试失效。
+
+#### 执行方式：别把「给模型的提示」当成「代码在跑」
+
+`method` 字段是标签，不是执行器。所以每条规则的执行方式被显式登记在
+`tools/rule_exec.py`，并出现在**报告、接口、控制台规则表**三处：
+
+| kind | 含义 | 当前条数 |
+|---|---|---|
+| `deterministic` | 有专用执行器（事实库 / 算术 / 正则 / checklist / lint / 窄口径逻辑检查） | 23 |
+| `declarative` | 规则自带 `pattern`，由 `pattern_rules` 通用引擎执行 | 1 |
+| `prompt_only` | **只作为分维 prompt 的提示，完全靠模型判断** | 1（`LOGIC-003` 因果归因） |
+
+报告新增 `rule_execution{deterministic,declarative,prompt_only,executors}`，
+并在 `limitations` 明写「以下 N 条规则没有确定性执行器……跨次可能漂移」；
+`GET /api/rules` 每条带 `capability{kind,executor,label}` 与 `execution` 汇总。
+
+**逻辑维度的 4 条规则补上了确定性检查**（`tools/logic_checks.py`，只做能明确判定的子集）：
+
+| 规则 | 判定条件 | 置信度 |
+|---|---|---|
+| `LOGIC-004` 年龄与工龄矛盾 | `N 岁` + `M 年工龄`，N−M < 14 岁 | 0.88 |
+| `LOGIC-005` 样本代表性 | 同句「抽样 + 样本量」在前、「所有/全体」在后 | 0.72 |
+| `LOGIC-006` 结论与正文冲突 | 结论用「一致同意/全部通过」+ 正文有「待确认/保留意见」 | 0.74 |
+| `LOGIC-008` 绝对化表述 | `100%/零缺陷` + 同句（排除自身后）出现竞品/投诉等反证 | 0.76 |
+
+三条防误报的口径：**目标/承诺语境不算事实**（「目标 100%」不报）、
+**否定语境不算风险**（「不存在风险」不报）、**排除绝对化表述自身**
+（否则「没有对手」会被当成反证词，构成循环论证）。
 
 ### 20.5 质量评测：别只看「命中几条」（`tools/eval_review.py`）
 
@@ -1133,4 +1177,51 @@ integrity 新增 `agent_dir_hash / agent_version`：**改 manifest 或自带检�
 
 完整设计、新增 Agent 的 5 个步骤、以及这套抽象的边界，见
 [`docs/多Agent框架.md`](docs/多Agent框架.md)。
+
+---
+
+## 25. 自学习闭环：提案 → 门禁 → 受控晋升（v0.6.0）
+
+「审查后如果有新的审查方向，能加进规则库」——方向对，但**不能是「审查完自动写规则」**。
+一旦被审文档能影响规则，被审对象就获得了修改裁判尺度的能力（第二轮 c04 已经证明
+文档里的注入句式能操控审查语义）。所以做成了：
+
+```
+人工标注（唯一可信信号）→ 挖掘聚类（数字泛化）→ 全语料门禁 → 预演 → 晋升/回滚
+```
+
+**四条结构约束**
+
+1. 候选在 `state/candidates/`，**不在 `rules/`**（`rules/` 是被哈希覆盖的受审目录）；
+2. `review.py` 里没有任何写 `rules/` 的代码；
+3. **HTTP 面上没有写规则的能力**：`/api/annotations` 只写标注，`/api/learning` 只读；
+   写库只有 `tools/rule_promote.py` 一条路径（契约测试锁住）；
+4. 只增不改不删，`rule_id` 已存在即拒绝。
+
+**门禁指标**（全语料 43 份，带候选 vs 不带）
+
+| 指标 | 门槛 | 为什么 |
+|---|---|---|
+| `hit_doc_count` | ≥2 | 单文档学出来的规则必然过拟合 |
+| `offtarget_count` | **0** | 误报的代价是"人不再看清单"，一条就拒绝 |
+| `suppressed_others` | ≤0 | 新规则不该改变别的判定的可见性（`COMP-004` 的既定去重除外） |
+
+**实测（`targets/learning_demo/`，两类真实漏检）**
+
+| 候选 | 结果 |
+|---|---|
+| 「同比下降 -3.2%」类 | **通过** → 已晋升为 `AUTO-LOGIC-BE1B78`，真实审查中生效 |
+| 「占比合计 110%」类 | **被拒**：它把数字自洽的对照组（合计 100%）也报了 → 只学了措辞没学语义 |
+
+**审批分级**：`safety/compliance/fact` 只能人工确认（`--confirm-manual`）；
+`logic/style` 可走 `--auto`，但每周 ≤3 条、严重度上限 minor。
+
+**治理**：每次写库都 快照 → 只新增 → `rules_version` 自增 → 追加审计行；
+`rollback` 可一键回退。不升版本就改 `rules/` 会被判为篡改（红），升了版本历史报告转 stale（黄）。
+
+> 这套机制当场抓到我自己一次违规：改完 Agent 目录忘了升 manifest 版本，
+> 已有报告立刻被判「疑似判定标准被改」。
+
+**它不是机器学习**：没有模型、不学语义，只做「人工标注 → 措辞模板 → 门禁过滤」的
+监督式规则归纳。局限与风险写在 [`docs/自学习闭环.md`](docs/自学习闭环.md) 第 8 节。
 
