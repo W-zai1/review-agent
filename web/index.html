@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>审查 Agent 控制台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 顶部导航 -->
+<div class="nav">
+  <div class="nav-left">
+    <div class="logo">R</div>
+    <div class="nav-title">审查 Agent 控制台</div>
+    <div class="nav-tabs">
+      <button class="nav-tab active" data-tab="review">审查台</button>
+      <button class="nav-tab" data-tab="rules">规则库</button>
+      <button class="nav-tab" data-tab="logs">审计日志</button>
+      <button class="nav-tab" data-tab="ledger">校验 Ledger</button>
+    </div>
+  </div>
+  <div class="nav-right">
+    <button class="llm-pill" id="llmPill" type="button" title="配置大模型 API">
+      <span class="status-dot dot-gray" id="llmDot"></span>
+      <span id="llmText">LLM 未配置</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" type="button" title="深色模式（开发中）">🌙</button>
+  </div>
+</div>
+
+<!-- LLM 未配置横幅 -->
+<div class="llm-banner hidden" id="llmBanner">
+  ⚠️ 检测到 LLM 模型未配置，「运行审查」按钮已暂停使用。配置后即可开始审查。
+  <button type="button" id="llmBannerBtn">立即配置</button>
+</div>
+
+<div class="container">
+
+  <!-- ========== TAB 1: 审查台 ========== -->
+  <div class="page active" id="page-review">
+    <div class="grid-review">
+
+      <!-- 左栏：上传 -->
+      <div class="card">
+        <div class="card-title">待审对象</div>
+        <div class="upload-box" id="uploadBox">
+          <div class="upload-icon">📄</div>
+          <div>拖拽文件到这里，或点击上传</div>
+          <div class="upload-hint">支持 UTF-8 文本 / 代码（≤ 2 MB）· PDF / Word / 图片 / ZIP（≤ 20 MB）</div>
+        </div>
+        <input type="file" id="fileInput" class="hidden"
+               accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
+
+        <div class="file-chip hidden" id="fileChip">
+          <div>
+            <div id="fileName"></div>
+            <div class="file-meta" id="fileMeta"></div>
+          </div>
+          <span class="remove" id="fileRemove" title="移除文件">✕</span>
+        </div>
+
+        <div class="pick-row">
+          <label for="targetSelect">或从已有对象选择</label>
+          <select id="targetSelect"></select>
+        </div>
+
+        <div class="pick-row">
+          <label for="agentSelect">审查 Agent（判定标准）</label>
+          <select id="agentSelect">
+            <option value="auto">自动路由（推荐）</option>
+          </select>
+          <div class="agent-hint" id="agentHint">按文件类型自动选择 Agent</div>
+        </div>
+
+        <button class="btn btn-primary" id="runBtn" type="button" disabled>运行审查（需配置 LLM）</button>
+        <button class="btn btn-example" id="exampleBtn" type="button">✨ 用示例文件试跑</button>
+      </div>
+
+      <!-- 中栏：进度 + 结果 -->
+      <div class="card">
+        <div class="card-title">审查进度与裁定</div>
+
+        <div class="progress-card hidden" id="progressCard">
+          <div class="progress-title" id="progressTitle">等待开始审查…</div>
+          <div class="steps" id="steps"></div>
+        </div>
+
+        <div class="empty-state" id="resultEmpty">
+          <div class="empty-ico">🔍</div>
+          <div>还没有审查结果</div>
+          <div class="empty-sub">选择文件后运行审查，或点击历史报告查看往期裁定。</div>
+        </div>
+
+        <div id="resultView" class="hidden">
+          <div class="result-caption" id="resultCaption"></div>
+          <div id="verdictBanner"></div>
+
+          <div id="annotatedBlock" class="anno-block hidden">
+            <div class="anno-head">
+              <span class="anno-title">原文标注</span>
+              <span class="anno-legend" id="annoLegend"></span>
+              <span class="anno-hint" id="annoHint"></span>
+            </div>
+            <div class="anno-text" id="annotatedText"></div>
+          </div>
+
+          <div id="summaryBlock" class="summary-block hidden">
+            <div class="anno-title">问题汇总 · 按类型归类</div>
+            <div id="issueSummary"></div>
+          </div>
+
+          <div id="issueList"></div>
+          <div id="excludedBlock" class="limitations hidden"></div>
+          <div id="limitations" class="limitations hidden"></div>
+        </div>
+      </div>
+
+      <!-- 右栏：历史 -->
+      <div class="card">
+        <div class="card-title" id="historyTitle">历史报告（0）</div>
+        <div id="historyList"></div>
+        <div class="legend">
+          <span><span class="status-dot dot-red"></span> FAIL</span>
+          <span><span class="status-dot dot-yellow"></span> WARN</span>
+          <span><span class="status-dot dot-green"></span> PASS</span>
+        </div>
+        <div class="integrity-bar" id="integrityBar">加载中…</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ========== TAB 2: 规则库 ========== -->
+  <div class="page" id="page-rules">
+    <div class="card">
+      <div class="card-title" id="rulesTitle">规则库</div>
+      <div class="filter-bar" id="ruleFilters">
+        <button class="filter-chip active" data-dim="all" type="button">全部</button>
+        <button class="filter-chip" data-dim="fact" type="button">事实审查</button>
+        <button class="filter-chip" data-dim="safety" type="button">安全审查</button>
+        <button class="filter-chip" data-dim="compliance" type="button">合规审查</button>
+        <button class="filter-chip" data-dim="style" type="button">风格审查</button>
+      </div>
+      <table class="rules">
+        <thead>
+          <tr>
+            <th style="width:110px;">规则 ID</th>
+            <th style="width:90px;">维度</th>
+            <th>规则描述</th>
+            <th style="width:90px;">严重度</th>
+            <th style="width:60px;">启用</th>
+          </tr>
+        </thead>
+        <tbody id="rulesBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ========== TAB 3: 审计日志 ========== -->
+  <div class="page" id="page-logs">
+    <div class="card">
+      <div class="logs-head">
+        <div class="card-title" id="logsTitle">审计日志</div>
+        <select id="logSelect" class="log-select"></select>
+      </div>
+
+      <div class="log-subtabs">
+        <button class="log-subtab active" data-log="task" type="button">任务日志</button>
+        <button class="log-subtab" data-log="decision" type="button">决策日志</button>
+        <button class="log-subtab" data-log="tool" type="button">工具日志</button>
+        <button class="log-subtab" data-log="cost" type="button">成本日志</button>
+      </div>
+
+      <div class="log-content active" id="log-task"></div>
+      <div class="log-content" id="log-decision"></div>
+      <div class="log-content" id="log-tool"></div>
+      <div class="log-content" id="log-cost"></div>
+    </div>
+  </div>
+
+  <!-- ========== TAB 4: 校验 Ledger ========== -->
+  <div class="page" id="page-ledger">
+    <div class="card">
+      <div class="card-title">Ledger 审计链校验</div>
+      <div class="ledger-intro" id="ledgerIntro">当前链状态：加载中…</div>
+      <div class="chain-visual" id="chainVisual"></div>
+      <div class="verify-result" id="verifyResult"></div>
+      <div class="ledger-meta" id="ledgerMeta"></div>
+    </div>
+  </div>
+
+</div>
+
+<footer class="footer">
+  审查 Agent Demo · SHA-256 防无意改动与事后抵赖 · 防恶意篡改需数字签名（v1.0）
+</footer>
+
+<div id="toast" class="toast hidden"></div>
+
+<!-- LLM 配置弹窗 -->
+<div id="llmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="llmTitle">
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <div>
+        <h2 id="llmTitle">大模型 API 配置</h2>
+        <p class="modal-sub">OpenAI 兼容端点。保存后立即生效，审查时按维度调用；不配置则纯规则审。</p>
+      </div>
+      <button type="button" class="icon-btn" id="llmClose" title="关闭" aria-label="关闭">✕</button>
+    </div>
+
+    <form id="llmForm" novalidate>
+      <label class="form-field">
+        <span>服务商</span>
+        <select id="llmProvider"></select>
+      </label>
+      <div class="provider-hint" id="providerHint"></div>
+
+      <label class="form-field">
+        <span>Base URL</span>
+        <input id="llmBaseUrl" type="url" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="form-field">
+        <span>模型</span>
+        <input id="llmModel" type="text" list="llmModelList" placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
+        <datalist id="llmModelList"></datalist>
+      </label>
+      <label class="form-field">
+        <span>API Key</span>
+        <input id="llmKey" type="password" placeholder="留空表示保留已保存的 Key" autocomplete="new-password">
+      </label>
+      <label class="check"><input type="checkbox" id="llmClearKey"> 清除已保存的 Key</label>
+      <label class="check"><input type="checkbox" id="llmEnabled"> 启用大模型语义审（关闭则纯规则）</label>
+
+      <div class="llm-history hidden" id="llmHistoryWrap">
+        <div class="llm-history-title">最近使用（点击可切回）</div>
+        <div class="llm-history-list" id="llmHistoryList"></div>
+      </div>
+
+      <details class="advanced">
+        <summary>高级</summary>
+        <div class="advanced-grid">
+          <label class="form-field"><span>超时（秒）</span><input id="llmTimeout" type="number" min="1" max="600" step="1"></label>
+          <label class="form-field"><span>max_tokens</span><input id="llmMaxTokens" type="number" min="16" max="8192" step="1"></label>
+        </div>
+      </details>
+
+      <div class="llm-status" id="llmStatusLine">加载中…</div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn-ghost" id="llmReset">恢复默认</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn-ghost" id="llmTest">测试连接</button>
+        <button type="submit" class="btn-save" id="llmSave">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- 删除历史报告：二次确认 -->
+<div id="confirmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <div>
+        <h2 id="confirmTitle">确认删除历史报告</h2>
+        <p class="modal-sub" id="confirmSub"></p>
+      </div>
+      <button type="button" class="icon-btn" id="confirmClose" title="关闭" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="confirm-warn">
+      此操作不可撤销（可在回收区自行找回），具体影响：
+      <ul>
+        <li>报告 JSON / Markdown 与审查日志移入 <code>outputs/.trash/</code></li>
+        <li>审计链上该节点标记为「已删除」，链的衔接保持不变、不会断裂</li>
+        <li>该报告将从历史列表与台账清单中消失</li>
+      </ul>
+    </div>
+
+    <div class="modal-actions">
+      <span class="spacer"></span>
+      <button type="button" class="btn-ghost" id="confirmCancel">取消</button>
+      <button type="button" class="btn-danger" id="confirmOk">确认删除</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/config.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

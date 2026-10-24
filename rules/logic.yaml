@@ -1,0 +1,71 @@
+# rules/logic.yaml —— 逻辑与内部一致性审（v0.3.2）
+#
+# 这类问题**无法用正则发现**（正则看不到"两句话互相矛盾"），
+# 必须由 LLM 逐条比对原文内部的自相矛盾之处。
+# 因此本文件的作用是：给 LLM 一个**合法依据**，让它有资格提出这些发现，
+# 而不是让它在"只许报这 16 条规则"的闭集里被迫去引用规则描述。
+#
+# 严重度说明：blocker = 会直接导致结论错误或对外表述失实；major = 关键事实/论证不成立。
+- rule_id: LOGIC-001
+  dimension: logic
+  desc: 同一指标或同一对象在文本中出现互斥数值/口径时必须指出（如总额与分项合计不符、同期数据前后不一致、同一指标两个不同数字）
+  method: cross_numeric_consistency
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-002
+  dimension: logic
+  desc: 时间线自相矛盾必须指出（如立项时间与投入月数不符、事件先后顺序颠倒、同一时段出现在两个地点、日期与星期/年份推算不符）
+  method: timeline_consistency
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-003
+  dimension: logic
+  desc: 因果归因与正文证据不匹配时必须指出（时序不支持因果、证据强度不足以支撑结论强度、把同时发生当作因果）
+  method: causal_support
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-004
+  dimension: logic
+  desc: 与常识或物理约束冲突时必须指出（如不可能的通勤/航行时间、年龄与工龄矛盾、常识不成立的量级）
+  method: common_sense_constraint
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-005
+  dimension: logic
+  desc: 样本代表性与结论普适性不匹配时必须指出（如仅调查特定群体却宣称整体满意度、样本量与结论范围不匹配）
+  method: sampling_validity
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-006
+  dimension: logic
+  desc: 结论与正文证据冲突时必须指出（正文已被他人反驳或纠正的说法仍被写入结论、结论与正文相反、会后"会后再对齐"却当场定论）
+  method: conclusion_vs_body
+  severity: blocker
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-007
+  dimension: logic
+  desc: 人物属性前后矛盾时必须指出（入职时间与参与经历冲突、所属部门/职责归属冲突、对他人事实的陈述与已知信息冲突）
+  method: entity_consistency
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false
+
+- rule_id: LOGIC-008
+  dimension: logic
+  desc: 绝对化表述与文中事实冲突时必须指出（如宣称占有率 100%/无对手同时又描述竞品存在、宣称无问题同时又承认有问题）
+  method: absolute_claim_conflict
+  severity: major
+  source: 逻辑一致性基线 v1
+  auto_fix: false

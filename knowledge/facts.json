@@ -1,0 +1,35 @@
+{
+  "version": "事实库 v1",
+  "updated": "2026-10-22",
+  "assertions": [
+    {
+      "entity": "豆包",
+      "attr": "月活",
+      "type": "number",
+      "expected": {
+        "num": 1,
+        "unit": "亿"
+      },
+      "tolerance": 2,
+      "rule_id": "FACT-001",
+      "note": "公开披露口径：豆包 App MAU 约 1 亿量级（截至 2024 年），非 10 亿；「豆包大模型/API」是另一产品线，口径不同，不做比对。",
+      "exclude_ctx": [
+        "大模型",
+        "模型",
+        "API",
+        "开放平台",
+        "接口",
+        "调用量",
+        "企业版"
+      ]
+    },
+    {
+      "entity": "豆包",
+      "attr": "推出",
+      "type": "date",
+      "expected_year": 2023,
+      "rule_id": "FACT-001",
+      "note": "豆包由字节跳动于 2023 年推出。"
+    }
+  ]
+}

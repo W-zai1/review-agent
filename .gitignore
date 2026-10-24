@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 本地 LLM 配置（含明文 Key，不要提交）
+config/llm.local.json
+config/llm.local.json.tmp
+
+# 规则启停状态（运行时生成）
+config/rules.state.json
+config/rules.state.json.tmp
+
+# 运行日志
+logs/console-boot.log
+
+# review_id 分配锁（正常会自动删除，异常退出时遗留）
+outputs/.R-*.lock
+
+# 控制台上传的待审文件
+targets/uploads/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+cache/
+
+# ---------- 以下为公开仓库排除项（仅推源码与核心文档） ----------
+# 审查运行产物
+outputs/
+ledger/
+logs/
+docs/*.png
+docs/*.jpg
+
+# 测试/对抗样本与报告（含系统漏洞细节，不公开）
+targets/
+tests/fixtures_v3/
+tests/*.log
+tests/net_probe.txt
+对抗测试·第二轮·系统漏洞报告.md
+对抗测试·第三轮·系统漏洞报告.md
+对抗测试·错误植入对照表.md
+方案诊断报告.md
+压力测试报告·长文本审查.md
+诊断全景图.html
+
+# 本地工具状态
+.workbuddy/
+agents/

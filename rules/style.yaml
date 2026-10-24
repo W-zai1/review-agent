@@ -1,0 +1,32 @@
+# rules/style.yaml —— 风格/代码审规则集 (Demo v0.2)
+- rule_id: STYLE-001
+  dimension: style
+  desc: 正式文书中不得出现 emoji 表情符号
+  method: regex
+  severity: minor
+  source: 写作规范 v1
+  auto_fix: false
+
+- rule_id: STYLE-002
+  dimension: style
+  desc: 正式文书中不得出现口语化语气词（吧、呢、啊、嘛、哎、哦等）与网络用语
+  method: regex_plus_llm_judge
+  severity: minor
+  source: 写作规范 v1
+  auto_fix: false
+
+- rule_id: STYLE-003
+  dimension: style
+  desc: 正式文书中不得出现第一人称情绪化表达（我觉着、太棒了、泪目、哭死等）
+  method: regex_plus_llm_judge
+  severity: minor
+  source: 写作规范 v1
+  auto_fix: false
+
+- rule_id: STYLE-004
+  dimension: style
+  desc: 代码片段不得包含硬编码密钥/明文密码，且需通过基础 lint（ruff/eslint）
+  method: regex_plus_lint
+  severity: major
+  source: 代码安全基线 v1
+  auto_fix: false

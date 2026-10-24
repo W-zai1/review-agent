@@ -1,0 +1,32 @@
+# rules/compliance.yaml —— 合规审规则集 (Demo v0.2)
+- rule_id: COMP-001
+  dimension: compliance
+  desc: 合同/协议中须明确双方主体（甲方/乙方或可识别的法人名称），缺失主体视为无效要件
+  method: clause_presence_check
+  severity: major
+  source: 合同审查基线 v1
+  auto_fix: false
+
+- rule_id: COMP-002
+  dimension: compliance
+  desc: 须包含生效与终止条款（生效条件、有效期、终止方式），缺失影响可执行性
+  method: clause_presence_check
+  severity: major
+  source: 合同审查基线 v1
+  auto_fix: false
+
+- rule_id: COMP-003
+  dimension: compliance
+  desc: 须包含争议解决条款（仲裁/诉讼管辖），缺失将导致纠纷无据可依
+  method: clause_presence_check
+  severity: major
+  source: 合同审查基线 v1
+  auto_fix: false
+
+- rule_id: COMP-004
+  dimension: compliance
+  desc: 披露具体数据/统计结论时须标注口径与时间，且给出可核查来源，禁止裸数据无出处
+  method: source_presence_check
+  severity: minor
+  source: 披露规范 v1
+  auto_fix: false

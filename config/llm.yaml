@@ -1,0 +1,38 @@
+# config/llm.yaml —— 大模型 API 配置（OpenAI 兼容）
+#
+# 只填 base_url / model，密钥请用环境变量：
+#   Windows:  set REVIEW_AGENT_LLM_API_KEY=sk-xxxx
+#   macOS/Linux: export REVIEW_AGENT_LLM_API_KEY=sk-xxxx
+#
+# 常见端点：
+#   DeepSeek     https://api.deepseek.com/v1          model: deepseek-chat
+#   OpenAI       https://api.openai.com/v1            model: gpt-4o-mini
+#   Ollama(本地) http://127.0.0.1:11434/v1            model: qwen2.5:7b
+#   任意兼容网关 https://your-gateway.example.com/v1   model: 按网关文档
+#
+# enabled:
+#   auto  —— 有可用凭据（或本地端点）才调用，否则纯规则审（默认）
+#   true  —— 强制尝试（无凭据会降级并在日志里记失败）
+#   false —— 关闭，等价于 --no-llm
+
+enabled: auto
+
+base_url: "https://api.deepseek.com/v1"
+model: "deepseek-chat"
+
+# 不建议在文件里写明文密钥；留空则只读环境变量
+api_key: ""
+
+timeout: 40              # 单次请求超时（秒）
+max_retries: 2           # 失败重试次数（429/5xx/网络错误）
+temperature: 0           # 审查要稳定，建议 0
+max_tokens: 4096         # 单次返回上限（结构化 JSON 输出建议 ≥4096，否则会被截断）
+max_input_chars: 12000   # 单次送审的字符上限（分块时也是每块的上限）
+chunking: true           # 长文按段落分块送审（true=不截断，成本换覆盖）
+chunk_overlap: 400       # 相邻块重叠字符数，避免把句子切两半
+chunk_chars: 6000        # 每块字符数（太小费钱，太大单块输出会被 max_tokens 截断）
+cache: true              # 语义审结果缓存：同原文+同规则+同模型重审不再重复调用
+max_issues_per_dim: 5    # 每个维度最多采纳的 LLM 异议数
+
+# 额外请求头（一般不用改）
+headers: {}

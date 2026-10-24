@@ -1,0 +1,33 @@
+# rules/fact.yaml —— 事实审规则集 (Demo v0.2)
+# 每条规则都是独立 YAML 条目，禁止把规则散落在 prompt 里。
+- rule_id: FACT-001
+  dimension: fact
+  desc: 涉及具体数字、日期、人名、机构名的陈述，必须能在知识库/可检索来源中复现，且与口径一致
+  method: retrieve_then_compare
+  severity: blocker        # blocker / major / minor / nit
+  source: 审查内部事实库 v1
+  auto_fix: false
+
+- rule_id: FACT-002
+  dimension: fact
+  desc: 引用来源（数据、结论、研究）必须可定位，禁止凭空给出无出处的断言
+  method: source_presence_check
+  severity: minor
+  source: 审查内部事实库 v1
+  auto_fix: false
+
+- rule_id: FACT-003
+  dimension: fact
+  desc: 因果关系或推断性结论（"因此""说明""意味着"）必须有明确前提支撑，禁止无依据归因
+  method: causal_claim_check
+  severity: major
+  source: 审查内部事实库 v1
+  auto_fix: false
+
+- rule_id: FACT-004
+  dimension: fact
+  desc: 百分比/倍数/量级陈述需核对单位与统计口径，禁止混淆"环比/同比""累计/单季"等口径
+  method: unit_caliber_check
+  severity: major
+  source: 审查内部事实库 v1
+  auto_fix: false

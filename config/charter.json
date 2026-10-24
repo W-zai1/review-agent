@@ -1,0 +1,9 @@
+{
+  "_comment": "审查任务书：告诉 Agent 这次要判定什么、标准是什么、后果多大。改完直接生效（下次审查时读）。留空字段用内置默认。",
+  "purpose": "",
+  "audience": "内部",
+  "consequence": "medium",
+  "strictness": "standard",
+  "focus": [],
+  "notes": ""
+}
