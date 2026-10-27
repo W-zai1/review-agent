@@ -44,6 +44,13 @@
 
 # 2026-10-27
 
+### 2026-10-27 · 修改 · 公开推送清理：.gitignore 追加排除测试/报告/运行态并推送 GitHub
+
+- **文件**：`.gitignore`、`CHANGELOG.md`（+ git 索引 `git rm --cached`）
+- **改了什么**：① `.gitignore` 追加「公开推送补充排除」段：`tests/`、`targets/`、`config/llm_history.json` / `learning.json` / `report_order.json`、`docs/修复报告-*.md`、`docs/本地模型实测报告.md`、`docs/盲测协议.md`、根目录 `回归测试·*.md` / `对抗测试·*.md` / `暴力测试·*.md` / `格式合规测试·*.md` / `调教报告·*.md`、`测试结果面板/`、`裁定结果样本/`；② `git rm -r --cached tests config/llm_history.json` 解除 14 项历史跟踪（文件保留本地）；③ 新提交 `cc05de4`（feat: docx 格式审查 + 公开推送清理）推送至 `https://github.com/W-zai1/review-agent.git`（main：524c01a..cc05de4）。
+- **为什么**：用户要求把当前版本上传到自己的 GitHub 账号（W-zai1/review-agent），并明确「不上传测试文件和相关报告」；此前 `tests/` 13 项与 `config/llm_history.json` 已在版本库中，根目录/`docs/` 的报告类 md 会在 `git add -A` 时进入推送——需要在公开仓库中彻底排除。
+- **验证**：`git status` 复核暂存清单——无 tests/、targets/、报告类 md、运行态数据，仅源码+规则+前端+核心文档；`git push origin main` 返回 `524c01a..cc05de4 main -> main`（exit 0）；`git ls-tree HEAD` 复核无排除项。
+
 ### 2026-10-27 · 新增 · 真实问题测试交付报告《格式合规测试·真实Word文档·20261027.md》
 
 - **文件**：`格式合规测试·真实Word文档·20261027.md`（新增）、`CHANGELOG.md`
