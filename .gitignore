@@ -11,6 +11,10 @@ config/llm.local.json.tmp
 config/rules.state.json
 config/rules.state.json.tmp
 
+# 历史报告收藏（个人使用偏好，运行时生成）
+config/favorites.json
+config/favorites.json.tmp
+
 # 运行日志
 logs/console-boot.log
 
@@ -49,3 +53,23 @@ tests/net_probe.txt
 # 本地工具状态
 .workbuddy/
 agents/
+
+# 运行态：标注、候选、审计、快照不进版本库（含标注人身份）
+state/
+
+# ---------- 2026-10-27 公开推送补充排除（用户要求：不上传测试文件和相关报告） ----------
+tests/
+targets/
+config/llm_history.json
+config/learning.json
+config/report_order.json
+docs/修复报告-*.md
+docs/本地模型实测报告.md
+docs/盲测协议.md
+回归测试·*.md
+对抗测试·*.md
+暴力测试·*.md
+格式合规测试·*.md
+调教报告·*.md
+测试结果面板/
+裁定结果样本/

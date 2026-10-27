@@ -30,3 +30,11 @@
   severity: major
   source: 代码安全基线 v1
   auto_fix: false
+
+- rule_id: STYLE-005
+  dimension: style
+  desc: 用词规范：表示「到某时为止」应写「截至」，「截止目前/截止当前」属误用；异形词「帐户/帐目」统一为「账户/账目」
+  method: regex
+  severity: minor
+  source: 写作规范 v1
+  auto_fix: false

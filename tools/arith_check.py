@@ -435,7 +435,47 @@ def check_tenure(text):
     }]
 
 
-CHECKS = (check_sums, check_weekdays, check_durations, check_ratios, check_tenure)
+# ---------- 6. 占比类指标超过 100%（量级越界） ----------
+# 「市场覆盖率达到 150%」不是口径问题，是数字本身不成立——占比/率的上限是 100%。
+# 但「覆盖率同比增长 150%」是合法的（增速可以超过 100%），所以必须在
+# 指标名与数字之间**排除增量类动词**，否则这条规则会变成新的误报源。
+RATIO_CAP_HEAD = re.compile(
+    r"(覆盖率|覆盖面|占比|比重|份额|市占率|合格率|通过率|完成率|达成率|"
+    r"满意度|转化率|留存率|复购率|准确率|召回率|精确率|毛利率|净利率|"
+    r"入住率|出租率|出勤率|到岗率|准时率|良品率|达标率|中签率|胜率)")
+RATIO_GROWTH = re.compile(r"(增长|提升|提高|上升|增加|同比|环比|增幅|增速|上涨|翻)")
+
+
+def check_ratio_cap(text):
+    findings = []
+    for start, seg in sentences(text):
+        for head in RATIO_CAP_HEAD.finditer(seg):
+            tail = seg[head.end(): head.end() + 14]
+            m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*[%％]", tail)
+            if not m:
+                continue
+            if RATIO_GROWTH.search(tail[:m.start()]):
+                continue        # 增速/同比可以超过 100%
+            value = float(m.group(1))
+            if value <= 100:
+                continue
+            findings.append({
+                "rule_id": "LOGIC-001",
+                "dimension": "logic",
+                "quote": seg.strip(),
+                "start": start,
+                "evidence": (f"「{head.group(0)}」= {_fmt(value)}%，超过占比类指标的上限 100%"
+                             "（确定性量级校验）"),
+                "suggestion": "核对分子分母口径；若想表达增速，请改写成「同比增长 X%」。",
+                "confidence": 0.9,
+                "tool": "arith_check:ratio_cap",
+            })
+            break
+    return findings
+
+
+CHECKS = (check_sums, check_weekdays, check_durations, check_ratios, check_tenure,
+          check_ratio_cap)
 
 
 def run_all(text, active_rule_ids=None):

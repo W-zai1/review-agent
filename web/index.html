@@ -44,10 +44,40 @@
       <!-- 左栏：上传 -->
       <div class="card">
         <div class="card-title">待审对象</div>
-        <div class="upload-box" id="uploadBox">
-          <div class="upload-icon">📄</div>
-          <div>拖拽文件到这里，或点击上传</div>
-          <div class="upload-hint">支持 UTF-8 文本 / 代码（≤ 2 MB）· PDF / Word / 图片 / ZIP（≤ 20 MB）</div>
+
+        <!-- 上传入口默认收起：左栏高度受视口限制，常驻一大块虚线框会把
+             「审查目的」「运行审查」挤到滚动区外。点按钮才展开拖拽区与格式说明。 -->
+        <button class="entry-toggle upload-toggle" id="uploadToggle" type="button"
+                aria-expanded="false" aria-controls="uploadBox">
+          <span class="entry-toggle-ico" aria-hidden="true">＋</span>
+          <span class="entry-toggle-text">
+            <b>上传文件</b>
+            <span class="entry-toggle-sub" id="uploadToggleSub">点击展开上传区，也可直接把文件拖进来</span>
+          </span>
+          <span class="entry-toggle-caret" aria-hidden="true">▾</span>
+        </button>
+
+        <div class="upload-box hidden" id="uploadBox">
+          <div class="upload-main"><span class="upload-ico">📄</span>拖拽文件到这里，或点击选择</div>
+          <div class="upload-hint">文本 ≤ 2 MB　·　文档 / 图片 / ZIP ≤ 20 MB</div>
+          <div class="upload-formats">
+            <div class="fmt-row">
+              <span class="fmt-label">文本/代码</span>
+              <span class="fmt">.txt</span><span class="fmt">.md</span><span class="fmt">.py</span><span class="fmt">.js</span><span class="fmt">.json</span><span class="fmt">.yaml</span><span class="fmt-more">等</span>
+            </div>
+            <div class="fmt-row">
+              <span class="fmt-label">文档</span>
+              <span class="fmt">.pdf</span><span class="fmt">.docx</span><span class="fmt">.doc</span><span class="fmt">.rtf</span>
+            </div>
+            <div class="fmt-row">
+              <span class="fmt-label">图片</span>
+              <span class="fmt">.png</span><span class="fmt">.jpg</span><span class="fmt">.gif</span><span class="fmt">.webp</span><span class="fmt">.tiff</span><span class="fmt">.heic</span>
+            </div>
+            <div class="fmt-row">
+              <span class="fmt-label">压缩包</span>
+              <span class="fmt">.zip</span><span class="fmt-note">递归展开 · 成员 ≤ 200</span>
+            </div>
+          </div>
         </div>
         <input type="file" id="fileInput" class="hidden"
                accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
@@ -73,12 +103,96 @@
           <div class="agent-hint" id="agentHint">按文件类型自动选择 Agent</div>
         </div>
 
-        <button class="btn btn-primary" id="runBtn" type="button" disabled>运行审查（需配置 LLM）</button>
-        <button class="btn btn-example" id="exampleBtn" type="button">✨ 用示例文件试跑</button>
+        <!-- 审查情境：同一份材料，用途不同，该问的问题不同。
+             简历初筛不核验"四六级是不是真的"（要核查只能索要原件），
+             把这类条目报出来只会淹没真正能改的矛盾。关了什么会写进报告。 -->
+        <div class="pick-row">
+          <label for="scenarioSelect">审查情境（用哪套规则）</label>
+          <select id="scenarioSelect">
+            <option value="">通用（全部规则）</option>
+          </select>
+          <div class="agent-hint" id="scenarioHint">全部规则参与（默认）</div>
+        </div>
+
+        <!-- 审查目的与上传同一套「按钮 + 展开」：收起时把已填内容写在副标题上，
+             否则用户会忘记自己设过目的（目的直接决定报告里多出一整块证据）。 -->
+        <button class="entry-toggle purpose-toggle" id="purposeToggle" type="button"
+                aria-expanded="false" aria-controls="purposePanel">
+          <span class="entry-toggle-ico" aria-hidden="true">🎯</span>
+          <span class="entry-toggle-text">
+            <b>审查目的<span class="entry-opt">可选</span></b>
+            <span class="entry-toggle-sub" id="purposeToggleSub">点击填写：这份文本想干什么</span>
+          </span>
+          <span class="entry-toggle-caret" aria-hidden="true">▾</span>
+        </button>
+
+        <div class="purpose-panel hidden" id="purposePanel">
+          <textarea id="purposeInput" rows="3" maxlength="300"
+                    placeholder="这份文本想干什么？例：这是给客户的报价邮件，帮我找有没有承诺过头的地方"></textarea>
+          <div class="purpose-hint" id="purposeHint">填了目的，报告会按目的派生审查目标并给出原文证据</div>
+
+          <!-- 目的也可以来自文件：上传说明材料（PDF/Word/图片/ZIP/文本），
+               提取文字后并入目的——长篇的审查要求不必手打 300 字。
+               交互刻意与「待审对象上传」对齐：整块虚线区可点选、可拖放、
+               可一次多选，并把支持格式直接列出来（后端白名单与待审上传同一份）。 -->
+          <div class="purpose-files" id="purposeFiles">
+            <div class="purpose-files-head">
+              <span class="purpose-files-title"><span aria-hidden="true">📎</span> 目的文件<span class="entry-opt">可选</span></span>
+              <span class="purpose-files-hint">提取文字后并入本次目的 · 每份前 2000 字 · 最多 5 个</span>
+            </div>
+
+            <button type="button" class="upload-box purpose-drop" id="purposeFileBtn"
+                    title="上传目的说明文件：PDF / Word / 图片 / ZIP / 文本，可一次多选；提取文字后并入本次审查目的">
+              <span class="upload-main"><span class="upload-ico">📎</span>拖拽文件到这里，或点击选择（可多选）</span>
+              <span class="upload-hint">审查要求 / 检查清单 / 客户邮件 · 提取文字后并入目的</span>
+              <span class="upload-formats" aria-hidden="true">
+                <span class="fmt-row">
+                  <span class="fmt-label">文本/代码</span>
+                  <span class="fmt">.txt</span><span class="fmt">.md</span><span class="fmt">.py</span><span class="fmt">.json</span><span class="fmt">.yaml</span><span class="fmt-more">等</span>
+                </span>
+                <span class="fmt-row">
+                  <span class="fmt-label">文档</span>
+                  <span class="fmt">.pdf</span><span class="fmt">.docx</span><span class="fmt">.doc</span><span class="fmt">.rtf</span>
+                </span>
+                <span class="fmt-row">
+                  <span class="fmt-label">图片</span>
+                  <span class="fmt">.png</span><span class="fmt">.jpg</span><span class="fmt">.gif</span><span class="fmt">.webp</span><span class="fmt">.tiff</span>
+                </span>
+                <span class="fmt-row">
+                  <span class="fmt-label">压缩包</span>
+                  <span class="fmt">.zip</span><span class="fmt-note">递归展开·成员并入同一目的</span>
+                </span>
+              </span>
+            </button>
+
+            <div class="purpose-file-status hidden" id="purposeFileStatus"></div>
+            <div class="purpose-file-list" id="purposeFileList"></div>
+          </div>
+          <input type="file" id="purposeFileInput" class="hidden" multiple
+                 accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
+
+          <div class="purpose-chips" id="purposeChips">
+            <button type="button" class="purpose-chip" data-purpose="这是给客户的报价邮件，帮我找有没有承诺过头的地方">承诺风险</button>
+            <button type="button" class="purpose-chip" data-purpose="帮我核对合同金额、大小写与付款条款是否一致">金额核对</button>
+            <button type="button" class="purpose-chip" data-purpose="帮我找出没有标注来源和统计口径的数据">数据来源</button>
+            <button type="button" class="purpose-chip" data-purpose="检查这份合同缺哪些必备条款、违约责任是否明确">合同要件</button>
+            <button type="button" class="purpose-chip" data-purpose="这是要对外发布的内容，找出需要改的口语化与绝对化表述">对外发布</button>
+          </div>
+          <div class="purpose-foot">
+            <span class="purpose-count" id="purposeCount">0 / 300</span>
+            <button type="button" class="purpose-clear" id="purposeClear">清空</button>
+          </div>
+        </div>
+
+        <!-- 操作按钮常驻底部：左栏内容比视口高时，按钮不能被挤到滚动区外面 -->
+        <div class="left-actions">
+          <button class="btn btn-primary" id="runBtn" type="button" disabled>运行审查（需配置 LLM）</button>
+          <button class="btn btn-example" id="exampleBtn" type="button">✨ 用示例文件试跑</button>
+        </div>
       </div>
 
       <!-- 中栏：进度 + 结果 -->
-      <div class="card">
+      <div class="card result-card">
         <div class="card-title">审查进度与裁定</div>
 
         <div class="progress-card hidden" id="progressCard">
@@ -92,33 +206,66 @@
           <div class="empty-sub">选择文件后运行审查，或点击历史报告查看往期裁定。</div>
         </div>
 
+        <!-- 结果区：一块完整的「裁定」界面，模块自上而下
+             ① 状态条 —— 这份东西能不能用；② 审查目的 —— 拿什么标准判；
+             ③ 裁定 —— 逐项结论；④ 对照矩阵 —— 要求与候选的硬对照；
+             ⑤ 证据 / 原文标注 / 问题汇总 / 问题清单 —— 支撑结论的原文。
+             结构对齐「裁定结果样本/审查进度与裁定-简洁版.html」：审查一结束
+             renderReport() 直接渲染这一套，不再先出一版旧样式再改。 -->
         <div id="resultView" class="hidden">
-          <div class="result-caption" id="resultCaption"></div>
-          <div id="verdictBanner"></div>
+          <div class="rs-bar" id="rsStatus"></div>
 
-          <div id="annotatedBlock" class="anno-block hidden">
+          <section class="rs-sec hidden" id="purposeBlock"></section>
+          <section class="rs-sec hidden" id="verdictBlock"></section>
+          <section class="rs-sec hidden" id="matrixBlock"></section>
+          <section class="rs-sec hidden" id="evidenceBlock"></section>
+
+          <section class="rs-sec anno-block hidden" id="annotatedBlock">
             <div class="anno-head">
               <span class="anno-title">原文标注</span>
               <span class="anno-legend" id="annoLegend"></span>
               <span class="anno-hint" id="annoHint"></span>
+              <span class="anno-learn">
+                <select id="annoDim" title="漏检问题的维度">
+                  <option value="logic">逻辑</option>
+                  <option value="fact">事实</option>
+                  <option value="compliance">合规</option>
+                  <option value="safety">安全</option>
+                  <option value="style">风格</option>
+                </select>
+                <button class="btn-anno" id="annoMissBtn" type="button"
+                        title="先在原文中选中一句有问题的文字，再点这里">标注漏检</button>
+              </span>
             </div>
             <div class="anno-text" id="annotatedText"></div>
-          </div>
+          </section>
 
-          <div id="summaryBlock" class="summary-block hidden">
+          <section class="rs-sec summary-block hidden" id="summaryBlock">
             <div class="anno-title">问题汇总 · 按类型归类</div>
             <div id="issueSummary"></div>
-          </div>
+          </section>
 
-          <div id="issueList"></div>
-          <div id="excludedBlock" class="limitations hidden"></div>
-          <div id="limitations" class="limitations hidden"></div>
+          <section class="rs-sec hidden" id="issueList"></section>
+
+          <div id="excludedBlock" class="rs-sec limitations hidden"></div>
+          <div id="limitations" class="rs-sec limitations hidden"></div>
+
+          <div class="rs-tech" id="rsTech"></div>
         </div>
       </div>
 
       <!-- 右栏：历史 -->
       <div class="card">
-        <div class="card-title" id="historyTitle">历史报告（0）</div>
+        <div class="card-title history-head">
+          <span id="historyTitle">历史报告（0）</span>
+          <span class="history-tools">
+            <button type="button" class="history-fav-filter" id="historyFavFilter"
+                    aria-pressed="false"
+                    title="只看收藏过的报告；再点一次回到全部">★ 收藏</button>
+            <button type="button" class="history-refresh" id="historyRefresh"
+                    title="重新拉取历史报告列表（在命令行或其他窗口跑完审查后，本页不会自己知道）">⟳ 刷新</button>
+          </span>
+        </div>
         <div id="historyList"></div>
         <div class="legend">
           <span><span class="status-dot dot-red"></span> FAIL</span>
@@ -134,7 +281,18 @@
   <!-- ========== TAB 2: 规则库 ========== -->
   <div class="page" id="page-rules">
     <div class="card">
-      <div class="card-title" id="rulesTitle">规则库</div>
+      <div class="rules-head">
+        <div class="card-title" id="rulesTitle">规则库</div>
+        <!-- 右上角：待人工审核的规则候选。数量 = 门禁没拒、也还没人下决定的那些。 -->
+        <button class="pending-toggle" id="pendingToggle" type="button"
+                aria-expanded="false" aria-controls="pendingPanel"
+                title="学习闭环产出的候选规则，必须先由人看过类型与证据才能晋升">
+          <span class="pending-dot" aria-hidden="true"></span>
+          <span>待人工审核</span>
+          <span class="pending-badge" id="pendingBadge">0</span>
+        </button>
+      </div>
+      <div class="pending-panel" id="pendingPanel" hidden></div>
       <div class="filter-bar" id="ruleFilters">
         <button class="filter-chip active" data-dim="all" type="button">全部</button>
         <button class="filter-chip" data-dim="fact" type="button">事实审查</button>
@@ -149,6 +307,7 @@
             <th style="width:90px;">维度</th>
             <th>规则描述</th>
             <th style="width:90px;">严重度</th>
+            <th style="width:120px;" title="确定性=代码执行；声明式=pattern 引擎执行；仅提示=只给模型的提示">执行方式</th>
             <th style="width:60px;">启用</th>
           </tr>
         </thead>

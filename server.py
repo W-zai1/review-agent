@@ -7,7 +7,7 @@ server.py —— 审查 Agent 本地 Web 控制台（零依赖，仅标准库）
   GET  /                          -> web/index.html
   GET  /static/<path>             -> web/ 下的静态资源
   GET  /api/targets               -> 列出 targets/ 与 targets/uploads/ 下待审文件
-  GET  /api/reports               -> 列出 outputs/ 下历史报告（按用户自定义顺序）
+  GET  /api/reports               -> 列出 outputs/ 下历史报告（按时间倒序，最新在最前）
   GET  /api/report?id=R-xxx       -> 读取单份报告 JSON
   DELETE /api/report?id=R-xxx     -> 删除单份报告（须 body 传 confirm=id 二次确认）
   GET  /api/integrity             -> 校验 ledger 链 + 每份报告自洽
@@ -18,8 +18,13 @@ server.py —— 审查 Agent 本地 Web 控制台（零依赖，仅标准库）
   GET  /api/llm/providers         -> 常见服务商 / 本地模型预设
   POST /api/rules/toggle          -> 启用/停用某条规则
   POST /api/upload?name=x.txt     -> 上传 UTF-8 文本到 targets/uploads/
+  POST /api/purpose/upload?name=x -> 上传「审查目的」说明文件（多格式，摄取成文本后暂存）
+  GET  /api/purpose/files         -> 列出暂存的目的文件（不含原文）
+  DELETE /api/purpose/files?id=x  -> 删除一个暂存的目的文件
   POST /api/review/start          -> 启动异步审查（带 S1~S6 进度）
-  POST /api/reports/order         -> 保存历史报告的拖拽排序结果
+  POST /api/reports/favorite      -> 收藏 / 取消收藏一份历史报告
+  GET  /api/scenarios             -> 列出审查情境（不同用途关掉不同规则）
+
   POST /api/llm/config            -> 保存前端配置到 config/llm.local.json
   POST /api/llm/test              -> 用草稿配置试连一次（不落盘）
   POST /api/llm/reset             -> 清除本地覆盖，回到 YAML/环境变量
@@ -50,7 +55,7 @@ UPLOADS = TARGETS / "uploads"
 OUTPUTS = ROOT / "outputs"
 LEDGER = ROOT / "ledger"
 LOG_DIR = ROOT / "logs"
-REPORT_ORDER = ROOT / "config" / "report_order.json"   # 历史报告的拖拽排序
+FAVORITES = ROOT / "config" / "favorites.json"         # 被收藏的报告 ID（顺序无意义）
 TRASH = OUTPUTS / ".trash"                              # 已删报告回收区（可恢复）
 LLM_HISTORY = ROOT / "config" / "llm_history.json"     # LLM 配置记忆（最近用过的）
 LLM_HISTORY_MAX = 12
@@ -109,6 +114,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 import integrity  # noqa: E402
 import ingest  # noqa: E402
 import agent_spec  # noqa: E402
+import scenario  # noqa: E402
+import rule_learning  # noqa: E402
+import rule_exec  # noqa: E402
 import llm_client  # noqa: E402
 import rules_store  # noqa: E402
 
@@ -217,6 +225,204 @@ def _unique_upload_path(name, base=None):
     return base / f"{stem}-{int(time.time() * 1000)}{ext}"
 
 
+def _unlink_quiet(path) -> bool:
+    """尽力而为的删除：环境级拦截（只读挂载/安全策略）不应拖垮 HTTP 响应。"""
+    try:
+        Path(path).unlink(missing_ok=True)
+        return True
+    except BaseException:                        # noqa: BLE001
+        return False
+
+
+
+PURPOSE_MAX = 300
+
+# ---- 「审查目的」上传文件暂存区 ----
+# 放在 state/ 而不是 targets/：目的文件是**说明材料**，不是待审对象，
+# 混进 targets/ 会污染待审列表（用户会以为要多审一份文件）。
+PURPOSE_DIR = ROOT / "state" / "purpose_uploads"
+PURPOSE_ORIGINALS = PURPOSE_DIR / "_originals"
+PURPOSE_WORK = PURPOSE_DIR / "_work"
+PURPOSE_FILE_MAX = 2000            # 单份目的文件参与解析的字数上限（与 purpose.py 一致）
+PURPOSE_TOTAL_MAX = 6000           # 组装后目的总文本上限（手写 300 + 文件拼接）
+PURPOSE_FILES_MAX = 5              # 一次审查最多附带几个目的文件
+PURPOSE_STAGE_MAX = 20             # 暂存区容量上限（防只传不删攒爆磁盘）
+for _d in (PURPOSE_DIR, PURPOSE_ORIGINALS):
+    _d.mkdir(parents=True, exist_ok=True)
+
+
+def _purpose_record_path(pid):
+    """暂存记录路径：id 只允许 uuid hex，防路径穿越。"""
+    if not re.fullmatch(r"[0-9a-f]{12}", str(pid or "")):
+        return None
+    return PURPOSE_DIR / f"{pid}.json"
+
+
+def _load_purpose_record(pid):
+    path = _purpose_record_path(pid)
+    if not path or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) and data.get("text") else None
+
+
+def _list_purpose_records():
+    """暂存列表（按上传时间倒序）；**不含原文**，只给预览。"""
+    items = []
+    for p in sorted(PURPOSE_DIR.glob("*.json"),
+                    key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            r = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        items.append({
+            "id": r.get("id"),
+            "name": r.get("name") or "",
+            "kind": r.get("kind") or "",
+            "chars": int(r.get("chars") or 0),
+            "truncated": bool(r.get("truncated")),
+            "created": r.get("created") or "",
+            "preview": (r.get("text") or "")[:80],
+        })
+    return items
+
+
+def _delete_purpose_record(pid):
+    """删除暂存记录与归档原件；尽力而为，失败不拖垮接口。"""
+    path = _purpose_record_path(pid)
+    if not path or not path.is_file():
+        return False
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        record = {}
+    original = str((record or {}).get("original") or "")
+    if original:
+        orig_path = (ROOT / original).resolve()
+        try:
+            orig_path.relative_to(PURPOSE_ORIGINALS.resolve())
+            orig_path.unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pass
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _clean_purpose(raw):
+    """清洗「审查目的」：去控制字符、限长。空 → None。"""
+    text = str(raw or "")
+    text = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
+    text = text.replace("\x00", "").strip()
+    return text[:PURPOSE_MAX] or None
+
+
+# 目的块定界符：组装时写成「【目的文件：NAME】」。名字里出现这些字符，
+# 会让下游（match_matrix.blocks）切块时把名字截断，或让截断说明的
+# 「《名》超过 N 字」匹配不上——名字不改，改的是**放进块标记里的那份**。
+PURPOSE_MARK_UNSAFE = {
+    "【": "[", "】": "]", "《": "<", "》": ">", "（": "(", "）": ")",
+}
+
+
+def _marker_safe_name(name):
+    """把文件名的定界符换成等价符号，返回 (安全名, 是否改过)。
+
+    只在写进目的块标记时用；暂存记录里仍保留用户原始文件名。
+    changed 只在**确实含定界符**时为 True：空名/纯空白是「未命名」保底，
+    不是改名，不能触发「文件名含定界符」的说明（2026-10-26 暴力测试踩到）。
+    """
+    raw = str(name or "")
+    safe = "".join(PURPOSE_MARK_UNSAFE.get(ch, ch) for ch in raw).strip()
+    changed = any(ch in PURPOSE_MARK_UNSAFE for ch in raw) and safe != raw
+    return (safe or "未命名"), changed
+
+
+def _assemble_purpose(typed, purpose_files):
+    """把手写目的 + 暂存的目的文件组装成一段目的文本。
+
+    返回 (text, error, quality)：
+      text    = 最终目的文本（可能为 ""，表示既没手写也没附件）
+      error   = 组装失败原因（id 非法 / 文件不存在 / 超数量），此时 text 为 None
+      quality = 目的来源的**质量风险**（如图片 OCR），要进报告 limitations 而不能
+                只在上传时弹个 toast —— 一闪而过的提示等于没提示，用户事后
+                只看到结论、看不到「判定标准本身可能被 OCR 认错」。
+
+    截断策略（两层，都写进文本让人在报告里看见）：
+      1. 单份文件在**上传时**已截到 PURPOSE_FILE_MAX（2000）并记 warning；
+      2. 组装总长超 PURPOSE_TOTAL_MAX（6000）时整体截断，并附一句说明。
+    说明文字直接并入目的文本，而不是悄悄丢——报告 purpose.text 会原样展示。
+    """
+    if purpose_files in (None, ""):
+        return (typed or ""), None, []
+    if not isinstance(purpose_files, list):
+        return None, "purpose_files 必须是文件 id 数组", []
+    ids = [str(x or "") for x in purpose_files]
+    if len(ids) > PURPOSE_FILES_MAX:
+        return None, f"目的文件最多 {PURPOSE_FILES_MAX} 个", []
+    parts, notes, quality = [], [], []
+    if typed:
+        parts.append(typed)
+    for pid in ids:
+        record = _load_purpose_record(pid)
+        if not record:
+            return None, f"目的文件不存在或已过期：{pid or '（空 id）'}", []
+        name = str(record.get("name") or pid)
+        text = str(record.get("text") or "")
+        # 「目的文件」是判定标准，不是待审对象：OCR 认错一个字，改的是**判定口径**。
+        # 所以质量风险必须单独记下来进报告 limitations，不能塞进正文（会污染要求侧）。
+        if str(record.get("kind") or "") == "image":
+            quality.append(
+                f"目的文件《{name}》是图片，其中文字由 OCR 识别，"
+                "识别错误会直接改变本次审查的判定标准——"
+                "关键要求（学历、年限、技能、金额）请以原文为准，"
+                "建议改用 PDF / Word / 文本版重新上传。")
+        # 说明里有 `《名》` 与 `（说明：…）` 两种定界符：名字必须先用安全名，
+        # 否则含「）」的名字会让整段说明提前闭合、截断提示读不出来。
+        mark_name, renamed = _marker_safe_name(name)
+        if record.get("truncated"):
+            notes.append(f"《{mark_name}》超过 {PURPOSE_FILE_MAX} 字，"
+                         f"已截断至前 {PURPOSE_FILE_MAX} 字")
+        if renamed:
+            # 不静默改名：报告里看得出「块标记里的名字」与上传名不同。
+            # 措辞里**不能出现「）」**——「（说明：…）」会提前闭合，后面的说明读不出来
+            notes.append(f"文件名含【】《》等目的块定界符，"
+                         f"标记内改写为《{mark_name}》")
+        parts.append(f"【目的文件：{mark_name}】\n{text}")
+    combined = "\n".join(p for p in parts if p.strip())
+    if len(combined) > PURPOSE_TOTAL_MAX:
+        combined = combined[:PURPOSE_TOTAL_MAX]
+        notes.append(f"组合目的文本超过 {PURPOSE_TOTAL_MAX} 字，已整体截断")
+    if notes:
+        combined += "\n（说明：" + "；".join(notes) + "）"
+    return combined, None, quality
+
+
+LABELS_SUFFIX = ".labels.json"
+
+
+def _target_role(path):
+    """待审对象的角色。`*.labels.json` 是**机读标注**（ground truth），不是原文。
+
+    把它当待审对象审，等于让标准答案参加考试：标注正文逐条写着
+    「XX 处有错、应为 YY」，任何规则都会在上面开火，报告里于是出现
+    一堆与本次目的毫无关系的问题（实测把会议纪要标注里的
+    「「这个政策调整哈…」——正式纪要中的口语化表达」判成风格问题）。
+    """
+    try:
+        name = path.name.lower()
+    except AttributeError:
+        return "text"
+    return "labels" if name.endswith(LABELS_SUFFIX) else "text"
+
+
 def _resolve_target(file):
     """只允许审查 targets/ 下的真实文件，同步/异步接口共用。"""
     if not file:
@@ -228,6 +434,15 @@ def _resolve_target(file):
         return None, "只能审查 targets/ 下的文件"
     if not target.is_file():
         return None, f"文件不存在：{file}"
+    if _target_role(target) == "labels":
+        # 报错里给出「该审哪个」，否则用户只知道被拒、不知道下一步
+        stem = target.name[: -len(LABELS_SUFFIX)]
+        sibling = target.parent / (stem + ".txt")
+        hint = (f"，对应的原文是 {sibling.relative_to(ROOT).as_posix()}"
+                if sibling.is_file() else "")
+        return None, (f"{target.name} 是机读标注（标准答案），不是待审原文{hint}。"
+                      "审它会把它写的「某处有错」逐条当成问题报出来，"
+                      "与审查目的无关。")
     return target, None
 
 
@@ -327,8 +542,36 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             rid = q.get("id", [None])[0]
             return self._send(200, self._report(rid))
+        if p == "/api/learning":
+            # 只读：控制台能看到候选与配额，但**没有任何接口能写规则库**
+            return self._send(200, {"ok": True, **rule_learning.summary()})
+        if p == "/api/candidates":
+            # 待人工审核的规则候选（口径与 CLI 的 rule_review.py 完全一致）
+            items = rule_learning.console_candidates()
+            return self._send(200, {
+                "ok": True, "count": len(items),
+                "pending": sum(1 for i in items if i["pending"]),
+                "items": items,
+            })
+        if p == "/api/annotations":
+            q = parse_qs(u.query)
+            rid = q.get("id", [None])[0]
+            items = [a for a in rule_learning.load_annotations()
+                     if not rid or a.get("report_id") == rid]
+            return self._send(200, {"ok": True, "items": items[-200:]})
         if p == "/api/agents":
             return self._send(200, {"ok": True, "items": agent_spec.list_agents()})
+        if p == "/api/scenarios":
+            # 配置坏了要让前端看见（400 语义），不能返回空列表：
+            # 空列表会被当成"没有情境"，用户在下拉里看不到任何选项也不知道为什么
+            try:
+                return self._send(200, scenario.public_list())
+            except scenario.ScenarioError as e:
+                return self._send(200, {"ok": False, "error": str(e), "items": []})
+        if p == "/api/purpose/files":
+            # 暂存的目的文件（说明材料，不是待审对象）；不含原文，只给预览
+            return self._send(200, {"ok": True,
+                                    "items": _list_purpose_records()})
         if p == "/api/rules":
             return self._send(200, self._rules())
         if p == "/api/logs":
@@ -348,6 +591,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/upload":
             return self._send(200, self._upload(u))
+        if u.path == "/api/purpose/upload":
+            return self._send(200, self._purpose_upload(u))
         data = self._json_body()
         if data is None:            # 超大 body：响应已发出（413），直接结束
             return
@@ -355,6 +600,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._run_review(data))
         if u.path == "/api/review/start":
             return self._send(200, self._start_review(data))
+        if u.path == "/api/annotations":
+            return self._send(200, self._add_annotation(data))
+        if u.path == "/api/candidates/decide":
+            return self._send(200, self._decide_candidate(data))
         if u.path == "/api/rules/toggle":
             return self._send(200, self._toggle_rule(data))
         if u.path == "/api/llm/config":
@@ -363,8 +612,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._test_llm(data))
         if u.path == "/api/llm/reset":
             return self._send(200, self._reset_llm_config())
-        if u.path == "/api/reports/order":
-            return self._send(200, self._save_report_order(data))
+        if u.path == "/api/reports/favorite":
+            return self._send(200, self._set_favorite(data))
         if u.path == "/api/llm/history/restore":
             return self._send(200, self._restore_llm_history(data))
         return self._send(404, {"error": "not found"})
@@ -378,6 +627,14 @@ class Handler(BaseHTTPRequestHandler):
             rid = parse_qs(u.query).get("id", [None])[0]
             data = self._json_body()
             return self._send(200, self._delete_report(rid, data))
+        if u.path == "/api/purpose/files":
+            pid = parse_qs(u.query).get("id", [None])[0]
+            ok = _delete_purpose_record(pid)
+            if not ok:
+                return self._send(200, {"ok": False,
+                                        "error": f"未找到目的文件：{pid or '（空 id）'}"})
+            return self._send(200, {"ok": True, "id": pid,
+                                    "items": _list_purpose_records()})
         return self._send(404, {"error": "not found"})
 
     MAX_JSON_BODY = 1 * 1024 * 1024        # JSON 接口 1MB 上限（与文本 2MB / 二进制 20MB 对称）
@@ -399,17 +656,29 @@ class Handler(BaseHTTPRequestHandler):
     # ----- 业务 -----
     def _targets(self):
         items = []
-        paths = [p for p in sorted(TARGETS.glob("*")) if p.is_file()]
-        paths += [p for p in sorted(UPLOADS.glob("*")) if p.is_file()]
+        paths = [p for p in TARGETS.glob("*") if p.is_file()]
+        paths += [p for p in UPLOADS.glob("*") if p.is_file()]
         for p in paths:
             st = p.stat()
+            role = _target_role(p)
             items.append({
                 "name": p.name,
                 "rel": p.relative_to(ROOT).as_posix(),
                 "size": st.st_size,
                 "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+                "mtime_ts": st.st_mtime,
                 "uploaded": p.parent == UPLOADS,
+                "role": role,
+                "reviewable": role != "labels",
             })
+        # 排序规则（顺序即语义）：
+        #   ① 可审对象在前 —— `*.labels.json` 是机读标注（测试用的标准答案），
+        #      不是待审原文，绝不能因为字母序靠前就占住「默认选中」这个位置；
+        #   ② 同一组内按修改时间**降序** —— 刚上传的简历排第一，
+        #      而不是把 targets/ 里的历史样本顶到最前。
+        items.sort(key=lambda x: (not x["reviewable"], -x["mtime_ts"], x["name"]))
+        for it in items:
+            it.pop("mtime_ts", None)
         return {"items": items}
 
     def _upload(self, u):
@@ -509,69 +778,237 @@ class Handler(BaseHTTPRequestHandler):
             "original": original.relative_to(ROOT).as_posix(),
         }
 
-    def _report_order(self):
-        """读取用户自定义的历史报告顺序（拖拽排序结果）。"""
+    # ------------------------------------------------------------------
+    # 「审查目的」上传：与 /api/upload 同一套协议，但产物是**目的文本**而不是待审对象
+    # ------------------------------------------------------------------
+    def _purpose_upload(self, u):
+        """接收目的说明文件 → 摄取成文本 → 暂存 state/purpose_uploads/。
+
+        与 /api/upload 的三点区别：
+          1. 落点在 state/ 而不是 targets/——目的文件不是待审对象，
+             混进 targets/ 会污染待审列表；
+          2. 文本按 PURPOSE_FILE_MAX 截断（目的会进每个维度的 prompt）；
+          3. 提取不到文本（扫描件/无 OCR 的图片）**明确拒绝**，
+             不留一个空目的文件等着被静默忽略。
+        """
+        q = parse_qs(u.query)
+        name = _safe_upload_name((q.get("name") or [""])[0])
+        if not name:
+            return {"ok": False, "error": "文件名无效"}
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in UPLOAD_ALLOWED:
+            return {"ok": False, "error": f"不支持的文件类型：{ext or '无扩展名'}"}
         try:
-            data = json.loads(REPORT_ORDER.read_text(encoding="utf-8"))
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {"ok": False, "error": "文件为空"}
+        is_binary = ext in UPLOAD_BINARY_EXTS
+        limit = UPLOAD_MAX_BINARY_BYTES if is_binary else UPLOAD_MAX_BYTES
+        if length > limit:
+            self.close_connection = True
+            return {"ok": False, "error": f"文件超过 {limit // (1024 * 1024)} MB 限制"}
+        if len(_list_purpose_records()) >= PURPOSE_STAGE_MAX:
+            return {"ok": False,
+                    "error": f"目的文件暂存已满（{PURPOSE_STAGE_MAX} 个），"
+                             "请先删除不用的目的文件"}
+        data = self.rfile.read(length)
+
+        warnings = []
+        if _marker_safe_name(name)[1]:
+            # 名字里的【】《》（）是目的块定界符：进块时会被改写，先说一声，
+            # 别等到报告里名字看着不一样才发现。
+            warnings.append(
+                "文件名含【】《》（）等定界符，写进目的块时会改写为 [ ] < > ( )，"
+                "不影响内容解析")
+        kind = "text"
+        if not is_binary:
+            # —— 文本路径：严格校验（UTF-8 / 拒 NUL / 剥 BOM），与待审对象上传同一口径 ——
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return {"ok": False, "error": "仅支持 UTF-8 编码的文本文件"}
+            if chr(0) in text:
+                return {"ok": False, "error": "疑似二进制文件，已拒绝"}
+            if text.startswith(chr(0xFEFF)):
+                text = text[1:]
+        else:
+            # ---------- 二进制路径：归档原件 + 摄取成文本 ----------
+            original = _unique_upload_path(name, base=PURPOSE_ORIGINALS)
+            try:
+                original.write_bytes(data)
+            except Exception as e:
+                return {"ok": False, "error": f"保存失败：{e}"}
+            try:
+                # 每次请求独立工作目录：并发上传时 rmtree 不会删掉别人正在解压的文件
+                work = PURPOSE_WORK / uuid.uuid4().hex[:8]
+                result = ingest.ingest_file(original, work_dir=work)
+            except ingest.IngestError as e:
+                _unlink_quiet(original)
+                return {"ok": False, "error": str(e)}
+            except Exception as e:                    # noqa: BLE001
+                _unlink_quiet(original)
+                return {"ok": False, "error": f"文档解析失败：{e}"}
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            kind = str(result.get("kind") or "binary")
+            warnings.extend(str(w) for w in (result["meta"].get("warnings") or []))
+            # 目的文件是"标准"，不是"待审对象"：OCR 认错一个字，改的是**判定口径**
+            # （实测一张招聘 JD 截图里「算法」被认成「篡法」、「本地部署」成「本地署」），
+            # 比审待审对象时认错字更严重——所以单独提示一次，并给出更可靠的做法。
+            if kind == "image":
+                warnings.append(
+                    "目的文件是图片：其中文字靠 OCR 识别，错字会直接改变本次审查的"
+                    "判定标准（如「算法」被认成「篡法」）；篇幅较长的要求建议改传 "
+                    "PDF / Word / 文本，识别更可靠。")
+            # 压缩包可能有多个成员：并成一段文本，成员名写进说明
+            chunks = [out["text"] for out in result["outputs"] if out.get("text")]
+            if len(result["outputs"]) > 1:
+                warnings.append(
+                    f"压缩包内 {len(result['outputs'])} 个成员的文本已合并为一段目的")
+            text = "\n".join(chunks)
+
+        if not text.strip():
+            # 扫描件 / 无 OCR 引擎时的图片：不留空目的文件（会被静默忽略）
+            if is_binary:
+                _unlink_quiet(original)
+            return {"ok": False, "error": "未能从文件中提取到文本"
+                                            "（扫描件或图片需 OCR 能力），"
+                                            "请换用文本版文件或先配置 OCR",
+                    "kind": kind, "warnings": warnings}
+
+        truncated = len(text) > PURPOSE_FILE_MAX
+        if truncated:
+            text = text[:PURPOSE_FILE_MAX]
+            warnings.append(f"目的文件超过 {PURPOSE_FILE_MAX} 字，"
+                            f"已截断至前 {PURPOSE_FILE_MAX} 字参与解析")
+
+        pid = uuid.uuid4().hex[:12]
+        record = {
+            "id": pid,
+            "name": name,
+            "kind": kind,
+            "chars": len(text),
+            "truncated": truncated,
+            "text": text,
+            "warnings": warnings,
+            "original": (original.relative_to(ROOT).as_posix()
+                         if is_binary else ""),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        try:
+            (PURPOSE_DIR / f"{pid}.json").write_text(
+                json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            if is_binary:
+                _unlink_quiet(original)
+            return {"ok": False, "error": f"暂存失败：{e}"}
+
+        return {
+            "ok": True,
+            "id": pid,
+            "name": name,
+            "kind": kind,
+            "chars": len(text),
+            "truncated": truncated,
+            "preview": text[:80],
+            "warnings": warnings,
+            "items": _list_purpose_records(),
+        }
+
+    def _favorites(self):
+        """读取被收藏的报告 ID。
+
+        文件不存在 / 损坏 / 内容不合规，一律当"没有收藏"处理——
+        一个坏掉的收藏文件不能把整个历史列表拖垮（列表是主路径，收藏是附加）。
+        """
+        try:
+            data = json.loads(FAVORITES.read_text(encoding="utf-8"))
         except Exception:
             return []
-        order = data.get("order") if isinstance(data, dict) else data
-        if not isinstance(order, list):
+        ids = data.get("favorites") if isinstance(data, dict) else data
+        if not isinstance(ids, list):
             return []
-        return [str(x) for x in order]
+        out = []
+        for x in ids:
+            rid = str(x or "")
+            if re.fullmatch(r"R-\d{8}-\d{3}", rid) and rid not in out:
+                out.append(rid)
+        return out
+
+    def _save_favorites(self, ids):
+        FAVORITES.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "favorites": ids,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        tmp = FAVORITES.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(FAVORITES))
+
+    def _set_favorite(self, data):
+        """收藏 / 取消收藏一份报告。body: {"id": "R-xxx", "favorite": true|false}
+
+        `favorite` 必须是布尔值：不接受 "1" / "toggle" 之类的模糊写法，
+        免得前端状态与服务端不一致时静默写反。
+        """
+        rid = str((data or {}).get("id") or "")
+        if not re.fullmatch(r"R-\d{8}-\d{3}", rid):
+            return {"ok": False, "error": "报告 ID 格式不合法"}
+        if not (OUTPUTS / f"{rid}.json").exists():
+            return {"ok": False, "error": f"未找到报告 {rid}"}
+        want = (data or {}).get("favorite")
+        if not isinstance(want, bool):
+            return {"ok": False, "error": "favorite 必须是 true / false"}
+
+        ids = self._favorites()
+        if want and rid not in ids:
+            ids.insert(0, rid)          # 最近收藏的排前面
+        elif not want and rid in ids:
+            ids.remove(rid)
+        self._save_favorites(ids)
+        return {"ok": True, "id": rid, "favorite": want, "favorites": ids}
 
     def _reports(self):
+        """历史报告列表：**只按时间倒序**，最新的排最上面。
+
+        排序键用报告内的 `timestamp`（生成时刻），不用文件 mtime：
+        拷贝 / 解压 / 批量重写都会改 mtime，会让顺序莫名漂移；而 timestamp
+        是报告自己写死的，永远等于"这份报告是什么时候跑出来的"。
+        同秒连跑两份时 timestamp 相同，用 review_id 兜底（编号更大的在后生成的），
+        保证顺序稳定、不随文件系统返回顺序抖动。
+        """
+        fav = set(self._favorites())
         items = []
-        for p in sorted(OUTPUTS.glob("R-*.json"), reverse=True):
+        for p in OUTPUTS.glob("R-*.json"):
             try:
                 r = _read_json(p)
             except Exception:
-                continue
+                continue          # 坏掉的报告不该让整个列表 500
             inc = r.get("integrity", {})
+            mtime = p.stat().st_mtime
+            ts = str(r.get("timestamp") or "")
+            if not ts:
+                # 老报告可能没写 timestamp：退回 mtime，但格式化成同一个口径再排
+                ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mtime))
+            rid = str(r.get("review_id") or p.stem)
             items.append({
-                "id": r.get("review_id"),
+                "id": rid,
                 "verdict": r.get("verdict"),
                 "target_type": r.get("target_type"),
                 "target_path": r.get("target_path"),
                 "target_name": Path(r.get("target_path") or "").name,
                 "review_mode": r.get("review_mode"),
-                "timestamp": r.get("timestamp"),
+                "timestamp": ts,
                 "issues": len(r.get("issues", [])),
                 "stats": r.get("stats", {}),
                 "report_hash": (inc.get("report_hash") or "")[:16],
-                "mtime": p.stat().st_mtime,
+                "favorite": rid in fav,
+                "mtime": mtime,
             })
-        # 默认按 mtime 倒序；用户拖拽排序后以自定义顺序优先
-        items.sort(key=lambda x: x.get("mtime", 0), reverse=True)
-        order = self._report_order()
-        rank = {rid: i for i, rid in enumerate(order)}
-        items.sort(key=lambda x: (rank.get(x.get("id"), len(rank)), -(x.get("mtime") or 0)))
-        return {"items": items, "order": order}
-
-    def _save_report_order(self, data):
-        """保存历史报告的拖拽排序结果（只接受仍然存在的报告 ID）。"""
-        raw = (data or {}).get("order")
-        if not isinstance(raw, list):
-            return {"ok": False, "error": "order 必须是数组"}
-        existing = {p.stem for p in OUTPUTS.glob("R-*.json")}
-        cleaned = []
-        for x in raw:
-            rid = str(x or "")
-            if re.fullmatch(r"R-\d{8}-\d{3}", rid) and rid in existing and rid not in cleaned:
-                cleaned.append(rid)
-        # 未出现在列表里但仍存在的报告按 mtime 倒序补到末尾，避免新报告“消失”
-        rest = sorted((p for p in OUTPUTS.glob("R-*.json") if p.stem not in cleaned),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-        cleaned += [p.stem for p in rest]
-        REPORT_ORDER.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "order": cleaned,
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        tmp = REPORT_ORDER.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(str(tmp), str(REPORT_ORDER))
-        return {"ok": True, "order": cleaned, "count": len(cleaned)}
+        items.sort(key=lambda x: (x["timestamp"], x["id"]), reverse=True)
+        return {"items": items, "favorites": sorted(fav)}
 
     def _delete_report(self, rid, data):
         """删除单份历史报告。
@@ -609,10 +1046,11 @@ class Handler(BaseHTTPRequestHandler):
             moved.append(f"logs/{rid}/")
 
         tombstoned = self._mark_ledger_deleted(rid)
-        # 顺序表里摘掉这个 id
-        rest_order = [x for x in self._report_order() if x != rid]
-        if rest_order != self._report_order():
-            self._save_report_order({"order": rest_order})
+        # 收藏表里摘掉这个 id：报告都进回收站了，收藏里留着会变成永远点不开的幽灵项
+        favs = self._favorites()
+        if rid in favs:
+            favs.remove(rid)
+            self._save_favorites(favs)
         return {
             "ok": True,
             "id": rid,
@@ -676,16 +1114,21 @@ class Handler(BaseHTTPRequestHandler):
                 "source": r.get("source", ""),
                 "file": r.get("file", ""),
                 "enabled": state.get(r["rule_id"], True),
+                # 执行方式：deterministic / declarative / prompt_only
+                "capability": rule_exec.capability(r),
             })
         dims = {}
         for item in items:
             dims[item["dimension"]] = dims.get(item["dimension"], 0) + 1
+        exec_counts = rule_exec.counts(all_rules)
         return {
             "ok": True,
             "items": items,
             "total": len(items),
             "enabled": sum(1 for i in items if i["enabled"]),
             "dimensions": dims,
+            # 执行方式分布：确定性 / 声明式 / 仅提示
+            "execution": exec_counts,
         }
 
     def _toggle_rule(self, data):
@@ -803,6 +1246,63 @@ class Handler(BaseHTTPRequestHandler):
                     report = None
         return {"ok": True, "job": job, "steps": steps, "report": report}
 
+    ANNOTATION_TOKEN_ENV = "REVIEW_AGENT_ANNOTATION_TOKEN"
+
+    def _add_annotation(self, data):
+        """记录人工标注（可选鉴权 + 作者白名单）。"""
+        need = os.environ.get(self.ANNOTATION_TOKEN_ENV, "").strip()
+        if need and self.headers.get("X-Review-Token", "") != need:
+            # 开放部署时才启用；单机默认不设这个变量，控制台照常可用。
+            # 注意：即使鉴权通过，能否作为学习种子还取决于 config 里的作者白名单。
+            return {"ok": False,
+                    "error": f"标注需要 X-Review-Token 头（服务端已启用标注鉴权）"}
+        return self._add_annotation_inner(data)
+
+    def _add_annotation_inner(self, data):
+        """记录人工标注。
+
+        这是整个 HTTP 面上唯一与「学习」有关的写操作，而且它**只能写标注**：
+        规则库的写入只存在于 tools/rule_promote.py 且需要审批。
+        被审文档因此没有任何路径能影响自己的审查规则。
+        """
+        d = data or {}
+        try:
+            item = rule_learning.add_annotation(
+                kind=str(d.get("kind") or ""),
+                by=str(d.get("by") or "console"),
+                target_path=d.get("target_path"),
+                quote=d.get("quote"),
+                dimension=d.get("dimension"),
+                report_id=d.get("report_id"),
+                issue_id=d.get("issue_id"),
+                note=str(d.get("note") or ""),
+            )
+        except rule_learning.LearningError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "annotation": item}
+
+    def _decide_candidate(self, data):
+        """人工审核决定：**只写候选文件的 human_review，不动规则库**。
+
+        这是 HTTP 面上第二个与「学习」有关的写操作（第一个是写标注）。
+        写规则库依然只存在于 tools/rule_promote.py —— 控制台没有那条路径。
+        """
+        need = os.environ.get(self.ANNOTATION_TOKEN_ENV, "").strip()
+        if need and self.headers.get("X-Review-Token", "") != need:
+            return {"ok": False,
+                    "error": "审核决定需要 X-Review-Token 头（服务端已启用鉴权）"}
+        d = data or {}
+        try:
+            r = rule_learning.decide_candidate(
+                d.get("candidate_id"),
+                str(d.get("decision") or ""),
+                note=str(d.get("note") or ""),
+                by=str(d.get("by") or "console"),
+            )
+        except rule_learning.LearningError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, **r}
+
     def _start_review(self, data):
         file = str((data or {}).get("file") or "").strip()
         target, error = _resolve_target(file)
@@ -817,6 +1317,18 @@ class Handler(BaseHTTPRequestHandler):
         agent_opt, agent_err = _resolve_agent((data or {}).get("agent"))
         if agent_err:
             return {"ok": False, "error": agent_err}
+        scenario_opt, scenario_err = _resolve_scenario((data or {}).get("scenario"))
+        if scenario_err:
+            return {"ok": False, "error": scenario_err}
+        # 目的组装（手写 + 上传的目的文件）在启动前完成：id 非法/超量要直接报错，
+        # 不能等任务跑起来才失败。组装后的文本经 --purpose 传给子进程，
+        # --purpose-max 告知解析上限（文件类目的可超过 300 字）。
+        typed_purpose = _clean_purpose((data or {}).get("purpose"))
+        purpose_text, purpose_err, purpose_quality = _assemble_purpose(
+            typed_purpose, (data or {}).get("purpose_files"))
+        if purpose_err:
+            return {"ok": False, "error": purpose_err}
+        purpose_max = len(purpose_text) if purpose_text else None
         with JOBS_LOCK:
             now = time.time()
             for old_id, old in list(JOBS.items()):
@@ -845,10 +1357,12 @@ class Handler(BaseHTTPRequestHandler):
                 "llm": llm_opt,
                 "type": type_opt,
                 "agent": agent_opt,
+                "scenario": scenario_opt,
             }
         threading.Thread(
             target=_run_review_job,
-            args=(job_id, file, llm_opt, progress, type_opt, agent_opt),
+            args=(job_id, file, llm_opt, progress, type_opt, agent_opt,
+                  purpose_text or None, purpose_max, purpose_quality, scenario_opt),
             daemon=True,
         ).start()
         return {"ok": True, "job_id": job_id}
@@ -1175,6 +1689,22 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": agent_err}
         if agent_opt:
             cmd.extend(["--agent", agent_opt])
+        scenario_opt, scenario_err = _resolve_scenario((data or {}).get("scenario"))
+        if scenario_err:
+            return {"ok": False, "error": scenario_err}
+        if scenario_opt:
+            cmd.extend(["--scenario", scenario_opt])
+        typed_purpose = _clean_purpose((data or {}).get("purpose"))
+        purpose_text, purpose_err, purpose_quality = _assemble_purpose(
+            typed_purpose, (data or {}).get("purpose_files"))
+        if purpose_err:
+            return {"ok": False, "error": purpose_err}
+        if purpose_text:
+            cmd.extend(["--purpose", purpose_text])
+            cmd.extend(["--purpose-max", str(len(purpose_text))])
+        if purpose_quality:
+            cmd.extend(["--purpose-notes",
+                        json.dumps(purpose_quality, ensure_ascii=False)])
         before = {p.name for p in OUTPUTS.glob("R-*.json")}
         t0 = time.time()
         try:
@@ -1208,8 +1738,22 @@ def _resolve_agent(raw):
     return str(raw), None
 
 
+def _resolve_scenario(raw):
+    """校验前端传来的情境 id；空值表示不指定（= 全规则，等价于旧行为）。"""
+    if raw in (None, "", "default"):
+        return None, None
+    try:
+        known = [s["id"] for s in scenario.load()["scenarios"]]
+        if str(raw) not in known:
+            return None, f"未知审查情境：{raw}；可选：{'、'.join(known)}"
+    except scenario.ScenarioError as e:
+        return None, f"情境配置错误：{e}"
+    return str(raw), None
+
+
 def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
-                    agent_opt=None):
+                    agent_opt=None, purpose=None, purpose_max=None,
+                    purpose_quality=None, scenario_opt=None):
     """后台线程：跑 review.py，进度事件写入 progress_path。"""
     before = {p.stem for p in OUTPUTS.glob("R-*.json")}
     cmd = [str(PY), str(ROOT / "review.py"), file,
@@ -1222,6 +1766,18 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
         cmd.extend(["--type", type_opt])
     if agent_opt:
         cmd.extend(["--agent", agent_opt])
+    if scenario_opt:
+        # 情境只决定"哪些规则参与"，关了什么会写进报告 limitations
+        cmd.extend(["--scenario", scenario_opt])
+    if purpose:
+        cmd.extend(["--purpose", purpose])
+        # 文件类目的可超过 300 字：把实际上限告诉解析层，避免二次截断
+        if purpose_max:
+            cmd.extend(["--purpose-max", str(purpose_max)])
+    if purpose_quality:
+        # 目的来源的质量风险（图片 OCR / 截断）要进报告 limitations：
+        # 只上传时 toast 一下，用户事后只看到结论、看不到判定标准被认错了
+        cmd.extend(["--purpose-notes", json.dumps(purpose_quality, ensure_ascii=False)])
     started = time.time()
     status = "done"
     error = None

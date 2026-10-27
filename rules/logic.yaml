@@ -8,7 +8,7 @@
 # 严重度说明：blocker = 会直接导致结论错误或对外表述失实；major = 关键事实/论证不成立。
 - rule_id: LOGIC-001
   dimension: logic
-  desc: 同一指标或同一对象在文本中出现互斥数值/口径时必须指出（如总额与分项合计不符、同期数据前后不一致、同一指标两个不同数字）
+  desc: 同一指标或同一对象在文本中出现互斥数值/口径时必须指出（如总额与分项合计不符、同期数据前后不一致、同一指标两个不同数字、合同大小写金额不一致、占比类指标超过 100%）
   method: cross_numeric_consistency
   severity: major
   source: 逻辑一致性基线 v1

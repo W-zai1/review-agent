@@ -1,0 +1,21 @@
+#!/bin/sh
+# 提交前守门：改了代码/文档却没在 CHANGELOG.md 登记，就拦住这次提交。
+#
+# 安装（一次即可，配置进 .git/config，不进版本库）：
+#   git config core.hooksPath .githooks
+#
+# 为什么用 hooksPath 而不是直接写 .git/hooks/pre-commit：
+#   .git/hooks/ 不进版本控制，换台机器就失效；.githooks/ 跟着仓库走。
+#
+# 确实要绕过（比如只改了一个错别字又不想留账）：git commit --no-verify
+#   但请记住：绕过会把守门变成摆设，能补条目就别绕过。
+
+if command -v py >/dev/null 2>&1; then
+  PY=py
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  PY=python
+fi
+
+exec "$PY" tools/changelog_guard.py --staged

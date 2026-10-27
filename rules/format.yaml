@@ -1,0 +1,51 @@
+# rules/format.yaml —— Word 版式格式规则（课程报告格式要求 v1）
+# 判定标准：正文中文宋体、英文 Times New Roman、小四、首行缩进 2 字符、
+# 固定 22 磅行距、两级或三级标题、图表编号与正文引用一致。
+# 执行器：tools/docx_format_checks.py（确定性，逐段取实际值比对要求值）。
+- rule_id: FORMAT-001
+  dimension: format
+  desc: 正文中文字体应为宋体（英文 Times New Roman）；显式使用其他中文字体即违规
+  method: docx_format
+  severity: minor
+  source: 课程报告格式要求 v1
+  auto_fix: false
+
+- rule_id: FORMAT-002
+  dimension: format
+  desc: 正文字号应为小四（12pt，OOXML sz=24）；正文使用五号/11pt 等其他字号即违规
+  method: docx_format
+  severity: minor
+  source: 课程报告格式要求 v1
+  auto_fix: false
+
+- rule_id: FORMAT-003
+  dimension: format
+  desc: 正文首行缩进应为 2 字符（firstLineChars=200，或 firstLine≈480 缇）
+  method: docx_format
+  severity: minor
+  source: 课程报告格式要求 v1
+  auto_fix: false
+
+- rule_id: FORMAT-004
+  dimension: format
+  desc: 正文行距应为固定值 22 磅（line=440 且 lineRule=exact）
+  method: docx_format
+  severity: minor
+  source: 课程报告格式要求 v1
+  auto_fix: false
+
+- rule_id: FORMAT-005
+  dimension: format
+  desc: 应采用清楚的两级或三级标题；未使用标题样式（Heading/大纲级别）或层级超过三级即违规
+  method: docx_format
+  severity: minor
+  source: 课程报告格式要求 v1
+  auto_fix: false
+
+- rule_id: FORMAT-006
+  dimension: format
+  desc: 图表编号与正文引用一致：正文引用的图/表编号必须有对应题注，题注不得重复
+  method: docx_format
+  severity: major
+  source: 课程报告格式要求 v1
+  auto_fix: false

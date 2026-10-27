@@ -1,0 +1,201 @@
+# config/purpose.yaml —— 「审查目的」词典（意图 → 审查目标 → 证据探针）
+#
+# 为什么要有这一层：
+#   用户给出的目的是一句话（"这是给客户的报价邮件，帮我找有没有承诺过头的地方"），
+#   而引擎需要的是一组**可执行的目标**。两者之间的翻译如果交给模型，
+#   同一句话两次会得到不同目标，报告就无法复核。
+#   所以翻译规则写成数据（本文件），解析过程是确定性的（tools/purpose.py）。
+#
+# 字段说明：
+#   keywords     —— 目的里出现这些词就激活该意图（命中数决定优先级，取前 3 个）
+#   dimensions   —— 该意图下应重点看的维度（用于给 issue 加权）
+#   rules        —— 该意图下应重点看的规则（命中的 issue 直接作为证据）
+#   goals        —— 派生目标，每个目标带 question（人类可读）与 probes（证据探针）
+#   probes[].relation —— risk（构成风险/问题）/ support（可作为支撑证据）
+#
+# 注意：probes 是"定位器"，不是"判定器"。它只负责把可能相关的句子找出来，
+# 判定仍然由规则层（已有 issue）或模型（judge）给出。探针写宽了会制造噪声，
+# 所以每个 goal 的命中数上限在 tools/purpose.py 里硬限 3 条。
+#
+# **改本文件必须同步下面的 version**：报告里记了 purpose.lexicon_version，
+# 版本没变而内容变了，就出现"同一句目的昨天派生 2 个目标、今天派生 1 个"，无法解释。
+
+version: v1-2026-10-26-a4
+
+# 泛词：在长文档里到处都是，**单个命中不足以激活意图**（见 tools/purpose.py::parse）。
+# 判定口径：有非泛词命中 → 有效；只有泛词 → 至少要命中 2 个不同的泛词才算数。
+# 实测教训：一份招聘 JD 只因出现「持续交付」「数据整理」就被判成
+# 「承诺与交付风险」+「数据与口径」，派生出 4 个与"要不要录用"无关的目标，全部 not_found。
+weak_keywords: [交付, 上线, 验收, 工期, 数据, 来源, 增长, 指标, 成本, 费用, 预算,
+                客户, 对外, 事实, 真实, 准确, 条款, 生效, 建议, 评估, 评审, 要不要, 内容]
+
+intents:
+  - id: commitment
+    name: 承诺与交付风险
+    keywords: [承诺, 保证, 打包票, 兑现, 交付, 上线, 验收, 工期, 完成时间, 承诺过头, 过度承诺]
+    dimensions: [logic, compliance, style]
+    rules: [LOGIC-008, LOGIC-006]
+    goals:
+      - id: unfalsifiable_promise
+        rules: [LOGIC-008, LOGIC-006]
+        question: 是否存在没有量化依据的绝对化承诺（保证/一定/零风险/100%）？
+        probes:
+          - pattern: "(保证|承诺|绝对|一定|百分百|百分之百|100\\s*%|零(?:风险|缺陷|故障|投诉)|无条件|包(?:您|你)?满意)"
+            relation: risk
+      - id: deadline_promise
+        question: 承诺的时间点是否给了依据或前置条件？
+        probes:
+          - pattern: "(\\d+\\s*个?\\s*(?:工作日|天|周|月|日)\\s*内|即日|随时|最迟|不晚于|T\\+\\d)"
+            relation: risk
+
+  - id: pricing
+    name: 价格与金额
+    keywords: [报价, 价格, 金额, 单价, 总价, 折扣, 付款, 结算, 账期, 发票, 税率, 含税, 费用, 预算, 成本]
+    dimensions: [logic, compliance, fact]
+    rules: [LOGIC-001, COMP-001, COMP-002]
+    goals:
+      - id: amount_consistency
+        rules: [LOGIC-001]
+        question: 金额的大小写、分项与合计、币种是否一致？
+        probes:
+          - pattern: "([¥￥]\\s*[\\d,]+|人民币|[零壹贰叁肆伍陆柒捌玖拾佰仟万亿]{2,}元|元整|合计|单价|总价|半价|\\d+\\s*折|翻[倍番])"
+            relation: risk
+      - id: payment_terms
+        rules: [COMP-002]
+        question: 付款与结算条件是否明确（账期、预付比例、发票）？
+        probes:
+          - pattern: "(付款|结算|账期|预付|尾款|发票|含税|不含税)"
+            relation: support
+
+  - id: data_source
+    name: 数据与口径
+    keywords: [数据, 统计, 来源, 口径, 引用, 增长, 占比, 指标, 排名, 调研, 样本]
+    dimensions: [compliance, fact, logic]
+    rules: [COMP-004, FACT-004, FACT-001, LOGIC-005]
+    goals:
+      - id: unsourced_number
+        rules: [COMP-004, FACT-004]
+        question: 文中的数字是否标注了统计口径与可核查来源？
+        probes:
+          - pattern: "(\\d+(?:\\.\\d+)?\\s*(?:万|亿|倍)|百分之[零〇一二三四五六七八九十百千两]+|(?:率|占比|比重|增长|下降|覆盖|渗透)\\D{0,4}\\d+(?:\\.\\d+)?\\s*(?:%|％))"
+            relation: risk
+      - id: sampling_scope
+        rules: [LOGIC-005]
+        question: 样本范围与结论的适用范围是否匹配？
+        probes:
+          - pattern: "(抽样|样本|受访|调研|问卷|部分|区域)"
+            relation: risk
+
+  - id: contract
+    name: 合同要件与责任
+    keywords: [合同, 协议, 条款, 违约, 解除, 管辖, 仲裁, 诉讼, 保密, 生效, 终止, 续签, 保证金]
+    dimensions: [compliance, logic]
+    rules: [COMP-001, COMP-002, COMP-003, LOGIC-001]
+    goals:
+      - id: required_clause
+        rules: [COMP-001, COMP-002, COMP-003]
+        question: 主体、生效/终止、争议解决等要件是否齐全？
+        probes:
+          - pattern: "(甲方|乙方|生效|终止|有效期|争议|仲裁|诉讼|管辖|保密|解除)"
+            relation: support
+      - id: liability
+        rules: [COMP-003]
+        question: 违约责任与免责条款是否明确、对等？
+        probes:
+          - pattern: "(违约金|赔偿责任|免责|不可抗力|损失|逾期)"
+            relation: risk
+
+  - id: publish
+    name: 对外发布表述
+    keywords: [对外, 发布, 公众号, 新闻稿, 通稿, 宣传, 客户, 投资人, 公告, 官网, 话术, 文案]
+    dimensions: [style, logic, compliance]
+    rules: [STYLE-001, STYLE-002, STYLE-003, STYLE-005, LOGIC-008]
+    goals:
+      - id: tone
+        rules: [STYLE-001, STYLE-002, STYLE-003, STYLE-005]
+        question: 是否存在口语化、情绪化或不合规的表述？
+        probes:
+          - pattern: "(吧|呢|啊|嘛|哦|呗|绝绝子|yyds|泪目|我觉得|太棒了)"
+            relation: risk
+      - id: overclaim
+        rules: [LOGIC-008]
+        question: 是否存在无法证实的"第一/唯一/领先"类表述？
+        probes:
+          - pattern: "(第一|唯一|独家|领先|最优|顶级|国家级|国家级|填补空白|颠覆)"
+            relation: risk
+
+  - id: privacy
+    name: 隐私与敏感信息
+    keywords: [隐私, 个人信息, 身份证, 手机号, 银行卡, 住址, 脱敏, 敏感信息, 保密信息]
+    dimensions: [safety]
+    rules: [SAFE-003]
+    goals:
+      - id: pii_exposure
+        rules: [SAFE-003]
+        question: 是否包含可识别到个人的信息（证件号/手机号/卡号/住址）？
+        probes:
+          - pattern: "(身份证|手机号|联系电话|银行卡|卡号|住址|家庭地址|病历|工号)"
+            relation: risk
+
+  - id: fact_check
+    name: 事实核验
+    keywords: [事实, 真实, 准确, 核实, 有没有错, 是否属实, 数据对不对, 夸大]
+    dimensions: [fact, logic]
+    rules: [FACT-001, FACT-002, FACT-003, FACT-004]
+    goals:
+      - id: verifiable_claim
+        rules: [FACT-001, FACT-002, FACT-003]
+        question: 可核验的事实性断言（数字/日期/机构）是否与公开口径一致？
+        probes:
+          - pattern: "(\\d{4}\\s*年|\\d+(?:\\.\\d+)?\\s*(?:万|亿|%|％)|成立于|总部|上市)"
+            relation: support
+
+  - id: injection
+    name: 提示词注入与越权
+    keywords: [注入, 提示词, 越权, 绕过, 无视规则, 角色扮演, 系统设定]
+    dimensions: [safety]
+    rules: [SAFE-004]
+    goals:
+      - id: override_attempt
+        rules: [SAFE-004]
+        question: 文本是否试图改写系统设定或绕过约束？
+        probes:
+          - pattern: "(忽略|无视|系统设定|角色|越权|不受限|内容政策|直接通过)"
+            relation: risk
+
+  # 「这个人/这个方案行不行」是**比对型**目的：拿一个标准（岗位要求、验收口径、
+  # 选型条件）去衡量对象，要的是结论与依据，不是找文本里的错。
+  # 此前词典里 8 个意图全是「找茬型」，这类目的只能被泛词拽到错误维度上，
+  # 派生出的目标与用户的真实问题无关 → 全数 not_found → 用户认为系统"没有目标命中意识"。
+  #
+  # a4 教训（2026-10-26 诊断实测）：纯 judge 判定没有候选证据可用——
+  # 「简历 vs JD」场景里目的词分散在两个文本块，term 定位的"每句≥2 词"门槛
+  # 永远过不了，analyze 的证据列表为空，judge 无编号可挂 → 目标 100% not_found。
+  # 所以 goals 补**轻探针**：只负责把"要求句/资质句/成果句/差距句"捞出来当候选，
+  # 不判定对错；relation 仍由规则命中或 judge 裁决，命中上限 PER_GOAL_HITS=3。
+  - id: evaluate
+    name: 对象评估与录用判断
+    keywords: [简历, 招聘, 录用, 面试, 候选人, 岗位, 任职, 招聘要求, JD,
+               是否录用, 能不能录用, 是否合适, 符合要求, 匹配度, 胜任, 考察,
+               可行性, 选型, 值不值, 优缺点, 短板, 差距,
+               合适, 适合, 行不行, 资格, 资历, 背调, 人岗]
+    dimensions: [fact, logic]
+    rules: []
+    goals:
+      - id: criteria_coverage
+        question: 岗位/标准要求的关键项，原文是否逐项覆盖（技能、经验、学历）？
+        probes:
+          - pattern: "(任职要求|优先|加分项|精通|熟练掌握|学历|专业|工作经验|经验要求)"
+            relation: support
+          - pattern: "(教育背景|毕业院校|学历|专业|工作经历|工作经验|技能|证书|培训经历)"
+            relation: support
+      - id: evidence_of_competence
+        question: 结论所依据的经历与能力，原文是否有具体证据（项目、产出、可核对的成果）？
+        probes:
+          - pattern: "(项目|负责|搭建|上线|落地|完成|达成|产出|成果|业绩|提升|下降|增长|模型|体系)"
+            relation: support
+      - id: gap_and_risk
+        question: 不满足项、风险与差距是否写明，而不是只给结论？
+        probes:
+          - pattern: "(不足|欠缺|短板|待提升|正在学习|缺乏|尚未|不符合|未达到|风险)"
+            relation: risk

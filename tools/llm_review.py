@@ -121,6 +121,9 @@ TARGET>>>
 7. 规则清单内的用对应 rule_id；清单外的独立发现用 OPEN-XXX（如 OPEN-CONFLICT、OPEN-TIMELINE）。
 8. **宁少勿滥**：每条都要能让人照着改。拿不准就不要输出——先在 evidence 里断言、
    又写「本条不成立 / 撤回 / 无需整改」的条目没有任何价值，会被系统直接剔除。
+   **比完两端事实、结论是「两处表述一致 / 不构成矛盾 / 只是依据不足」的，不要输出**：
+   "依据不足"不是问题，该写进 coverage.uncovered；报告里出现一条自己写着
+   "此处表述一致"的 issue，读者只会认为整个清单不可信。
 9. **同类只报一处**：同一种问题（同一类口径缺失、同一种口语表达、同一类来源缺失）
    在原文多处出现时，只报最有代表性的一处，并在 evidence 里注明「同类另见约 N 处」，
    不要逐段罗列。
@@ -239,6 +242,27 @@ RETRACT_RE = re.compile(
     r"撤回(本条|上述|该条|此条)|无需整改|无需修改|属(于)?误报|系误报|"
     r"应(予)?排除|前述判断有误|之前的判断有误|上条撤回)")
 
+# 「自证无矛盾」：模型把两端事实比完了，最后落在"两处表述一致""不构成矛盾"
+# "属时间线依据不足而非直接矛盾"——这种条目的正文自己就说没问题，
+# 留在清单里只会让用户怀疑整份报告（实测：一条 minor 的 evidence 写着
+# "此处两处表述一致…属时间线依据不足而非直接矛盾"，被用户直接质问"这条有必要吗"）。
+# 两种"一致"必须分清："两处表述一致"= 没矛盾；"与岗位要求不一致"= 有矛盾。
+NO_CONFLICT_RE = re.compile(
+    r"(两处(表述|说法|信息|口径)?一致|表述一致|说法一致|口径一致|"
+    r"前后一致|相互一致|"
+    r"并不矛盾|不构成矛盾|并非矛盾|不存在矛盾|无矛盾|而非(直接)?矛盾|而非.{0,6}冲突)")
+# 命中这些词说明"一致"是被否定的、或正文确实断言了冲突，问题真实存在，绝不能剔。
+# 宁可多留一条噪声，也不能把真问题静默删掉——所以这里只加不删。
+CONFLICT_DENY_RE = re.compile(
+    r"(不一致|不相符|不吻合|对不上|不自洽|自相矛盾|"
+    r"前后矛盾|存在矛盾|相互矛盾|互相矛盾|与[^。；]{0,10}矛盾)")
+
+
+def _tail_sentence(text, limit=90):
+    """取末句：结论通常落在最后一句，正文中间的"一致"往往只是铺垫。"""
+    parts = [p.strip() for p in re.split(r"[。！？；;!?\n]", text or "") if p.strip()]
+    return parts[-1] if parts else (text or "")[-limit:]
+
 
 def validate(raw, rules, text, max_issues):
     """把模型输出校验成候选 issue。
@@ -309,6 +333,14 @@ def validate(raw, rules, text, max_issues):
                                  + issue["evidence"])[:520]
         if RETRACT_RE.search(evidence) or RETRACT_RE.search(suggestion):
             issue["reason"] = "模型自否（evidence/建议里明确写了不成立/撤回/无需整改）"
+            retracted.append(issue)
+            continue
+        # 自证无矛盾：末句结论是"表述一致/不构成矛盾"，这条自己就不是问题。
+        # 进 excluded 而不是静默丢弃——报告里要能回答"模型曾经怀疑过什么、为什么排除"。
+        if (NO_CONFLICT_RE.search(_tail_sentence(evidence))
+                and not CONFLICT_DENY_RE.search(evidence)):
+            issue["reason"] = ("自证无矛盾（末句结论为「表述一致 / 不构成矛盾」，"
+                               "本条不成立，仅记「依据不足」不构成问题）")
             retracted.append(issue)
             continue
         issues.append(issue)

@@ -144,6 +144,84 @@ def find_secret_spans(text):
     return out
 
 
+# ---------------------------------------------------------------- 隐私：银行卡 / 住宅地址
+#
+# 为什么不用「16-19 位数字」这么简单的正则：订单号、合同编号、流水号也是长数字，
+# 一律当银行卡报就是制造噪声（第五轮已证明噪声比漏报更伤人）。用 **Luhn 校验**
+# 做结构判定：真实卡号必须过 Luhn，随机长数字只有约 1/10 能过，再叠加发卡行
+# 首位（3/4/5/6）与长度约束，误报率可以压到接近 0。
+CARD_CANDIDATE = re.compile(
+    r"(?<![\d])(\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}(?:[\s\-]?\d{1,3})?)(?![\d])")
+# Luhn 不通过的「四段式数字」只在**银行卡语境**里才算疑似卡号：
+# 伪造/占位的卡号本来就过不了 Luhn（实测样本 6222 0131 0736 0306 校验和为 47），
+# 但真实单据里的卡号仍然要拦——所以降级为「需人工确认」，而不是直接放过。
+CARD_CONTEXT = re.compile(
+    r"(卡号|账户|帐号|收款|付款|退款|转入|转至|打款|汇款|银行|信用卡|储蓄卡|开户|对公)")
+
+
+def luhn_ok(digits):
+    """Luhn（模 10）校验：银行卡/信用卡号的必要条件。"""
+    if not digits or not digits.isdigit():
+        return False
+    total, parity = 0, len(digits) % 2
+    for i, ch in enumerate(digits):
+        d = int(ch)
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def find_bank_cards(text):
+    """返回疑似银行卡号命中（含位置与 Luhn 结果）。
+
+    两条通道：
+      ① Luhn 通过 + 16~19 位 + 发卡行首位 3/4/5/6 → 高置信直接判；
+      ② Luhn 不通过，但**四段式分组**（有空格/连字符）且邻近出现银行卡语境词
+         → 疑似伪造/占位卡号，仍要报，但明确标注需人工确认。
+    """
+    out = []
+    for m in CARD_CANDIDATE.finditer(text):
+        raw = m.group(1)
+        digits = re.sub(r"[\s\-]", "", raw)
+        if not 16 <= len(digits) <= 19:
+            continue
+        if digits[0] not in "3456":          # 发卡行首位；1/2/7/8/9 开头的多是内部编号
+            continue
+        luhn = luhn_ok(digits)
+        if not luhn:
+            if not re.search(r"[\s\-]", raw):
+                continue                     # 无分隔的裸长数字更可能是内部编号，不猜
+            ctx = text[max(0, m.start() - 24): m.end() + 24]
+            if not CARD_CONTEXT.search(ctx):
+                continue
+        out.append({"raw": raw, "digits": digits, "luhn": luhn,
+                    "start": m.start(), "end": m.end()})
+    return out
+
+
+# 住宅地址：必须同时出现「市区县 + 路/街/巷 + 门牌号」**和**「单元/室/栋/户」
+# 才判为个人住址。公司注册地址常写成「XX 路 88 号 A 座 1801」，没有室/单元，
+# 而合同里披露办公地址是正常的——只认带住宅单元信息的那种。
+ADDR_ROAD = re.compile(
+    r"[\u4e00-\u9fa5]{2,10}(?:区|县|镇|乡)[\u4e00-\u9fa5]{0,12}(?:路|街|大道|巷|弄|胡同)"
+    r"\s*\d{1,4}\s*(?:号|弄)")
+ADDR_UNIT = re.compile(r"\d{1,4}\s*(?:单元|栋|幢|号楼|层|室|户)")
+
+
+def find_residence_addrs(text):
+    out = []
+    for m in ADDR_ROAD.finditer(text):
+        tail = text[m.end(): m.end() + 30]
+        if not ADDR_UNIT.search(tail):
+            continue
+        end = m.end() + (ADDR_UNIT.search(tail).end())
+        out.append({"raw": text[m.start(): end], "start": m.start(), "end": end})
+    return out
+
+
 def main():
     text = sys.stdin.read()
     print(json.dumps({
