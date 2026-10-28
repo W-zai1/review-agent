@@ -1233,6 +1233,14 @@ textarea#purposeInput:focus { border-color: #5b4fc7; }
   background: #EEF2FF; color: #4338CA; font-size: 10.5px; font-weight: 600;
   cursor: help; white-space: nowrap;
 }
+/* 格式规格 chip：和情境区分开（情境=问不问，规格=按什么数值判）。
+   未提供标准时用灰色，提醒"版式这项没判"，不能读成"版式合规"。 */
+.rs-fmt {
+  display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 999px;
+  background: #ECFDF5; color: #047857; font-size: 10.5px; font-weight: 600;
+  cursor: help; white-space: nowrap;
+}
+.rs-fmt.is-none { background: #F3F4F6; color: #6B7280; }
 /* 覆盖率告警：常驻在状态条里，避免"以为全文都审过了" */
 #resultView .verdict-cover { font-size: 11px; margin: 0; display: inline-block; }
 #resultView .verdict-cover.warn { padding: 2px 7px; border-radius: 5px; }

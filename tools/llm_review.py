@@ -26,19 +26,80 @@ INSTRUCTION_RE = re.compile(
 FLOAT_NOISE_RE = re.compile(r"\d+\.\d{5,}")
 CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "llm"
 # prompt 一旦改动必须改版本号，否则会命中旧缓存，拿不到新策略的效果
-PROMPT_VERSION = "2026-10-24a"
+PROMPT_VERSION = "2026-10-28a"
 
 
-def _cache_key(dim, chunk, rules, model):
+def _cache_key(dim, chunk, rules, model, facts_sig=""):
     import hashlib
     h = hashlib.sha256()
-    for part in (PROMPT_VERSION, dim, model, chunk):
+    # facts_sig 必须进键：事实库改了而缓存不失效，等于拿旧证据判新文本
+    for part in (PROMPT_VERSION, dim, model, chunk, facts_sig):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     for r in sorted(rules, key=lambda x: x["rule_id"]):
         h.update((r["rule_id"] + "|" + str(r.get("desc", ""))).encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()
+
+
+# ---------- 事实库注入 ----------
+# 为什么要把 facts.json 塞进 prompt（2026-10-28）：
+#   事实审原来的"弹药"只有 prompt 里一句"只查与事实库/可检索来源冲突"，
+#   而事实库**根本没进 prompt**——模型只能拿自己的参数记忆当依据。
+#   一旦如此，"独立裁判"就破产了：它和通用 agent 的差别只剩一条哈希链，
+#   而哈希链只能证明"记录没被改"，证明不了"记录是对的"。
+#   现在把事实库作为**唯一可引用的事实依据**摆进 prompt，并明确禁止凭记忆断言真伪。
+FACTS_MAX_LINES = 60
+
+
+def _facts_sig(facts):
+    import hashlib
+    if not facts:
+        return ""
+    return hashlib.sha256(
+        json.dumps(facts, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def load_facts():
+    """读 knowledge/facts.json（失败返回空，绝不因事实库缺失而让审查崩掉）。"""
+    try:
+        import retrieve
+        return retrieve.load_facts()
+    except Exception:
+        return {"assertions": []}
+
+
+def render_facts(facts):
+    """把事实库渲染成 prompt 里的一段（无条目时返回空串）。"""
+    items = (facts or {}).get("assertions") or []
+    if not items:
+        return ""
+    lines = ["【事实库（本次唯一可引用的事实依据，来自 knowledge/facts.json）】"]
+    for a in items[:FACTS_MAX_LINES]:
+        head = f"- {a.get('entity')} / {a.get('attr')}："
+        if a.get("type") == "number":
+            exp = a.get("expected") or {}
+            head += f"期望 {exp.get('num')}{exp.get('unit', '')}"
+            if a.get("tolerance"):
+                head += f"（容差 ±{a['tolerance']}）"
+        else:
+            head += f"期望年份 {a.get('expected_year')}"
+        note = str(a.get("note") or "").replace("\n", " ").strip()
+        if note:
+            head += f"｜口径：{note[:120]}"
+        if a.get("exclude_ctx"):
+            head += f"｜不适用语境：{'、'.join(a['exclude_ctx'][:6])}"
+        lines.append(head)
+    lines.append(
+        "【事实判定硬约束】\n"
+        "① FACT-001 只能用于上面列出的 实体/属性；evidence 必须点明依据的条目"
+        "（如「事实库：豆包/月活=1 亿」）。\n"
+        "② 原文里出现、但事实库里**没有**的实体/数字/日期，**不得凭记忆断言其真伪**"
+        "——那等于用模型参数记忆当证据。这类只能按 FACT-002 报「缺可核验出处」，"
+        "或写进 coverage.uncovered。\n"
+        "③ 事实库的 note 是口径说明；语境命中 exclude_ctx 时不要拿该条目比对。")
+    return "\n".join(lines)
 
 
 def _cache_read(key):
@@ -68,7 +129,8 @@ MAX_OPEN_PER_CALL = 3               # 单次调用最多采纳的开放发现数
 HARD_CAP_PER_DIM = 30
 
 DIM_FOCUS = {
-    "fact": "只查与事实库/可检索来源冲突或无法复现的数字、日期、人名、机构与引用。",
+    "fact": "只查两类：① 与下面【事实库】条目冲突的数字/日期；② 事实库覆盖不到、"
+            "必须按 FACT-002 报「缺可核验出处」的断言。**不得凭记忆断言真伪**。",
     "safety": "只查攻击/违法指引、个人隐私泄露、prompt 注入等安全红线。",
     "compliance": "只查合同要件缺失、数据披露口径/来源缺失等合规问题。",
     "style": "只查 emoji、口语化、第一人称情绪化表达等写作规范问题。",
@@ -88,20 +150,27 @@ SYSTEM = (
 )
 
 
-def build_messages(dim, rules, text, charter=None):
+def build_messages(dim, rules, text, charter=None, facts=None):
     """构造单维度审查的 messages。
 
     charter: 可选的「审查任务书」，用于告诉模型**这次要判定什么、标准是什么**
              （用途 / 后果等级 / 关注重点）。缺省时按通用标准审。
+    facts:   事实库（dict）。事实维度会把它渲染成 prompt 的 FACTS 区块，
+             **事实判断只能引用它**——这是「独立裁判」的证据来源。
     """
     rule_lines = "\n".join(
         f"- {r['rule_id']}（{r['severity']}）：{r['desc']}" for r in rules)
     charter_text = ""
     if charter:
         charter_text = f"\n【本次审查任务书】\n{charter.strip()}\n"
+    facts_text = ""
+    if dim == "fact":
+        block = render_facts(facts)
+        if block:
+            facts_text = "\n" + block + "\n"
     user = f"""审查维度：{DIM_LABEL.get(dim, dim)}
 审查重点：{DIM_FOCUS.get(dim, "")}
-{charter_text}
+{charter_text}{facts_text}
 本维度规则清单（**重点提示，非封闭限制**；清单外的问题请用 OPEN-XXX 标识）：
 {rule_lines}
 
@@ -264,16 +333,25 @@ def _tail_sentence(text, limit=90):
     return parts[-1] if parts else (text or "")[-limit:]
 
 
-def validate(raw, rules, text, max_issues):
+def validate(raw, rules, text, max_issues, dim=None, facts=None):
     """把模型输出校验成候选 issue。
 
     返回 (issues, dropped_reasons, retracted)：
       - issues：采纳的问题；
       - dropped：被丢弃的原因（**配额丢弃也必须留痕**，旧实现直接 break，无任何记录）；
       - retracted：模型自否的条目（单独进报告的「已排除」区）。
+
+    dim/facts：事实维度的「不许凭记忆判真伪」硬守门——
+      模型把某个事实库外的实体报成 FACT-001 时，改判为 FACT-002（缺可核验出处），
+      并在 evidence 里注明降级理由。规则不是删掉，而是换成站得住的那一条：
+      "这个数字我核不了" 是可交付的结论，"这个数字是假的" 不是。
     """
     allowed = {r["rule_id"]: r for r in rules}
     issues, dropped, retracted = [], [], []
+    fact_entities = []
+    if dim == "fact" and facts:
+        fact_entities = [str(a.get("entity") or "") for a in facts.get("assertions") or []]
+        fact_entities = [e for e in fact_entities if e]
     try:
         data = _loads_array(raw)
     except ValueError as e:
@@ -325,6 +403,17 @@ def validate(raw, rules, text, max_issues):
         # 开放发现：默认 minor，只有模型很确信才升 major——否则长文里会刷出上百条 major
         if open_discovery and confidence >= OPEN_MAJOR_MIN_CONF:
             issue["severity"] = "major"
+        # 事实维度硬守门：FACT-001 是"与事实库冲突"，不是"我觉得不对"。
+        # quote 里一个事实库实体都没有，说明模型在用参数记忆判真伪 → 改判 FACT-002。
+        if (fact_entities and issue["rule_id"] == "FACT-001"
+                and not any(e in quote for e in fact_entities)):
+            if "FACT-002" in allowed:
+                issue["rule_id"] = "FACT-002"
+                issue["severity"] = allowed["FACT-002"].get("severity", "minor")
+                issue["evidence"] = ("（事实库无对应条目，按「缺可核验出处」判定，"
+                                     "不判事实真伪）" + issue["evidence"])[:520]
+                dropped.append("FACT-001→FACT-002：quote 未涉及事实库实体，"
+                               "禁止凭模型记忆判真伪")
         # 浮点尾数（37.800000000000004 万）是数据格式噪声，不是事实硬伤：
         # 不能让模型把它报成 blocker，降级为 minor 并在依据里注明
         if FLOAT_NOISE_RE.search(quote) and issue["severity"] in ("blocker", "major"):
@@ -377,11 +466,13 @@ def validate(raw, rules, text, max_issues):
     return kept, dropped, retracted
 
 
-def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None):
+def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None,
+                     facts=None):
     """调一次模型做单维审查；调用失败由上层捕获 LLMError。
 
     charter: 可选的「审查任务书」文本，注入 prompt 让模型知道判定标准与后果等级。
     full_text: 分块审查时传完整原文——quote 必须对完整原文校验（块是原文的子串）。
+    facts: 事实库（事实维度注入 prompt + 校验降级；其它维度忽略）。
     """
     validate_text = full_text if full_text is not None else text
     prompt_text = text
@@ -390,7 +481,9 @@ def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None
         prompt_text = prompt_text[: cfg.max_input_chars] + "\n…（原文过长，已截断）"
         truncated = True
     use_cache = bool(getattr(cfg, "cache", True))
-    cache_key = (_cache_key(dim, prompt_text, rules, getattr(cfg, "model", ""))
+    facts_sig = _facts_sig(facts) if dim == "fact" else ""
+    cache_key = (_cache_key(dim, prompt_text, rules, getattr(cfg, "model", ""),
+                            facts_sig)
                  if use_cache else None)
     if cache_key:
         hit = _cache_read(cache_key)
@@ -405,10 +498,11 @@ def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None
             return {**hit, "cached": True, "latency_ms": 0,
                     "usage": {"input": 0, "output": 0}}
 
-    messages = build_messages(dim, rules, prompt_text, charter=charter)
+    messages = build_messages(dim, rules, prompt_text, charter=charter, facts=facts)
     result = client.chat(messages)
     issues, dropped, retracted = validate(
-        result.content, rules, validate_text, cfg.max_issues_per_dim)
+        result.content, rules, validate_text, cfg.max_issues_per_dim,
+        dim=dim, facts=facts)
     finish_reason = getattr(result, "finish_reason", "")
     # finish_reason=length 就是"输出没写完"的唯一可靠信号。
     # 旧判定还附加了「正文为空且一条都没救回」，导致 _salvage_objects 一旦救回对象

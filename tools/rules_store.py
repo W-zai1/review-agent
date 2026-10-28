@@ -16,16 +16,24 @@ STATE_PATH = ROOT / "config" / "rules.state.json"
 
 
 def load_all_rules():
-    """按文件名顺序加载全部 YAML 规则，附加 file 字段。"""
+    """按文件名顺序加载全部 YAML 规则，附加 file 字段。
+
+    结构不对**必须报错**：顶层写成对象（`{rules: [...]}`）或条目缺 rule_id 时，
+    旧实现是 `continue` 跳过——报告会「看起来正常」，但整类规则根本没跑，
+    和 manifest 静默跳过属同一类事故。少跑检查比跑错检查更难发现。
+    """
     rules = []
     for path in sorted(RULES_DIR.glob("*.yaml")):
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or []
         if not isinstance(data, list):
-            continue
-        for item in data:
+            raise ValueError(
+                f"规则文件 {path.name} 顶层必须是列表，实际是 {type(data).__name__}；"
+                "写成对象会导致整份文件的规则被静默丢弃")
+        for idx, item in enumerate(data):
             if not isinstance(item, dict) or not item.get("rule_id"):
-                continue
+                raise ValueError(
+                    f"规则文件 {path.name} 第 {idx + 1} 条缺少 rule_id：{item!r}")
             rule = dict(item)
             rule["file"] = path.name
             rules.append(rule)

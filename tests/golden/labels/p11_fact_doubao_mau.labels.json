@@ -1,0 +1,17 @@
+{
+ "errors": [
+  {
+   "id": "L1",
+   "desc": "豆包MAU 10亿 vs 1亿",
+   "match": [
+    [
+     "1 亿量级",
+     "与公开口径偏差"
+    ]
+   ],
+   "exclude_dimensions": [
+    "style"
+   ]
+  }
+ ]
+}

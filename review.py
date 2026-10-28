@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import agent_spec
 import purpose as purpose_mod
 import scenario as scenario_mod
+import format_spec as format_spec_mod
 import match_matrix
 import logic_checks
 import pattern_rules
@@ -72,6 +73,11 @@ SOURCE_MARK_RE = re.compile(
 CAUSAL_RE = re.compile(r"(因此|所以|由此可见|这说明|这意味着|导致|证明了)")
 CAUSAL_EVIDENCE_RE = re.compile(
     r"(据|来源|数据|研究|实验|样本|统计|报告|https?://)")
+# 因果句里的「成效/归因」词。有它 = 真在拿结果归因（"销量翻倍，因此定价策略成功"），
+# 没有它 = 只是行文顺承（"因此我们下周补测"）。同一规则按这两种结构分档，
+# 而不是靠调阈值——结构判断比分数判断可复现。（红队 B1）
+EFFECT_RE = re.compile(
+    r"(成功|成效|大幅|翻倍|倍增|归功于|归因|证明了|说明了|领先|第一|显著提升|显著增长)")
 PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
 CALIBER_RE = re.compile(
     r"(同比|环比|占比|增长率|转化率|毛利率|覆盖率|完成率|口径|"
@@ -263,6 +269,24 @@ def sentence_at(text, idx):
     return text[start:end].strip()
 
 
+def _sent_start(text, idx):
+    """idx 所在句的起点（含句首标点边界，与 sentence_at 同一口径）。"""
+    punct = set("。！？\n")
+    start = idx
+    while start > 0 and text[start - 1] not in punct:
+        start -= 1
+    return start
+
+
+def _sent_end(text, idx):
+    """idx 所在句的终点（不含句末标点）。"""
+    punct = set("。！？\n")
+    end = idx
+    while end < len(text) and text[end] not in punct:
+        end += 1
+    return end
+
+
 def sentence_no(text, idx):
     seg = text[:idx]
     sents = [s for s in re.split(r"[。！？\n]", seg) if s.strip()]
@@ -275,6 +299,20 @@ def doc_anchor(text):
         if line.strip():
             return line.strip()[:60]
     return ""
+
+
+def clause_anchor(text, where="tail"):
+    """缺失条款类 issue 的锚点：指到「该条款应该出现的位置」。
+
+    旧实现一律用首行（"甲方：北京示例科技有限公司"）当锚点，于是"缺争议解决条款"
+    这条的证据指向的是"有甲方"，逐字可回查在**缺失型**问题上等于失效（红队 C1）。
+    主体缺失（COMP-001）锚开头是对的；生效/争议这类尾部条款必须锚文末——
+    读者一眼就能对上"本该在这一条后面再补一条"。
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    return (lines[0] if where == "head" else lines[-1])[:80]
 
 
 def note_fact(s, assertion):
@@ -321,6 +359,12 @@ class Session:
         self.tool_logs = []
         self.steps = []
         self.verified_facts = []
+        # 同一片段被「线索级」规则和「结论级」规则同时命中时，折叠掉较弱的那条
+        # （数据不丢，进报告 suppressed 并写明归口到哪条规则）
+        self.folded = []
+        # 文本里出现、但事实库没有断言的高频实体：写进 limitations，明说"没判"，
+        # 而不是让模型拿参数记忆去判真伪
+        self.unverified_hits = []
         self.llm_usage = {"input": 0, "output": 0, "calls": 0, "failures": 0}
         self.issue_counter = 0
         self.tool_ok = 0
@@ -477,9 +521,16 @@ def fact_heuristics(s: Session, text, active_ids):
                     "补充可核查的来源链接、文献名或统计口径。", 0.65)
         if "FACT-003" in active_ids and counters["FACT-003"] < 3:
             if CAUSAL_RE.search(sentence) and not CAUSAL_EVIDENCE_RE.search(sentence):
+                # 红队 B1：同一现象不能"fact 侧 minor、logic 侧 major"。
+                # 分档依据是结构：句子里有成效/归因词 → 真的在拿结果归因，
+                # 按规则原级（major）报；只有连接词 → 线索级，进待确认。
+                strong = bool(EFFECT_RE.search(sentence))
                 add("FACT-003", sentence, pos,
-                    "正则启发式：出现因果连接词，但同句未给出数据、研究或来源前提",
-                    "补充支撑该因果结论的前提与证据，或改为弱化表述。", 0.6)
+                    ("正则启发式：因果连接词 + 成效/归因词同现，但同句未给出数据、"
+                     "研究或来源前提" if strong else
+                     "正则启发式：出现因果连接词，但同句未给出数据、研究或来源前提"),
+                    "补充支撑该因果结论的前提与证据，或改为弱化表述。",
+                    0.72 if strong else 0.6)
         if "FACT-004" in active_ids and counters["FACT-004"] < 3:
             percent_issue = PERCENT_RE.search(sentence) and not CALIBER_RE.search(sentence)
             times_issue = TIMES_RE.search(sentence) and not BASELINE_RE.search(sentence)
@@ -519,6 +570,16 @@ def fact_review(s: Session, text, rules):
                            ["按同一实体核验"], "不同产品线的同名指标不能互相校验")
                 continue
         window = text[idx: idx + 50]
+        # 年度口径约束（2026-10-28，红队 st03）：同一指标不同年份量级可以差十倍
+        # （华为手机出货量 2019 年 2.4 亿台 → 2024 年 4,600 万台）。断言声明了
+        # year_ctx，就只核验**同一句里写着该年份**的那一处；句内没有该年份不判。
+        # 宁漏不误：拿 2024 年的口径去判 2019 年的数字，比漏报更糟。
+        if a.get("year_ctx") and str(a["year_ctx"]) not in sentence_at(text, idx):
+            s.decision(
+                f"{entity}{attr} 所在句未写明 {a['year_ctx']} 年，未比对",
+                a["rule_id"], "断言限定年度口径（year_ctx），跨年比较无意义",
+                ["按任意年份比对"], "不同年份的量级不可互换，硬比就是误报")
+            continue
         if a["type"] == "number":
             tr = time.perf_counter()
             nums = regex_check.extract_numbers(window)
@@ -528,9 +589,13 @@ def fact_review(s: Session, text, rules):
                 continue
             # 跳过"2024 年"这类年份：它不是被比对的指标值。
             # 旧实现取窗口第一个数字，把年份当基数，得出"偏差约 0 倍"的垃圾证据（实测 f01）
+            # 2026-10-28 补：「9 月」「18 日」这类日期成分同样不是指标值——
+            # 「豆包是字节跳动 2023 年 9 月推出…」里没有「月活」时，旧代码会把 9 当
+            # 月活去跟 1 亿比，产出垃圾 issue（实测 F 案例）。
             values = [n for n in nums
                       if not (1900 <= n["num"] <= 2100
-                              and window[n["end"]:n["end"] + 1] == "年")]
+                              and window[n["end"]:n["end"] + 1] == "年")
+                      and window[n["end"]:n["end"] + 1] not in ("月", "日")]
             if not values:
                 continue
             v = values[0]
@@ -549,7 +614,10 @@ def fact_review(s: Session, text, rules):
                        (time.perf_counter() - tr) * 1000, "success")
                 ev = (f"知识库命中：{hits[0]['file']}:{hits[0]['line']} —— {hits[0]['text']}"
                       if hits else a.get("note", "事实库无对应条目"))
-                sugg = (f"与公开口径偏差约 {ratio:.0f} 倍，建议改为「{exp['num']}{exp['unit']}量级」"
+                # label 是给人看的量级写法：「0.5 亿」对读者没意义，
+                # 「5,000 万台」才是同一件事的正常说法（数值仍然只从 facts 来）
+                _label = a.get("label") or f"{exp['num']:g}{exp['unit']}"
+                sugg = (f"与公开口径偏差约 {ratio:.0f} 倍，建议改为「{_label}量级」"
                         f"并标注统计口径与时间。")
                 s.add_issue(s.make_issue(
                     "fact", a["rule_id"], quote, loc, ev,
@@ -565,31 +633,109 @@ def fact_review(s: Session, text, rules):
                     a["rule_id"],
                     f"{v['raw']} 落在 {exp['num']}{exp['unit']} ±{tol} 倍容差内",
                     ["blocker"], "事实一致无需报")
-        elif a["type"] == "date":
-            # 日期通常在 attr 之前（如"2023 年 9 月推出"），向前开窗口，避免误取后文年份
+        elif a["type"] == "max":
+            # 法定/规范「上限」是一侧判断（红队 st04：《劳动合同法》试用期法定上限
+            # 6 个月，写 12 个月要报）。旧的 number 分支是对称容差，直接拿来做上限
+            # 会反过来误报：「试用期 3 个月」远低于上限完全合法，却会被算成
+            # 「偏差 0.5 倍」。所以上限必须单独成一种类型，只在超限时报。
             tr = time.perf_counter()
-            dwin = text[max(0, idx - 40): idx + 10]
-            dates = regex_check.extract_dates(dwin)
-            s.tool("regex_check", f"{entity} 日期抽取", f"候选 {len(dates)} 个",
+            nums = regex_check.extract_numbers(window)
+            s.tool("regex_check", f"{entity}{attr} 数字抽取", f"候选 {len(nums)} 个",
                    (time.perf_counter() - tr) * 1000, "success")
-            if not dates:
+            if not nums:
                 continue
+            hint = str(a.get("unit_hint") or "")
+            values = [n for n in nums
+                      if not (1900 <= n["num"] <= 2100
+                              and window[n["end"]:n["end"] + 1] == "年")
+                      # 单位必须紧跟在数字后（允许空格）：只认「12 个月」，
+                      # 不把「试用期工资 80%」「试用期 3 人」当上限值
+                      and (not hint or window[n["end"]:n["end"] + 6].lstrip().startswith(hint))]
+            if not values:
+                s.decision(f"{entity}{attr} 未找到带「{hint}」的数值，不判", a["rule_id"],
+                           "上限类断言必须带上限单位才有可比性",
+                           ["按任意数字比对"], "没有单位的数字可能指别的量，判了就是误报")
+                continue
+            v = values[0]
             note_fact(s, a)
-            yr = dates[0]["year"]
-            if yr != a["expected_year"]:
+            exp = a["expected"]
+            exp_base = exp["num"] * UNIT_FACTOR.get(exp["unit"], 1)
+            base = v["num"] * UNIT_FACTOR.get(v["unit"] or exp["unit"], 1)
+            if base > exp_base * (1 + 1e-9):
                 quote = sentence_at(text, idx)
                 loc = f"第 {sentence_no(text, idx)} 句"
-                ev = a.get("note", "事实库无对应条目")
                 s.add_issue(s.make_issue(
-                    "fact", a["rule_id"], quote, loc, ev,
+                    "fact", a["rule_id"], quote, loc,
+                    a.get("note") or f"{entity}{attr} 超出上限",
                     "retrieve + regex", 0.85,
-                    f"年份不符，建议核对为 {a['expected_year']} 年。"))
-                s.decision(f"{entity}{attr} 年份 {yr} 与事实库 {a['expected_year']} 不符，报 issue",
-                           a["rule_id"], f"年份偏差（{yr} vs {a['expected_year']}）",
-                           ["minor"], "年份属可核验硬事实，直接报")
+                    f"超出法定/规范上限：上限为 {exp['num']:g}"
+                    f"{a.get('unit_hint') or exp['unit']}，文中为 {v['num']:g}"
+                    f"{a.get('unit_hint') or exp['unit']}，请按上限改写。"))
+                s.decision(
+                    f"{entity}{attr} {v['raw']} 超过上限 {exp['num']}{exp['unit']}，报 issue",
+                    a["rule_id"], f"超限（{v['raw']} > {exp['num']}{exp['unit']}）",
+                    ["minor"], "上限属可核验硬事实，超限直接报")
             else:
-                s.decision(f"{entity}{attr} 年份 {yr} 与事实库一致，不报", a["rule_id"],
-                           "年份匹配", ["blocker"], "事实一致无需报")
+                s.decision(f"{entity}{attr} {v['raw']} 未超上限，不报", a["rule_id"],
+                           f"{v['raw']} ≤ 上限 {exp['num']}{exp['unit']}",
+                           ["blocker"], "未超限即合规，低于是合法区间不构成问题")
+        elif a["type"] == "date":
+            # 旧实现：attr 前 40 字窗口取第一个日期。两个坑：
+            #   ① 窗口跨句，把落款、前文另一个日期当成断言年份；
+            #   ② 同段出现多部法律（网安法修正 2026 + 数据条例 2025）必然张冠李戴。
+            # 新实现（2026-10-28）：逐个实体出现位置，只在**同一句**内找日期；
+            # attr（如「施行」）也必须在句内——「网络安全法」和「施行」不同句
+            # 就不算同一断言，宁可不判。锚点取 attr 的句内位置（无 attr 退回实体
+            # 位置），取距锚点最近的日期作为被核验年份。
+            tr = time.perf_counter()
+            checked = 0
+            for m_ent in re.finditer(re.escape(entity), text):
+                sent_start = _sent_start(text, m_ent.start())
+                sent_end = _sent_end(text, m_ent.end())
+                sent = text[sent_start:sent_end]
+                anchor_off = sent.find(attr) if attr and attr != entity else -1
+                if attr and attr != entity and anchor_off < 0:
+                    continue            # attr 不在同句 → 不是同一断言，跳过该出现处
+                anchor = anchor_off if anchor_off >= 0 else m_ent.start() - sent_start
+                dates = regex_check.extract_dates(sent)
+                s.tool("regex_check", f"{entity} 日期抽取", f"候选 {len(dates)} 个",
+                       (time.perf_counter() - tr) * 1000, "success")
+                if not dates:
+                    continue
+                nearest = min(dates, key=lambda d: min(
+                    abs(d["start"] - anchor), abs(d["end"] - anchor)))
+                checked += 1
+                yr = nearest["year"]
+                if yr != a["expected_year"]:
+                    note_fact(s, a)
+                    quote = sentence_at(text, sent_start + nearest["start"])
+                    loc = f"第 {sentence_no(text, m_ent.start())} 句"
+                    ev = a.get("note", "事实库无对应条目")
+                    s.add_issue(s.make_issue(
+                        "fact", a["rule_id"], quote, loc, ev,
+                        "retrieve + regex", 0.85,
+                        f"年份不符，建议核对为 {a['expected_year']} 年。"))
+                    s.decision(f"{entity}{attr} 年份 {yr} 与事实库 {a['expected_year']} 不符，报 issue",
+                               a["rule_id"], f"年份偏差（{yr} vs {a['expected_year']}）",
+                               ["minor"], "年份属可核验硬事实，直接报")
+                else:
+                    s.decision(f"{entity}{attr} 年份 {yr} 与事实库一致，不报", a["rule_id"],
+                               "年份匹配", ["blocker"], "事实一致无需报")
+            if not checked:
+                s.decision(f"{entity}{attr} 未找到实体与日期同句的出现处，不判",
+                           a["rule_id"], "同句内无日期（宁漏不误）",
+                           ["minor"], "跨句猜年份是上一版的误报源")
+    # 事实库里「被点名但还没有断言」的高频实体：显式记录下来，交给 limitations。
+    # 这一步的意义不是多报一条问题，而是让读者知道"这些实体本次没判真伪"——
+    # 否则「没报事实错误」会被读成「事实都对」。
+    watch = facts.get("watchlist") or []
+    seen_watch = []
+    for w in watch:
+        name = str(w.get("entity") or "")
+        if name and name in text and name not in seen_watch:
+            seen_watch.append(name)
+    if seen_watch:
+        s.unverified_hits = seen_watch
     fact_heuristics(s, text, active_ids)
     return s
 
@@ -804,13 +950,13 @@ def compliance_review(s: Session, text, rules, target_type):
         checks = {
             "COMP-001": ((has_affirmative_term(text, ["甲方"])
                           and has_affirmative_term(text, ["乙方"])),
-                         "未检索到明确的双方主体（甲方/乙方）"),
+                         "未检索到明确的双方主体（甲方/乙方）", "head"),
             "COMP-002": ((has_affirmative_term(text, ["生效"])
                           and (has_affirmative_term(text, ["终止"])
                                or has_affirmative_term(text, ["有效期"]))),
-                         "未检索到生效/终止条款"),
+                         "未检索到生效/终止条款", "tail"),
             "COMP-003": (has_affirmative_term(text, ["争议", "仲裁", "诉讼"]),
-                         "未检索到争议解决条款（仲裁/诉讼）"),
+                         "未检索到争议解决条款（仲裁/诉讼）", "tail"),
         }
         s.decision("合同审采用关键词 + 否定语境预筛", "OVERALL-005",
                    "Demo 无条款结构解析器，仅做要件存在性初筛",
@@ -820,13 +966,19 @@ def compliance_review(s: Session, text, rules, target_type):
             "COMP-002": "已核验：合同含生效与终止条款",
             "COMP-003": "已核验：合同含争议解决条款",
         }
-        for rid, (ok, msg) in checks.items():
+        for rid, (ok, msg, where) in checks.items():
             if rid not in ridset:
                 continue
             if not ok:
+                anchor = clause_anchor(text, where)
+                loc = ("合同开头（主体信息处）" if where == "head"
+                       else "文末（最后一条之后，应在此处补该条款）")
                 s.add_issue(s.make_issue(
-                    "compliance", rid, doc_anchor(text), "全文（缺失要件，无对应原文）",
-                    f"clause_presence_check 未命中：{msg}", "regex + checklist", 0.9,
+                    "compliance", rid, anchor, loc,
+                    f"clause_presence_check 未命中：{msg}。"
+                    f"缺失定位：{'开头' if where == 'head' else '文末'}「{anchor[:24]}」"
+                    f"{'之前' if where == 'head' else '之后'}未见该要件（全文 {len(text)} 字符）",
+                    "regex + checklist", 0.9,
                     f"补充 {rid} 要求的条款，否则合同要件不完整。"))
                 s.decision(f"合规缺失 {rid} 定为 {RULE_BY_ID[rid]['severity']}", rid,
                            msg, ["minor"], "合同要件缺失影响可执行性，属 major")
@@ -982,6 +1134,80 @@ def drop_covered_comp004(s: Session):
         s.decision(f"COMP-004 去重 {dropped} 条", "COMP-004",
                    "该句已由算术/事实规则报出，披露提示不再重复叠加",
                    ["逐条保留"], "同一句话重复两条不同规则的提示，只会稀释信噪比")
+    return s
+
+
+# 同片段「归口」表：键是线索级规则，值是它该让位的结论级规则。
+# 红队 B1/B2 说的是同一件事——同一句话被两条规则命中、一条 minor 一条 major，
+# 用户看到的是"口径不清"，真正的"量级矛盾"被埋了。
+# 处理原则不是删问题，而是**定归口**：结论级规则在就折叠线索级，进 suppressed 留痕。
+FOLD_INTO = {
+    "FACT-003": ("LOGIC-003", "LOGIC-005", "LOGIC-002", "LOGIC-008"),
+    "FACT-004": ("LOGIC-001", "LOGIC-002", "LOGIC-009"),
+}
+
+# 内部工作进度语境：这些数字是"自己干了多少"，本身就是原始记录，
+# 要求它给自己标外部来源是范畴错误（红队 B3：「联调完成 8/10」被判无出处）。
+INTERNAL_SCOPE = re.compile(
+    r"(本周|上周|本月|上月|本季|内部|对内|本项目|项目组|团队|进度|里程碑|"
+    r"联调|内测|排期|交付|剩余|待办|计划|完成率|收尾)")
+
+
+def drop_internal_progress_comp004(s: Session):
+    """内部进度类数字不按「对外披露」要求来源。
+
+    COMP-004 的原文是"披露具体数据/统计结论时须标注口径与时间"——对内的工作
+    进度（8/10 个接口联调完成）既不是披露，也没有外部来源可标。模型按字面套用
+    会稳定误报一条 minor，把"周报本来就没问题"变成"周报有问题"。
+    只在**没有外部数据语境**时豁免，内部周报里引用行业数据照样要求标来源。
+    """
+    kept, dropped = [], []
+    for it in s.issues:
+        if it["rule_id"] != "COMP-004":
+            kept.append(it)
+            continue
+        if INTERNAL_SCOPE.search(it["quote"]) and not EXTERNAL_SCOPE.search(it["quote"]):
+            it = dict(it)
+            it["fold_reason"] = "内部工作进度不属于「对外披露数据」，不要求外部来源"
+            dropped.append(it)
+            continue
+        kept.append(it)
+    if dropped:
+        s.issues[:] = kept
+        s.folded.extend(dropped)
+        s.decision(f"COMP-004 内部进度豁免 {len(dropped)} 条", "COMP-004",
+                   "命中内部语境（本周/进度/完成…）且无外部数据语境",
+                   ["按披露规范报"], "对内进度不是披露数据，要求外部来源属范畴错误")
+    return s
+
+
+def collapse_rule_overlap(s: Session):
+    """同一片段上线索级 fact 规则让位给结论级 logic 规则（数据不丢，进 suppressed）。"""
+    rank = {"blocker": 0, "major": 1, "minor": 2, "nit": 3}
+    kept, folded = [], []
+    for it in s.issues:
+        rivals = FOLD_INTO.get(it["rule_id"]) or ()
+        rival = next((o for o in s.issues
+                      if o is not it and o["rule_id"] in rivals
+                      and rank.get(o["severity"], 9) <= rank.get(it["severity"], 9)
+                      and _quote_overlap(o["quote"], it["quote"]) >= 0.6), None)
+        if rival is None:
+            kept.append(it)
+            continue
+        it = dict(it)
+        it["folded_into"] = rival["rule_id"]
+        it["fold_reason"] = (
+            f"同一片段已由 {rival['rule_id']}（{rival['severity']}）判定，"
+            f"{it['rule_id']}（{it['severity']}）作为同源线索不重复列出")
+        folded.append(it)
+    if folded:
+        s.issues[:] = kept
+        s.folded.extend(folded)
+        s.decision(
+            f"同片段归口折叠 {len(folded)} 条", folded[0].get("folded_into", "OVERALL"),
+            "；".join(f"{f['rule_id']}→{f['folded_into']}" for f in folded)[:200],
+            ["逐条并列展示"], "同一现象两条规则一轻一重，用户只会看到轻的那条；"
+                              "折叠后仍可在报告 suppressed 里查到，不丢证据")
     return s
 
 
@@ -1197,10 +1423,14 @@ def docx_format_review(s: Session, text, rules, ctx):
     只对 Word 文档生效：非 docx 路径直接跳过（该维度只进入 docx 类型的
     dims_for，其它类型不会走到这里）。文本与版式分离：文本链路已由
     read_target_text 提取，这里重读结构（解析开销小，保证结构新鲜）。
+
+    **阈值来自格式规格**（ctx["format_spec"]），不来自代码常量。
+    规格里没写的那一项就不检查——没有委托方标准时，"字号对不对"没有答案。
     """
     path = ctx.get("target_path")
     if not path or Path(path).suffix.lower() not in (".docx", ".docm"):
         return s
+    spec = ctx.get("format_spec") or {}
     try:
         info = docx_extract.extract(path)
     except Exception as e:                                     # noqa: BLE001
@@ -1211,7 +1441,7 @@ def docx_format_review(s: Session, text, rules, ctx):
         return s
     ridset = {r["rule_id"] for r in rules}
     added = 0
-    for f in docx_format_checks.run_all(info, ridset):
+    for f in docx_format_checks.run_all(info, ridset, spec):
         if any(i["rule_id"] == f["rule_id"] and _quote_overlap(i["quote"], f["quote"]) >= 0.8
                for i in s.issues):
             continue
@@ -1323,12 +1553,14 @@ def _agent_rule_sources(agent):
     return out or ["(未声明规则来源)"]
 
 
-def run_agent_steps(s, agent, text, active, target_path):
+def run_agent_steps(s, agent, text, active, target_path, format_spec=None):
     """按 manifest 执行：先维度处理器（声明顺序），再附加检查。
 
     返回执过的处理器名列表，写进 S3 日志——用户要能看到"这次到底跑了哪些检查"。
+    format_spec：格式规格的 check 块（只有 format 维用得上），随 ctx 传给处理器。
     """
-    ctx = {"target_path": target_path, "target_type": s.target_type, "agent": agent}
+    ctx = {"target_path": target_path, "target_type": s.target_type, "agent": agent,
+           "format_spec": format_spec}
     executed = []
     for dim in agent.dims_for(s.target_type):
         key = agent.handler_for(dim)
@@ -1392,6 +1624,9 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
             if any(r["dimension"] == d for r in active)]
     existing = list(s.issues)
     charter = build_charter(target_type, agent=agent)
+    # 事实库进 prompt：事实维度必须拿 facts.json 当唯一证据，
+    # 否则模型会退回参数记忆，"独立裁判"就只剩一条哈希链（2026-10-28）。
+    llm_facts = retrieve.load_facts()
     # 用户给的「审查目的」并入任务书：模型据此判断哪些问题值得报，
     # 但 quote 必须仍来自原文（校验不放宽）。
     _pblock = purpose_mod.charter_block(purpose_info)
@@ -1455,7 +1690,7 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
             try:
                 res = llm_review.review_dimension(
                     client, dim, dim_rules, chunk, cfg, charter=charter,
-                    full_text=text if chunked else None)
+                    full_text=text if chunked else None, facts=llm_facts)
             except llm_client.LLMError as e:
                 elapsed = (time.perf_counter() - started) * 1000
                 s.llm_usage["failures"] += 1
@@ -1584,6 +1819,47 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
 # ----------------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------------
+LEDGER_LOCK_NAME = ".chain.lock"
+
+
+def _acquire_ledger_lock(timeout=30.0):
+    """拿台账写锁（O_EXCL 锁文件，进程内线程与多进程共用一套）。
+
+    为什么必须锁：追加一条台账 = 「读最后一行取 prev_hash → 算 report_hash → 追加」。
+    这三步不是原子的，两个审查同时收尾会读到同一个 prev，写出两条 seq 相同的记录，
+    链条当场断裂（实测 6 路并发 → `序号不连续 @line2`），而且**报告本身看起来都正常**，
+    只有事后 verify 才发现。这类"生产时无感、审计时才炸"的损坏必须从源头堵。
+    """
+    LEDGER.mkdir(parents=True, exist_ok=True)
+    lock = LEDGER / LEDGER_LOCK_NAME
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            # 进程被强杀会留下锁文件：超龄（60s）视为陈旧，直接清掉，不能永久堵死
+            try:
+                if time.time() - lock.stat().st_mtime > 60:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"等待台账写锁超时（{timeout:.0f}s）：{lock}；"
+                    "如确认没有审查在跑，可手工删除该锁文件")
+            time.sleep(0.01)
+
+
+def _release_ledger_lock(lock):
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+
+
 def allocate_review_id(date):
     """从 outputs/ + ledger 已用 ID 中取下一个，并用 O_EXCL 锁文件防并发覆盖。"""
     used = {p.stem for p in OUTPUTS.glob(f"R-{date}-*.json")}
@@ -1629,6 +1905,10 @@ def allocate_review_id(date):
 TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "gb18030", "utf-16", "utf-16-le", "utf-16-be")
 
 
+class UnreadableTargetError(ValueError):
+    """待审目标不可读（docx 损坏/缺失/非文档）。CLI 与 server 捕获后给出明确错误。"""
+
+
 def read_target_text(path: Path):
     """按候选编码读取待审文本，返回 (text, encoding, warning)。
 
@@ -1655,10 +1935,24 @@ def read_target_text(path: Path):
 
 def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             type_override=None, agent_id=None, purpose=None, purpose_max=None,
-            purpose_notes=None, scenario=None):
+            purpose_notes=None, scenario=None, format_spec=None):
     t0 = time.perf_counter()
     # 非 UTF-8（GBK/UTF-16）不能让整个进程崩掉：按候选编码依次尝试。
-    text, source_encoding, enc_warn = read_target_text(target_path)
+    try:
+        text, source_encoding, enc_warn = read_target_text(target_path)
+    except (ValueError, OSError) as e:
+        # 目标不可读（docx 损坏 / 文件不存在 / 不是文档）：明确报错，绝不带 traceback
+        # 崩溃、也不产出「看起来没问题」的空报告。server 侧已有 returncode!=0 兜底，
+        # 会把这里的错误文本透传给前端。
+        raise UnreadableTargetError(
+            f"无法读取待审文件 {target_path.name}：{e}") from e
+    except Exception as e:                                     # noqa: BLE001
+        # 兜底：解析器的异常类型不受我们控制（xml.etree.ParseError、zipfile 的
+        # 各种子类、第三方库的私有异常…）。全系统暴力测试里 bomb.docx 就是抛
+        # ParseError 一路冒到进程顶部的——审查工具对任意输入的底线是
+        # 「要么给结论、要么给明确错误」，不是「打 traceback」。
+        raise UnreadableTargetError(
+            f"无法读取待审文件 {target_path.name}：{type(e).__name__}: {e}") from e
     # 零宽字符会让「争议」「360万」这类关键词与数字整段失配，
     # 同时制造误报（条款存在却报缺失）与漏检（金额被拆断）——必须在所有匹配前剥离。
     text, invisible_n = regex_check.strip_invisible(text)
@@ -1676,6 +1970,20 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         # 这种"看起来正常"的结果比直接报错危险得多。异常由调用方（main / 测试）处理。
         scenario_info = scenario_mod.apply(scenario, rules)
         rules = scenario_info["rules"]
+
+    # 格式规格：决定「版式按哪套标准判」。它和情境是两个维度——
+    # 情境决定"问不问这类问题"，规格决定"按什么数值判"。
+    # 同样必须在 set_rule_index 之前过滤：没选规格时 FORMAT-001~005 不参与，
+    # 晚过滤等于"关掉的规则还在跑"。
+    #
+    # 只对 docx 生效：纯文本/代码目标不涉及版式，套一遍只会往 limitations 塞噪音。
+    # 没显式选规格时用配置里的 default（当前是 none = 不做版式判定），
+    # 而不是"留空跳过"——否则规则数虚高、报告里也没有"这一项没查"的说明。
+    format_info = None
+    if target_path.suffix.lower() in (".docx", ".docm"):
+        chosen_spec = format_spec or format_spec_mod.load()["default"]
+        format_info = format_spec_mod.apply(chosen_spec, rules)
+        rules = format_info["rules"]
     set_rule_index(rules)
 
     # 生成 review_id（ledger 已用 ID + O_EXCL 锁，避免并发/清理后覆盖）
@@ -1701,6 +2009,18 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             f"情境 {scenario_info['id']}｜关闭：{'、'.join(_ids) or '无'}",
             ["通用情境全规则审查（会报出初筛阶段无法行动的核验类问题）"],
             "情境只决定哪些规则参与，不改判定标准与严重度；关闭项已写入报告 limitations")
+
+    if format_info:
+        _ids = [x["rule_id"] for x in format_info["skipped"]]
+        _kn = sorted(format_info["check"])
+        s.decision(
+            f"格式规格：{format_info['name']}（判定项 {len(_kn)} 项）",
+            "OVERALL-011",
+            f"规格 {format_info['id']}@{format_info['version']}｜判定项：{'、'.join(_kn) or '无'}"
+            f"｜不参与：{'、'.join(_ids) or '无'}",
+            ["按内置的某一套固定版式标准判（换份委托要求就不适用）"],
+            "版式标准随委托方格式要求变化，规格化后换标准不必改代码；"
+            "未判定项已写入报告 limitations")
 
     # 「审查目的」解析放在最前面：它决定后面 LLM 的任务书内容，
     # 也决定 S5.5 要比对哪些目标。解析本身是确定性的（词典 + 二元组，不调模型）。
@@ -1789,10 +2109,15 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # ---- S3 分维审查 ----
     t = time.perf_counter()
     # 按 Agent manifest 调度：维度处理器（声明顺序）→ 附加检查 → 语义审
-    s, executed = run_agent_steps(s, agent, text, active, target_path)
+    s, executed = run_agent_steps(s, agent, text, active, target_path,
+                                  format_spec=(format_info or {}).get("check"))
     s, review_mode, llm_meta = semantic_review(s, text, active, s.target_type,
                                               use_llm, dims=dims, agent=agent,
                                               purpose_info=purpose_info)
+    # 归口必须在语义审之后：线索级规则在 S2 就产生了，但"让位给谁"要等模型
+    # 给出结论级判定才知道（纯规则模式下没有对手，线索照常保留）。
+    collapse_rule_overlap(s)
+    drop_internal_progress_comp004(s)
     dim_detail = {}
     for d, info in (llm_meta.get("dimensions") or {}).items():
         line = (f"新增 {info.get('added', 0)} / 候选 {info.get('candidates', 0)}"
@@ -1924,6 +2249,9 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             s.decision(f"同类提示聚合 {len(folded_ids)} 条", "OVERALL-006",
                        f"规则 {sorted(ADVISORY_RULES)} 下重复条目合并为一条示例，其余进 suppressed",
                        ["逐条展示"], "同一句提示重复几十条会淹没真问题；数据未丢失，可查 suppressed")
+    # 归口折叠的条目（同片段让位给结论级规则 / 内部进度豁免）也要落到报告里：
+    # 折叠 ≠ 删除，每条都带 folded_into + fold_reason，可在 JSON 里回查。
+    suppressed.extend(getattr(s, "folded", []) or [])
     if stats["blocker"] > 0:
         verdict = "fail"
     elif stats["major"] > 0:
@@ -2027,6 +2355,10 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # 后面的编码告警与输入截断会 insert(0)，仍排在它之前（那两种更严重）。
     if scenario_info and scenario_info["limitations"]:
         limitations.extend(scenario_info["limitations"])
+    # 格式规格的说明同样属于"这一整类问题本次没查"：没选规格时字体/字号/缩进/
+    # 行距/标题层级一律不判。「未报出版式问题」不能被读成「版式合规」。
+    if format_info and format_info["limitations"]:
+        limitations.extend(format_info["limitations"])
     if invisible_n:
         limitations.append(
             f"原文含 {invisible_n} 个零宽/不可见字符（U+200B 等），已剥离后再匹配；"
@@ -2044,6 +2376,31 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     elif matched_count < total_assertions:
         limitations.append(
             f"事实库共 {total_assertions} 条断言，本次仅匹配 {matched_count} 条，未覆盖部分需人工核验。")
+    # 事实审的弹药边界必须自报：库外实体只判"缺出处"，不判真伪。
+    # 不写这句，读者会把"没报事实错误"当成"事实全对"。
+    if "fact" in dims and total_assertions:
+        _ents = []
+        for _a in fact_assertions:
+            _e = str(_a.get("entity") or "")
+            if _e and _e not in _ents:
+                _ents.append(_e)
+        limitations.append(
+            f"事实审的证据仅限事实库内 {total_assertions} 条断言（涉及："
+            f"{'、'.join(_ents[:8])}{'等' if len(_ents) > 8 else ''}）；"
+            "库外实体只判「缺可核验出处」，不判真伪——要判真伪请先补进 knowledge/facts.json。")
+    # 被点名但还没断言的高频实体：说清"没判"，避免"没报错=都对"
+    if "fact" in dims and (getattr(s, "unverified_hits", None) or []):
+        limitations.append(
+            f"本次文本涉及事实库暂无断言的高频实体："
+            f"{'、'.join(s.unverified_hits[:6])}——其数字/日期**未做真伪判定**"
+            "（不是已核验通过）。")
+    # 规则清单外的模型发现：必须自报来源，否则读者会当成"规则级判定"
+    open_n = int((llm_meta or {}).get("open_discoveries") or 0)
+    if open_n:
+        limitations.append(
+            f"模型另报 {open_n} 条「规则清单外发现」（rule_id 以 OPEN- 开头）："
+            "来源=模型推测、未经规则库定义、不参与规则覆盖率统计，严重度取默认 minor 档，"
+            "须人工确认后再采信。")
     if review_mode == "rule-only":
         limitations.append("本次为纯规则审查，LLM 语义审未成功执行，复杂语义/长文推理未覆盖。")
     # 输入截断：最严重的一种"没审"，必须排在最前，避免被后面的条目淹没
@@ -2173,6 +2530,18 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             "disabled_rules": [x["rule_id"] for x in scenario_info["skipped"]],
             "disabled_detail": scenario_info["skipped"],
         } if scenario_info else None),
+        # 格式规格：这次版式按哪套标准判。只对 docx 有值（其余类型为 null）。
+        # 记 source 是为了半年后能回答「这条 22 磅是从哪份文件来的」。
+        "format_spec": ({
+            "id": format_info["id"],
+            "name": format_info["name"],
+            "version": format_info["version"],
+            "source": format_info["source"],
+            "desc": format_info["desc"],
+            "criteria": format_info["check"],
+            "disabled_rules": [x["rule_id"] for x in format_info["skipped"]],
+            "disabled_detail": format_info["skipped"],
+        } if format_info else None),
         "target_path": target_rel,
         # 原文快照：标注视图用（与 issue.quote 的校验基准完全一致，
         # 不受原文件之后被修改/删除的影响）
@@ -2212,6 +2581,14 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         "issues": issues_sorted,
         # 模型自否的条目：不进 to_fix / 统计，但保留下来（模型曾怀疑过也是信息）
         "excluded": list((llm_meta or {}).get("excluded") or []),
+        # 规则清单外发现（OPEN-*）：单独列一份，标明来源=模型。
+        # 不列出来，这些条目会混在 issues 里看着像"规则判定"，审计时无法区分。
+        "open_discoveries": [
+            {"rule_id": i["rule_id"], "severity": i["severity"],
+             "quote": (i.get("quote") or "")[:120],
+             "confidence": i.get("confidence"), "source": "model"}
+            for i in issues_sorted if i.get("open_discovery")
+        ],
         # 折叠的次要条目：JSON 完整保留，清单不展开（数量在 limitations 里说明）
         "suppressed": suppressed,
         "disputes": s.disputes,
@@ -2267,27 +2644,35 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     report["integrity"]["logs_hash"] = logs_hash
 
     # ledger 链（文件可能尚不存在，需先判断：先确定 prev_report_hash，再算 report_hash）
+    #
+    # 「读 prev → 算 report_hash → 追加」必须在同一把锁内完成：report_hash 里含
+    # prev_report_hash，读和写之间只要插进另一个审查，两条记录就会指向同一个 prev，
+    # 链条断裂。锁的粒度只覆盖这三步，不包住文件写盘（那部分按 review_id 互不相干）。
     ledger_path = LEDGER / "chain.log"
-    prev = "0" * 64
-    seq_no = 1
-    if ledger_path.exists():
-        lines = [l for l in ledger_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-        if lines:
-            prev = json.loads(lines[-1]).get("report_hash", "0" * 64)
-            seq_no = len(lines) + 1
-    report["integrity"]["prev_report_hash"] = prev
+    lock = _acquire_ledger_lock()
+    try:
+        prev = "0" * 64
+        seq_no = 1
+        if ledger_path.exists():
+            lines = [l for l in ledger_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if lines:
+                prev = json.loads(lines[-1]).get("report_hash", "0" * 64)
+                seq_no = len(lines) + 1
+        report["integrity"]["prev_report_hash"] = prev
 
-    # report_hash（自指处理：必须在 prev_report_hash 写入之后再算，否则校验对不上）
-    report["integrity"]["report_hash"] = integrity.compute_report_hash(report)
+        # report_hash（自指处理：必须在 prev_report_hash 写入之后再算，否则校验对不上）
+        report["integrity"]["report_hash"] = integrity.compute_report_hash(report)
 
-    with open(ledger_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "seq": seq_no, "review_id": review_id, "target_hash": target_hash,
-            "report_hash": report["integrity"]["report_hash"], "prev_hash": prev,
-            "rules_dir_hash": rules_dir_hash,
-            "rules_version": integrity.rules_version(),
-            "ts": now_iso(),
-        }, ensure_ascii=False) + "\n")
+        with open(ledger_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "seq": seq_no, "review_id": review_id, "target_hash": target_hash,
+                "report_hash": report["integrity"]["report_hash"], "prev_hash": prev,
+                "rules_dir_hash": rules_dir_hash,
+                "rules_version": integrity.rules_version(),
+                "ts": now_iso(),
+            }, ensure_ascii=False) + "\n")
+    finally:
+        _release_ledger_lock(lock)
 
     # 输出 JSON + MD
     out_json = OUTPUTS / f"{review_id}.json"
@@ -2584,6 +2969,39 @@ def main():
             sys.exit(2)
         print(f"未知审查情境：{scenario}；可选：{opts}")
         sys.exit(2)
+    format_spec = None
+    if "--format-spec" in args:
+        i = args.index("--format-spec")
+        if i + 1 < len(args):
+            format_spec = args[i + 1]
+            del args[i:i + 2]
+        else:
+            del args[i]
+            try:
+                opts = "、".join(s["id"] for s in format_spec_mod.load()["specs"])
+            except format_spec_mod.FormatSpecError as e:
+                opts = f"（格式规格配置读取失败：{e}）"
+            print(f"--format-spec 缺少取值。可用：{opts}")
+            sys.exit(2)
+    if "--list-format-specs" in args:
+        data = format_spec_mod.load()
+        print(f"可用格式规格（默认 {data['default']}，配置版本 {data['version']}）：")
+        for s in data["specs"]:
+            print(f"  {s['id']:<24}{s['name']}")
+            print(f"      判定项：{'、'.join(sorted(s['check'])) or '无'}")
+            if s["source"]:
+                print(f"      来源：{s['source']}")
+            if s["disable_rules"]:
+                print(f"      不参与：{'、'.join(s['disable_rules'])}")
+        return
+    if format_spec and format_spec_mod.get(format_spec) is None:
+        try:
+            opts = "、".join(s["id"] for s in format_spec_mod.load()["specs"])
+        except format_spec_mod.FormatSpecError as e:
+            print(f"格式规格错误：{e}")
+            sys.exit(2)
+        print(f"未知格式规格：{format_spec}；可选：{opts}")
+        sys.exit(2)
     if "--agent" in args:
         i = args.index("--agent")
         if i + 1 < len(args):
@@ -2682,6 +3100,8 @@ def main():
         print("\n可选参数：--llm 强制调用大模型；--no-llm 强制纯规则审；"
               "--type 显式指定对象类型；--agent 指定审查 Agent（--list-agents 查看）；"
               "--scenario 指定审查情境（--list-scenarios 查看：不同用途关掉不同规则）；"
+              "--format-spec 指定格式规格（--list-format-specs 查看：docx 版式按哪套标准判，"
+              "默认 none 即不判字体字号行距）；"
               "--purpose \"这份文本想干什么\"（按目的派生目标并定位证据，默认解析前 300 字）；"
               "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）")
         return
@@ -2695,16 +3115,24 @@ def main():
         report = run_one(target_path, rules, use_llm=use_llm,
                          progress_path=progress_path, type_override=type_override,
                          agent_id=agent_id, purpose=purpose, purpose_max=purpose_max,
-                         purpose_notes=purpose_notes, scenario=scenario)
+                         purpose_notes=purpose_notes, scenario=scenario,
+                         format_spec=format_spec)
     except agent_spec.AgentError as e:
         print(f"Agent 配置错误：{e}")
         sys.exit(2)
     except scenario_mod.ScenarioError as e:
         print(f"审查情境错误：{e}")
         sys.exit(2)
+    except format_spec_mod.FormatSpecError as e:
+        print(f"格式规格错误：{e}")
+        sys.exit(2)
+    except UnreadableTargetError as e:
+        print(f"目标不可读：{e}")
+        sys.exit(1)
     print(f"[{report['review_id']}] 裁定={report['verdict']} | "
           f"Agent={(report.get('agent') or {}).get('id')} | "
           f"情境={(report.get('scenario') or {}).get('id') or '-'} | "
+          f"规格={(report.get('format_spec') or {}).get('id') or '-'} | "
           f"模式={report['review_mode']} | 异议 {len(report['issues'])} 条 | "
           f"输出：outputs/{report['review_id']}.json/.md")
 

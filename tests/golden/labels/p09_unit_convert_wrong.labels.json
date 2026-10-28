@@ -1,0 +1,16 @@
+{
+ "errors": [
+  {
+   "id": "L1",
+   "desc": "1.2亿≠1200万",
+   "match": [
+    [
+     "换算相差"
+    ]
+   ],
+   "exclude_dimensions": [
+    "style"
+   ]
+  }
+ ]
+}

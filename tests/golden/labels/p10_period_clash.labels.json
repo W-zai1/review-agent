@@ -1,0 +1,16 @@
+{
+ "errors": [
+  {
+   "id": "L1",
+   "desc": "同口径方向互斥",
+   "match": [
+    [
+     "方向互斥"
+    ]
+   ],
+   "exclude_dimensions": [
+    "style"
+   ]
+  }
+ ]
+}

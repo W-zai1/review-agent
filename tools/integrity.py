@@ -122,8 +122,11 @@ def rules_version(root=None):
     root = root or _root()
     path = os.path.join(root, "config", "rules_version.txt")
     try:
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip() or "unversioned"
+        # utf-8-sig：版本文件常被记事本另存为带 BOM，BOM 会跟着版本号一起进报告
+        # （实测 R-20261027-005 的 rules_version 首字符是 \ufeff：肉眼看不见，
+        # 但它会让"版本号等于某个字面量"的判断、前端展示、跨工具比对全部失准）
+        with open(path, encoding="utf-8-sig") as f:
+            return f.read().lstrip("\ufeff").strip() or "unversioned"
     except OSError:
         return "unversioned"
 

@@ -44,6 +44,8 @@ const state = {
   agent: "auto",
   scenarios: [],
   scenario: "",
+  formatSpecs: [],
+  formatSpec: "",
   llm: null,
   llmHistory: [],
   providers: [],
@@ -1685,11 +1687,23 @@ function renderStatusBar(report) {
       + `</span>`
     : "";
 
+  // 格式规格 chip：版式结论只在"选定了委托方标准"时才有意义。
+  // 没选时必须显示「未提供标准」，否则读者会以为"没报版式问题 = 版式合规"。
+  const fmt = report.format_spec || null;
+  const fmtCrit = (fmt && fmt.criteria) || {};
+  const fmtChip = fmt
+    ? `<span class="rs-fmt${fmt.id === "none" ? " is-none" : ""}" title="${esc(
+        Object.entries(fmtCrit).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join("\n")
+        || "本规格未规定任何版式数值")}${fmt.source ? "\n出处：" + fmt.source : ""}">`
+      + (fmt.id === "none" ? "版式：未提供标准" : `版式：${esc(fmt.name || fmt.id)}`)
+      + `</span>`
+    : "";
+
   box.innerHTML = `<span class="rs-badge ${tone}" title="${esc(badgeDesc)}"><i></i>${esc(badge)}</span>
     <span class="rs-sid">审查结果 ${esc(report.review_id || "")}<span class="rs-tag">${esc(report.review_mode || "rule-only")}${agentName ? " · " + esc(agentName) : ""}</span></span>
     <div class="rs-meta">
       <div>${esc(basename(report.target_path))} · ${esc(relTime(report.timestamp))}</div>
-      <div>${covHtml}${covHtml ? '<span class="rs-sep">·</span>' : ""}${esc(issueText)}${scnChip}</div>
+      <div>${covHtml}${covHtml ? '<span class="rs-sep">·</span>' : ""}${esc(issueText)}${scnChip}${fmtChip}</div>
     </div>`;
 }
 
@@ -2067,6 +2081,15 @@ function renderTech(report) {
     const off = sc.disabled_rules || [];
     bits.push(`情境 <b>${esc(sc.name || sc.id)}</b>`
       + (off.length ? `（关闭 ${esc(String(off.length))} 条：${esc(off.join("、"))}）` : ""));
+  }
+  // 格式规格：写明"按哪套标准判、判了哪几项"。没选时说明"版式未判"，
+  // 不能留空——留空会被读成"版式没问题"。
+  if (report.format_spec) {
+    const fs = report.format_spec;
+    const keys = Object.keys(fs.criteria || {});
+    bits.push(`版式规格 <b>${esc(fs.name || fs.id)}</b>`
+      + (keys.length ? `（判 ${esc(String(keys.length))} 项：${esc(keys.join("、"))}）`
+        : "（<b>未判</b>：未提供格式标准）"));
   }
   box.innerHTML = `<b>技术参数</b> · ${bits.join(" · ")}`;
 }
@@ -2576,6 +2599,8 @@ async function startReview(llmOverride) {
   const payload = { file: state.selected.rel };
   if (state.agent && state.agent !== "auto") payload.agent = state.agent;
   if (state.scenario) payload.scenario = state.scenario;
+  // 格式规格只对 .docx 有意义；不选就不传，让后端用默认 none（并写进 limitations）
+  if (state.formatSpec) payload.format_spec = state.formatSpec;
   if (llmOverride === true || llmOverride === false) payload.llm = llmOverride;
   const purpose = currentPurpose();
   if (purpose) payload.purpose = purpose;
@@ -3152,6 +3177,7 @@ async function init() {
   await loadTargets();
   await loadAgents();
   await loadScenarios();
+  await loadFormatSpecs();
   await loadRules();
   await loadIntegrity();
   await loadReports();
@@ -3231,6 +3257,56 @@ async function loadScenarios() {
       return;
     }
     hint.textContent = `${it.desc}${it.keep_note ? "｜仍然检查：" + it.keep_note : ""}`;
+    hint.classList.toggle("is-warn", (it.disabled_count || 0) > 0);
+  };
+  sel.addEventListener("change", sync);
+  sync();
+}
+
+/** 格式规格（docx 版式按哪套标准判）。
+ *
+ * 为什么要选：字体/字号/行距没有"通用正确答案"，只有"委托方要求"。
+ * 「宋体小四、固定 22 磅」是某份课程报告的标准，换份期刊就全变。
+ * 不选 = 不判这几项，并在报告 limitations 写明「未报出 ≠ 合规」。
+ */
+async function loadFormatSpecs() {
+  const sel = $("#formatSpecSelect");
+  const hint = $("#formatSpecHint");
+  if (!sel) return;
+  let data;
+  try {
+    data = await api("/api/format-specs");
+  } catch (e) {
+    data = { ok: false, error: `读取格式规格失败：${e && e.message ? e.message : e}` };
+  }
+  if (!data || !data.ok) {
+    sel.innerHTML = '<option value="">（格式规格读取失败）</option>';
+    sel.disabled = true;
+    if (hint) {
+      hint.textContent = (data && data.error) || "格式规格读取失败";
+      hint.classList.add("is-error");
+    }
+    return;
+  }
+  const items = data.items || [];
+  state.formatSpecs = items;
+  const usable = items.filter((x) => x.id !== (data.default || "none"));
+  sel.innerHTML = [`<option value="">不判版式（默认）</option>`]
+    .concat(usable.map((x) => `<option value="${esc(x.id)}">${esc(x.name)}`
+      + (x.checks && x.checks.length ? `（${esc(x.checks.join("/"))}）` : "")
+      + `</option>`))
+    .join("");
+  sel.disabled = !usable.length;
+  const sync = () => {
+    state.formatSpec = sel.value;
+    const it = items.find((x) => x.id === sel.value);
+    hint.classList.remove("is-error");
+    if (!it) {
+      hint.textContent = "仅对 .docx 生效：不判字体/字号/行距";
+      hint.classList.remove("is-warn");
+      return;
+    }
+    hint.textContent = `${it.desc}${it.source ? "｜出处：" + it.source : ""}`;
     hint.classList.toggle("is-warn", (it.disabled_count || 0) > 0);
   };
   sel.addEventListener("change", sync);

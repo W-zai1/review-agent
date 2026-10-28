@@ -17,7 +17,7 @@
 每条记录固定四行，字段不许省：
 
 ```md
-### 2026-10-27 · 修改 · 一句话标题
+### YYYY-MM-DD · 修改 · 一句话标题
 
 - **文件**：`path/a.py`（+ `tests/x.py`、`README.md` §n）
 - **改了什么**：删了/加了/换了什么，写到能照着复现的程度
@@ -42,7 +42,239 @@
 
 ---
 
+# 2026-10-28
+
+### 2026-10-28 · 修改 · 事实库 7 → 9 条：新增「上限」类型与年度口径（红队 A1/A2/A3）
+
+- **文件**：`knowledge/facts.json`（7 → 9 条断言 + `watchlist` 4 条）、`knowledge/kb_laws.md`（新增「数值类条款」表）、`config/knowledge_version.txt`（1.0.2 → 1.0.3）、`review.py`（`fact_review` 新增 `max` 分支 / `year_ctx` / `watchlist` 采集；`limitations` 自报未核实体）、`tests/test_fact_library.py`、`tests/test_redteam_20261028.py`（新增）
+- **改了什么**：
+  1. 新增断言 `劳动合同法·试用期`（`type: "max"`，上限 6 个月，`unit_hint: "个月"`）与 `华为·出货量`（2024 年约 5,000 万台，容差 2 倍，`year_ctx: 2024`）。
+  2. `type` 从 {number, date} 扩到第三类 **max**：上限必须单侧判定。旧的 number 是对称容差（`ratio < 1/tol` 也报），拿它判上限会把合法的「试用期 3 个月」算成「偏差 0.5 倍」。
+  3. `year_ctx`：句内没写声明年份就不判——华为 2019 年 2.4 亿台是对的，不能被 2024 年的口径判错。
+  4. `watchlist`：微信 / iPhone / 抖音 / 民法典 四个高频实体**故意不写断言**（口径按季变、单值会互相误伤），改为在报告 limitations 里明说「其数字/日期未做真伪判定」。
+- **为什么**：红队 A1/A2 打得很准——st03（华为 5 亿台）、st04（试用期 12 个月）都抓到了，但抓它们的是 **LOGIC-004 的模型常识**（confidence 0.85，basis=model），事实库一条依据都没有。这正是用户说的"靠模型脑补，独立裁判就破产"：蒙对是运气，且下次不一定蒙对。补库后同一现象由 `FACT-001` 的 `rule` 级命中，evidence 直接指到条款号/数据源。
+- **验证**：
+  - 红队 selftest：st03/st04 从 `LOGIC-004(model, major)` → `FACT-001(rule, blocker)`，`evidence` 含「第十九条」「Canalys 2025-01」，仅凭规则层即可复现。
+  - 9 组突变：12 个月报 / 6 个月不报 / 3 个月不报；华为 5 亿报 / 4840 万不报 / 2019 年 2.4 亿不报（year_ctx 挡住）；iPhone 正确陈述不报且 limitations 出现「未做真伪判定」。
+  - 事实库 schema 锁：`max` 必须带 `unit_hint`（否则「3 人」会被当成 3 个月）；note 必须给日期或条款号（新增 `第X条` 分支）。
+  - 全量回归 **519 项 OK / 225.6s**；金标准 33 例 / 21 标注 / 召回 100% / 精确率 100% / 误报 0。
+
+### 2026-10-28 · 修复 · 缺失条款的证据锚在文档首行，指向「有甲方」而不是「缺争议条款」（红队 C1）
+
+- **文件**：`review.py`（新增 `clause_anchor(text, where)`，`compliance_review` 的 COMP-001/002/003 分别取头/尾锚点）、`tests/test_redteam_20261028.py`
+- **改了什么**：缺失型问题原来一律用 `doc_anchor(text)`（首个非空行）当 `quote`，于是 st17「缺争议解决条款」的 quote 是「甲方：北京示例科技有限公司」——证据指向"有甲方"。现在 `COMP-001`（主体缺失）锚开头，`COMP-002/003`（生效/争议）锚**文末最后一条**，`location` 写成「文末（最后一条之后，应在此处补该条款）」，`evidence` 加「缺失定位：文末「…」之后未见该要件」。
+- **为什么**：`quote` 必须原文逐字是为了前端高亮与回查；但缺失型问题没有病句可引，"逐字可回查"就退化成了"随便找一个真实句子"。锚到文末，读者一眼能对上"本该在这一条后面再补一条"。
+- **验证**：st17 的 `COMP-003.quote` = `本合同自双方签字盖章之日起生效。`（= 原文最后一行，仍逐字）；回归锁 `test_missing_clause_anchors_at_document_tail` 断言 quote 等于末行、location 含「文末」、evidence 含「缺失定位」、且 quote ∈ `target_text`。
+
+### 2026-10-28 · 修改 · 同一现象两条规则一轻一重：FACT-003/004 归口到 LOGIC，折叠留痕（红队 B1/B2）
+
+- **文件**：`review.py`（新增 `collapse_rule_overlap` + `FOLD_INTO` 表，在语义审之后调用；`Session.folded`）、`rules/fact.yaml`（FACT-003/004 的 desc 写明分工）、`config/rules_version.txt`（a3 → a4）、`targets/selftest/{gen_selftest.py,manifest.json}`、`docs/API接口对照表.md`
+- **改了什么**：
+  1. 判据写进规则库：**fact 侧管「有没有前提/口径」，logic 侧管「证据强度/算术矛盾」**；同一句同时命中时由 LOGIC 主判，FACT-003/004 折叠进 `suppressed`，带 `folded_into` + `fold_reason`。
+  2. FACT-003 启发式按**结构**分两档：因果连接词 + 成效/归因词同现 → 按规则原级 `major`（0.72）；只有连接词 → 线索级 `minor`（0.6）。不再靠调阈值，而是靠"句子里有没有成效词"。
+  3. 没有对手（纯规则模式）时线索照常保留——不能为了去重把唯一的判断吞掉。
+- **为什么**：红队 B1/B2 说的是同一件事：st06 的同一句被 FACT-003（minor 0.6）与 LOGIC-003（major）同时报，st07 被 FACT-004（minor）与 LOGIC-001（major）同时报。用户看到的是轻的那条，真问题被埋。
+- **验证**：st06 现只剩 `LOGIC-003 major`、st07 只剩 `LOGIC-001 major`（`HIT`，不再 `HIT_DUP`）；回归锁 4 项覆盖"折叠到结论级""严重度相同也折叠""无对手时保留""纯规则模式不吞线索"。
+
+### 2026-10-28 · 修复 · COMP-004 把内部周报的「联调完成 8/10」当对外披露数据（红队 B3）
+
+- **文件**：`review.py`（新增 `INTERNAL_SCOPE` + `drop_internal_progress_comp004`）、`rules/compliance.yaml`（COMP-004 desc 写明不适用内部进度）、`tests/test_redteam_20261028.py`
+- **改了什么**：COMP-004 命中内部语境（本周/进度/里程碑/联调/内测/完成…）**且**句内没有外部数据语境（行业/市场/全国/第三方/白皮书…）时豁免，条目带 `fold_reason` 进 `suppressed`；内部周报里引用行业数据照样要求标来源。
+- **为什么**：COMP-004 的原文是"披露具体数据/统计结论时须标注口径与来源"。对内的工作进度既不是披露，也没有外部来源可标——要求它给自己标来源是范畴错误。st18 一份完全正常的周报被判 `COMP-004 minor`，属于"为了报而报"。
+- **验证**：st18 从 1 条 minor → **0 条 issue，文档裁定 pass**；回归锁同时锁反向（内部周报引用"行业市场规模 120 亿元"仍报 COMP-004），防止豁免扩大成"内部两字就免死"。
+
+### 2026-10-28 · 新增 · 规则清单外发现（OPEN-*）单独成列并自报来源（红队 C2）
+
+- **文件**：`review.py`（报告新增 `open_discoveries[]`；limitations 自报条数）、`docs/API接口对照表.md` §3.5 + 字段表
+- **改了什么**：`OPEN-*` 本来就带 `open_discovery: true` / `confidence_basis: "model"` / `rule_text`（未经规则库定义）/ 单次上限 3 条 / 默认 minor；这次再加两处可追溯性——报告顶层单独给 `open_discoveries[]{rule_id,severity,quote,confidence,source:"model"}`，`limitations` 写明「模型另报 N 条规则清单外发现，不参与规则覆盖率统计，须人工确认」。顺带修正文档里 `OPEN-*` 默认档写成 major 的过期描述（代码一直是 minor）。
+- **为什么**：红队质疑"OPEN-* 是不是模型即兴发挥"。结论是**有治理但不够显眼**：它混在 `issues[]` 里，rule_id 长得像规则库条目，审计时分不清"规则判定"和"模型猜测"。不列出来，等于让模型猜测借规则的名义发言。
+- **验证**：回归锁 `test_open_discoveries_are_listed_separately` 断言字段存在、`source == "model"`、rule_id 以 `OPEN-` 开头；st06/st09/st12 的 `OPEN-*` 仍正常产出（未被误收敛）。
+
+### 2026-10-28 · 修改 · 红队 selftest 从"人肉数成绩"改成自动判定，用例预期随整改同步
+
+- **文件**：`targets/selftest/run_selftest.py`（重写：`judge()` / `--rejudge` / 退出码）、`targets/selftest/gen_selftest.py`（st03/st04 由 `expect_miss_gap` 升为 `should_catch`；st06/st07 加 `expect_rules` + `expect_severity`）、`targets/selftest/manifest.json`、`run_result.json`、`eval_summary.json`
+- **改了什么**：新增判定口径 `HIT / MISS / GAP / GAP_FILLED / CLEAN / FP / HIT_DUP / MISS_SEV`，退出码 1 = 出现 MISS/FP/HIT_DUP/MISS_SEV；`--rejudge` 用已有原始 issues 按新口径重算（不重跑模型、不产生新报告）。旧脚本把**被审文档的裁定**命名为 `verdict`，与"用例是否通过"极易混淆，已改为 `doc_verdict` + `outcome`。
+- **为什么**：上一版报告写"14/14 召回"，但原始结果里只有 issues，判定是人肉数的——换个读者就会数出别的数。测试成绩必须机器可复现。用例预期同步是**整改的必然结果**，不是迁就实现：st03/st04 的事实补上了就不该再"预期缺口"；st06/st07 归口后应断言"两条里恰好一条以 major 出现"，因此新增 `HIT_DUP` 来抓"两条同时出现"。
+- **验证**：`py -3 targets/selftest/run_selftest.py --rejudge` → **HIT 16 + CLEAN 4 = 20/20，退出码 0**；同一份原始数据在新口径下 st03/st04 为 `HIT`（此前 `GAP_FILLED`）、st06/st07 为 `HIT`（此前 `MISS`）。重跑产生的 R-20261028-022~041 共 20 份合成报告已按规程删除（`outputs/.trash/` + ledger 原位墓碑），原始 issues 保留在 `run_result.json`。判定函数本身也有 5 项回归锁（`SelftestJudgeTests`：HIT / MISS / HIT_DUP / MISS_SEV / FP / GAP），避免"用例判定悄悄改了口径"——这与第 14 轮 `bruteforce_docx.py` 过期是同一类坑。
+
+### 2026-10-28 · 新增 · 金标准 25 → 33 例，覆盖新增的事实断言与锚点行为
+
+- **文件**：`tests/golden/cases/`（+4 阳性 +4 干净对照）、`tests/golden/labels/`（+4）、`tests/golden/baseline.json`、`tools/golden_eval.py`（无改动，沿用）
+- **改了什么**：新增阳性 `p16`（试用期 12 个月）、`p17`（华为 5 亿台）、`p18`（合同缺争议条款，锚点断言）、`p19`（销量翻倍归因成功）；新增干净对照 `c11`（试用期 3 个月）、`c12`（华为 4840 万台）、`c13`（华为 2019 年 2.4 亿台，year_ctx）、`c14`（内部进度 8/10）。
+- **为什么**：金标准是"改规则的唯一标尺"，新加的两类断言（上限、年度口径）与两类行为（锚点、豁免）如果没有正反用例，下次重构只能靠感觉。
+- **验证**：33 用例 / 21 标注 / **召回 100% / 精确率 100% / 误报 0**，基线已重存（`baseline.json` 同步为 33 例）。删掉中间 5 次试跑产物，`outputs/bench/` 只留最新一份。
+
+### 2026-10-28 · 新增 · 事实库从 2 条扩到 7 条：把法条口径写成可核验断言
+
+- **文件**：`knowledge/facts.json`（2 → 7 条断言）、`knowledge/kb_laws.md`（新增，人读版口径）、`config/knowledge_version.txt`（1.0.0 → 1.0.2）、`tests/test_fact_library.py`（新增）
+- **改了什么**：按原 schema（`entity/attr/type/expected/tolerance/note/exclude_ctx`）补入 5 条法条断言——
+  `个人信息保护法`（2021 通过/施行）、`数据安全法`（2021）、`网络安全法`（施行 2026，同时 `exclude_ctx` 排除「数据安全管理条例」）、
+  `网络数据安全管理条例`（2025 施行）、`生成式人工智能服务管理暂行办法`（2023 公布/施行）；每条 `note` 写清公布日/通过日/施行日，
+  不是"年份应为 X"这种无法复查的结论。
+- **为什么**：用户的判断很直接——**哈希链、台账、自学习、500 项回归都建好了，事实审的弹药只有 2 条豆包断言**。
+  任何不涉及豆包的文本，事实审要么哑火，要么退回模型的参数记忆判真假；一旦如此，"独立裁判"就破产了，
+  它和通用 agent 的差别只剩一条哈希链，而哈希链只能证明"记录没被改"，证明不了"记录是对的"。
+- **验证**：`tests/test_fact_library.py` 12 项 OK（含「note 必须带可核验时间/口径」）。
+  同一份 `targets/uploads/…智能招聘平台…报告.docx`（111 段）：扩库前匹配断言 **0**（不含豆包，事实审等于没跑），扩库后 **4 / 7**。
+
+### 2026-10-28 · 修复 · 事实年份跨句偷日期：40 字窗口 → 同句最近制
+
+- **文件**：`review.py`（`_sent_start` / `_sent_end` 新增；date 分支重写）、`tools/regex_check.py`（`DATE_RE` 支持 ISO `YYYY-MM-DD`）
+- **改了什么**：删掉「取实体前 40 字窗口里第一个日期」的写法，改成在**实体所在句**内取离实体最近的日期；
+  同句没有日期就不判，并在 decision 里写明「同句内无日期（宁漏不误）」。
+  `DATE_RE` 原来只认「2024 年 3 月」，`2026-01-01` 这种 ISO 写法整个漏掉，一并补上。
+- **为什么**：语料里三条法规挤在同一段，窗口会把隔壁条目的日期偷过来——
+  「网络数据安全管理条例，2026-01-01 施行」被读成 2021（拿了个保法的），正确文本被判错、错误文本反被判对。
+  事实审是 blocker 级，一次跨实体误判就足以让人放弃整份清单。
+- **验证**：9 组突变 —— 写错年份 5 例全中（条例 2026 / 个保法 2022 / 生成式办法 2024 / 豆包推出 2022 / 豆包 MAU 10 亿）；
+  同段三法规全对 → 0 条；同段三法规错 1 处 → 只报那 1 条；豆包写对 → 0 条；实体与日期跨句 → 0 条。
+
+### 2026-10-28 · 新增 · 四个确定性检查器 + LOGIC-009，吃掉 logic 类漏检
+
+- **文件**：`tools/arith_check.py`（6 → 10 个检查器）、`rules/logic.yaml`（新增 LOGIC-009）、`tools/rule_exec.py`（登记执行方式）、`config/rules_version.txt`（→ `v1-2026-10-28-a3`）
+- **改了什么**：新增 `check_signed_direction`（方向词 + 负号同现）、`check_share_sum`（占比分项和 ≠ 100%）、
+  `check_unit_convert`（「1.2 亿（即 1200 万）」量级换算错）、`check_period_clash`（同句同口径反向断言），
+  四个都进了 `CHECKS`；LOGIC-009 按规矩登记为 `arith_check·方向词与负号同现`（未登记 = 报告里标「仅提示」，等于虚报覆盖面）。
+  每个检查器都带反向护栏：方向词与负号必须**紧邻**（「增长率为 -3.4%」不算）、占比必须有语境词 + 合计词、
+  换算只认「即/等于/折合/=」等价式、口径打架必须**同口径**且主语相同。
+- **为什么**：用户亲自标的 4 条漏检全是 logic 类，且全是形式自相矛盾——「同比下降 -3.2%」「45%+35%+30%=110%」。
+  这类问题**根本不该让 LLM 猜**：LLM 负责语义，算术和形式自洽交给脚本，误报率近零、召回立竿见影。
+- **验证**：18 例快速验证全绿（12 正例 / 6 负例）。反向样本「占比 40%、30%、35%，合计 100%」证明
+  `check_sums` 查不出来（分项和 105 与合计 100 自洽），必须靠 `share_sum` 单独判「占比之和 = 100」。
+
+### 2026-10-28 · 新增 · 金标准测试集 25 例 + golden_eval 驱动 + 三把防假绿灯的锁
+
+- **文件**：`tests/golden/`（cases 25 / labels 15 个共 17 条标注 / baseline.json）、`tools/golden_eval.py`（新增）、`tests/test_golden_suite.py`（新增 9 项）、`.gitignore`（`tests/` → `tests/*` + `!tests/golden/**`）
+- **改了什么**：15 条阳性（含 `annotations.jsonl` 里 4 条真实漏检）+ 10 条干净对照，标注用 `eval_review` 的 AND-of-OR 格式；
+  驱动脚本输出 recall / precision / 误报并与 `baseline.json` 比较（退出码 1 = 变差）；
+  三把锁：① 每条标注必须**真能命中**（防止正则写错变成空断言）② 干净对照必须真的 0 issue ③ 基线用例集必须与磁盘一致。
+  `.gitignore` 把 `tests/` 改成 `tests/*`，单独捞回 `tests/golden/`——金标准集是判定基准（数据），必须随仓库走。
+- **为什么**：只有 4 条标注、没有标准答案集，改一条规则根本不知道是涨了召回还是误伤了干净文本，自学习闭环在空转。
+  另外 `bruteforce_docx.py` 已经演过一次"脚本过期 → 27 PASS 假红"，金标准集同样不能只靠记性。
+- **验证**：25 用例 / 标注 17 命中 17 → **召回 100% / 精确率 100% / 误报 0**，单轮 2.8s（无 LLM）。
+  这套锁当场咬出我自己的错：第一版"干净对照" `c09` 写 360+210+480=**1080**（实际 1050），被 LOGIC-001 报出——
+  不是规则误报，是我的干净样本算错了。改成 1050，错的那条升为阳性用例 `p15_sum_wrong_1080` 并加标注。
+
+### 2026-10-28 · 新增 · 事实库进 prompt + FACT-001→FACT-002 硬守门（禁止凭记忆判真伪）
+
+- **文件**：`tools/llm_review.py`（`render_facts` / `load_facts` / `DIM_FOCUS["fact"]` / `build_messages(facts=)` / `validate(dim=,facts=)` / `review_dimension(facts=)` / `_cache_key(facts_sig)`）、`review.py`（`llm_facts` 注入 + limitations 自报边界）
+- **改了什么**：事实维度 prompt 里注入 FACTS 区块（7 条断言 + 三条硬约束：只准引用区块内实体、区块外不得断言真伪、命中 `exclude_ctx` 不比对）；
+  校验层加兜底：FACT-001 的 quote 里**一个事实库实体都没有**时改判 FACT-002（缺可核验出处），evidence 前置说明并写进 `dropped` 留痕，严重度仍取规则库；
+  语义缓存键加入事实库签名；`limitations` 新增「事实审证据仅限库内 N 条，库外只判缺出处」。
+- **为什么**：只填库不够——库没进 prompt，模型仍然拿参数记忆判真伪。而且事实库改了而缓存不失效，等于拿旧证据判新文本。
+  改判而不是丢弃的理由：**"这个数字我核不了"是可交付的结论，"这个数字是假的"不是。**
+- **验证**：`tests/test_fact_library.py::FactsGuardTests` 4 项 —— 命中库内实体仍是 FACT-001；库外实体（ChatGPT 月活）改判 FACT-002 且留痕；
+  改判后严重度等于规则库 FACT-002；不传 facts 的旧调用行为不变。`FactsPromptTests` 4 项 —— FACTS 区块只进事实维度、缓存键随事实库变。
+
+### 2026-10-28 · 修改 · 硬编码事实断言数改动态；自学习门禁用例改判「已被 LOGIC-009 覆盖」
+
+- **文件**：`tests/test_review.py`、`tests/test_api_contract.py`、`tests/test_learning.py`
+- **改了什么**：两处 `assertEqual(fact_assertions_total, 2)` 改成从 `knowledge/facts.json` 动态读条数；
+  `test_narrow_pattern_passes_gate` 拆成两项：一项断言「环比增长 -1.8%」候选**被冗余门禁拒绝且理由点名 LOGIC-009」，
+  另一项用 ROOT 内合成语料证明「确定性规则覆盖不到的新表述仍能通过门禁」。
+- **为什么**：扩库后两处硬编码必然失败（写死数字正是 MEMORY 里记过的坑）；自学习用例的翻转不是回归——
+  2 处命中现在全由 LOGIC-009 覆盖，冗余门禁正确地拒绝了重复学习的候选，**这是 ② 生效的证据**。
+- **验证**：全量 `py -3 -m unittest discover -s tests` → **501 项 OK / 190.7s**（原 500：新增 golden 9 + fact 12，learning 1 拆 2）；
+  `tests/test_learning.py` 37 OK；docx 暴测仍 31 PASS / 0 FAIL。
+
 # 2026-10-27
+
+### 2026-10-27 · 修复 · docx 暴测脚本口径过期（27 PASS 假红），并把它本身锁进回归
+
+- **文件**：`tests/bruteforce_docx.py`、`tests/test_bruteforce_regressions.py`（新增 `DocxFormatBruteforceHarnessTests` 2 项）、`暴力测试·docx格式审查·输入输出报告.md`（新增 §7 复核轮）
+- **改了什么**：
+  1. 脚本顶部加薄包装 `SPEC = format_spec.get("course-report-v1")["check"]` +
+     `run_all(info, rids=None) → docx_format_checks.run_all(info, rids or ALL, SPEC)`，
+     20 个调用点全部改走它；脚本内自此**不含任何阈值数字**（阈值只在 `config/format_specs.yaml`）；
+  2. `a4` 期望反转：从「畸形 XML 抛解析异常即算过」改为「必须抛 `ValueError` 且文案含『损坏』，
+     绝不能漏出 `ET.ParseError`」；
+  3. `main()` 增加 `groups_only` / `write_report` 形参，并在开头 `RESULTS.clear()`——
+     让单测能只跑无副作用的 A+B 组（C 组会往 `outputs/` 写真实报告，不能进 unittest）；
+  4. 新增两项回归锁：`test_ab_groups_all_green`（A+B 必须 31 项全绿且用例数不得少）、
+     `test_spec_carries_thresholds`（包装器必须带 5 个关键阈值，合规段落不得报版式违规）。
+- **为什么**：用户复核这份报告时重跑脚本，得到 **27 PASS / 9 FAIL**，报告结论不可复现。
+  根因不是产品代码：`run_all` 已改成 `run_all(info, ridset, spec)`，脚本仍传两个参数，
+  `spec=None → {}`，而「规格里没写的项不检查」是既定设计——于是 B 组 8 条判定被静默跳过
+  （B1/B2/B5/B7/B9/B11/B13/B16），断言落空。危险在于镜像情形：同样的空跑会让**反转的断言变绿**。
+  另外 A4 在 `ET.ParseError → ValueError` 改造后与旧期望正好相反，修好反而报红。
+  脚本文件名不是 `test_*`，不在 `unittest discover` 收集范围，这是漂移能潜伏一整轮的结构性原因。
+- **验证**：`py -3 tests\bruteforce_docx.py` → **36 PASS / 0 FAIL / 4 OBS-INFO**（修复前 27/9）；
+  A 组 14、B 组 17 全绿；新增 2 项单测 OK；全量 `unittest discover -s tests` → **479 OK / 207s**（原 476）。
+
+### 2026-10-27 · 修复 · 删除报告只认 .json，中断后留下清不掉的孤儿 .md
+
+- **文件**：`server.py`（`_delete_report` 存在性判断）、`tests/test_api_contract.py`（新增 1 项）
+- **改了什么**：存在性判断从「`{rid}.json` 存在」改为「`.json` 与 `.md` **都不存在**才算未找到」；
+  只剩 `.md` 时照常移入 `outputs/.trash/` 并打 ledger 墓碑。
+- **为什么**：本轮清理暴测报告时后台进程被杀，`R-20261027-006.json` 已进回收站、`.md` 还留在 `outputs/`；
+  再调 `DELETE /api/report` 直接报「未找到报告」，那个 `.md` 从此没有任何接口能处理。
+  删除本身是「移 json → 移 md → 移 logs → 打墓碑」四步，不是原子操作——判存在性不能只看第一步的产物。
+- **验证**：新增 `test_delete_cleans_orphan_md_left_by_interruption`（先删 json 再删，断言 `moved` 含 `.md` 且文件消失）；
+  `tests.test_api_contract` → **148 项 OK / 161s**；`tools/integrity.py verify` → **182 条记录链完整**（+4 墓碑）。
+
+### 2026-10-27 · 新增 · 全系统非针对性暴力测试（113 项，6 个面）
+
+- **文件**：`tests/bruteforce_global.py`（新增）、`tests/bruteforce_global_report.json`（产物）、`tests/test_bruteforce_regressions.py`（新增 10 项）、`暴力测试·全系统·20261027.md`（新增报告）、`README.md` §34
+- **改了什么**：新写一个可复跑的全局压测脚本，不预设靶子，从 6 个面同时压系统：
+  A 输入模糊（22 份畸形/极端输入走完整 `run_one`：空文件、单字符、只有 BOM、只有零宽字符、夹 NUL、纯标点、12 万字符单行/多段、emoji+扩展 B 区、怪文件名、5 类不可读目标）；
+  B 报告不变式（140 份历史报告逐条查字段/severity 域/quote 逐字溯源/覆盖率算术/裁定一致性/完整性链，旧 schema 报告单独按历史契约判）；
+  C 配置对抗（28 种写坏配置：scenario / format_spec / agent manifest / rules / 版本文件）；
+  D API 模糊（42 项：坏 JSON、错类型、穿越、超限 body、跨站头、未知路由、20 并发、滥用后存活）；
+  E 并发与确定性（6 路并发 + 同输入三跑）；
+  F 摄取对抗（bomb.docx、空/炸弹 PDF、PNG、旧格式、zip 成员超限/穿越/嵌套、超长文本截断）。
+  全部在临时沙箱里跑（`outputs/logs/ledger/targets` 整体重定向），不碰真实台账。配套 10 项回归测试把本轮每个修复钉死。
+- **为什么**：用户要求「针对该系统进行不针对性、全局性的暴力测试」。前几轮都是**已知功能**定向打（docx 格式、目的、对照矩阵），能证明单个功能对不对，证明不了"系统整体还站得住"。这轮改查**契约**：是否崩溃 / 是否静默降级 / 报告是否自洽 / 链是否完整 / 结论是否可复现——这五条与具体规则无关，任何改动都可能破坏。
+- **验证**：逐组跑共报出 **9 条 FAIL**——6 条是系统真缺陷（见下一条），3 条是测试脚本自身的问题（临时目录在 ROOT 外触发 `relative_to`、`urllib` 在 413 后 `e.read()` 自己抛、用新契约判 6 份旧 schema 报告），已一并修正并写进报告 §4.1。修复后全量 **113 PASS / 0 FAIL / 2 OBS**，单轮 7.3s，连续 3 次结果一致。因沙箱隔离，真实 `ledger` 未被写入，仍为 **174 条链完整**。
+
+### 2026-10-27 · 修复 · 并发写台账把 hash 链写断 + 4 处「静默降级/异常未翻译」
+
+- **文件**：`review.py`（台账锁 + 读取异常兜底）、`tools/rules_store.py`（规则文件结构校验）、`tools/docx_extract.py`（XML 解析错误翻译）、`tools/ingest.py`（截断 vs 空文档的表述）、`tools/integrity.py`（版本号去 BOM）、`server.py`（PUT/PATCH 405 JSON）、`config/rules_version.txt`（去 BOM）
+- **改了什么**：
+  1. **台账并发**：新增 `_acquire_ledger_lock()` / `_release_ledger_lock()`，用 `O_EXCL` 锁文件把「读 prev_hash → 算 report_hash → 追加一行」包成原子段；陈旧锁（mtime>60s）自动回收，等待 30s 超时明确报错；
+  2. **异常翻译**：`docx_extract.extract` 把 `ET.ParseError` 翻成 `ValueError("Word 文档结构损坏…")`；`run_one` 在 `(ValueError, OSError)` 之外再加 `except Exception` → `UnreadableTargetError`，并把异常类型写进消息；
+  3. **规则文件**：`load_all_rules` 顶层非列表、条目缺 `rule_id` 一律 `ValueError` 并点名文件/序号（原来 `continue` 静默跳过 = 整类规则凭空消失）；
+  4. **版本号**：`integrity.rules_version()` 改 `utf-8-sig` 读 + `lstrip("\ufeff")`，并清掉 `config/rules_version.txt` 里的 BOM；
+  5. **摄取表述**：`ingest.extract_docx` 记录被截断成员，正文为空且发生过截断时告警改为「超出上限已截断，疑似压缩炸弹或结构损坏，不要当作空文档处理」，不再谎称「内容为空」；
+  6. **HTTP 方法**：`do_PUT/do_PATCH/do_OPTIONS` → 405 + JSON + `Allow` 头（原来落到基类，返回 501 + HTML）。
+- **为什么**：全系统暴力测试一次挖出来的 6 个缺陷，共同点是**生产时无感、审计时才炸**：
+  ① 6 路并发后 `verify_ledger` 报 `序号不连续 @line2`，而两份报告本身都自洽；
+  ② `bomb.docx` 抛 `ParseError` 冒到进程顶部，CLI 打 traceback、服务端 500；
+  ③ 规则文件写成对象 → 返回 0 条规则、零提示，报告"正常"但整类检查没跑；
+  ④ 报告里 `rules_version` 首字符是 `\ufeff`，肉眼不可见却让版本比较/展示失准，且换个编辑器保存就会让全部历史报告变 stale；
+  ⑤ `PUT /api/review` 返回 501（5xx）+ HTML，前端 `res.json()` 直接抛错；
+  ⑥ 解压炸弹 docx 被告知「内容为空」——"读不出来"和"本来就没字"是两种处置，说错了等于替攻击者打掩护。
+- **验证**：修复前后逐条实测——并发 6 路：`序号不连续 @line2` → `共 9 条记录，链完整`；`bomb.docx`：`ParseError: no element found` → `无法读取待审文件 bomb.docx：Word 文档结构损坏…`；规则文件写成对象：`0 条无提示` → `ValueError: 顶层必须是列表`；版本号：`'\ufeffv1-2026-10-27-a1'` → `'v1-2026-10-27-a2'`；PUT：`501 HTML` → `405 JSON`；bomb.docx 摄取告警：`["Word 文档内容为空"]` → `["…超出上限，已截断读取", "…疑似压缩炸弹或文件结构损坏——请人工确认，不要当作空文档处理"]`。`tests/test_bruteforce_regressions.py` **10 项 OK**，全量回归 **476 项 OK**。
+
+### 2026-10-27 · 修改 · FORMAT 规则拆成「维度清单 + 可选的格式规格」，格式要求不再住进规则库
+
+- **文件**：`config/format_specs.yaml`（新增）、`tools/format_spec.py`（新增）、`tools/docx_format_checks.py`（阈值全部改为 spec 驱动）、`rules/format.yaml`（desc 去数值 + `spec_keys`）、`review.py`（`run_one(format_spec=)` + 规则过滤 + 报告字段 + limitations + CLI）、`server.py`（`/api/format-specs` + 参数校验 + 子进程传参）、`web/index.html`、`web/app.js`、`web/style.css`、`config/rules_version.txt`（a1→a2）、`tests/test_format_spec.py`（新增 26 项）、`tests/test_docx_format.py`（显式传规格）、`tests/test_api_contract.py`（接口正则修字符集）、`README.md` §2/§33、`docs/API接口对照表.md` §2.9/§3.7
+- **改了什么**：
+  1. `rules/format.yaml` 六条规则的描述去掉所有具体数值（宋体/小四/2 字符/22 磅/两三级），改为"应符合所选格式规格"；新增 `spec_keys` 字段声明依赖哪些规格键；
+  2. 新增 `config/format_specs.yaml`：`none`（默认，只判图表编号）+ `course-report-v1`（原课程报告数值），并附一份期刊规格的注释样例；
+  3. 新增 `tools/format_spec.py`：`load/get/apply/public_list`，校验未知键名、数值必须正整数、缩进区间必须成对、`line_rule` 只能 exact/auto、id 唯一、default 必须存在；
+  4. `docx_format_checks.py` 删除 `OK_EAST/SZ_XIAOSI/FIRST_LINE_OK/LINE_OK` 四个硬编码常量，`run_all(info, ridset, spec)` 由 spec 决定阈值；spec 缺某个键 → 该项直接不跑；
+  5. `review.py`：只在目标是 `.docx/.docm` 时套用规格（没选就用 default `none`），位置在 `scenario` 之后、`set_rule_index` **之前**；报告新增 `format_spec{id,name,version,source,desc,criteria,disabled_rules,disabled_detail}`；CLI `--format-spec` / `--list-format-specs`；
+  6. 前端左栏新增「格式规格」下拉（选项带"会判哪几项"），状态条新增绿色 `rs-fmt` chip（`none` 时灰色显示「版式：未提供标准」），技术参数行写明"判 N 项 / 未判"。
+- **为什么**：用户截图质问「为何会写入规则库？我只是这次是这样的格式要求，下次是另一个，最后我选择哪个标准呢」。核查确认 `rules/format.yaml` 的 `source` 全是「课程报告格式要求 v1」，且阈值硬编码在 Python 里——换一份期刊标准只能改代码，规则库还会攒下多套互相矛盾的标准。根因是**层级放错**：格式要求是"这一次任务的参数"，不是"长期裁判尺度"。同时对默认行为做了取舍：不选规格 = 不判字体/字号/缩进/行距/标题层级（这些没有通用正确答案），并在 limitations 写明「未报出版式问题 ≠ 版式合规」。
+- **验证**：
+  - 真实 docx（`targets/uploads/…智能招聘平台…报告.docx`，111 个正文段）三套标准实测：不选规格 **0 条格式问题**（limitations 有说明）；`course-report-v1` **4 条**（字号 110 段 11pt / 缩进 10 段 / 行距 111 段 / 无标题样式）；另一份"11pt + 非固定行距 + 不限缩进"规格 **3 条**（缩进完全不判，字号只剩 1 段五号）。**同一批段落随标准从违规变合规**，证明判定跟着标准走而不是固定在代码里。
+  - `tests/test_format_spec.py` **26 项 OK**（配置校验 9 / 规格驱动判定 5 / run_one 集成 3 / HTTP 接口 5 / 前端契约 3）；`tests/test_docx_format.py` **17 项 OK**；全量回归 **458 项 OK**。
+  - 修 `FrontendParityTests` 正则字符集缺 `-`（`/api/format-specs` 被截成 `/api/format` 误报）。
+  - `config/rules_version.txt` 升至 `v1-2026-10-27-a2`：`rules/format.yaml` 变了，历史报告会显示 stale（黄），属既定机制。
+
+### 2026-10-27 · 新增 · docx 格式审查暴力测试（36 PASS / 0 FAIL / 4 OBS）
+
+- **文件**：`tests/bruteforce_docx.py`（新增）、`tests/bruteforce_docx_report.json`（新增，测试产物）、`暴力测试·docx格式审查·输入输出报告.md`（新增，根目录）
+- **改了什么**：新增 docx 格式审查的破坏性输入暴力测试脚本与报告，延续项目暴力测试口径（逐用例带「期望」+ PASS/FAIL/OBS 统计 + JSON 落盘）：A 提取层 14 例（损坏 zip/缺部件/畸形 XML/非法编码/嵌套表格/一万段/10 万段性能）、B 检查层 17 例（属性极端值与边界阈值：字号 0·-5·1000、缩进缇值边界、行距 0·auto·atLeast·None、outline_lvl 0·99、Heading9/99、9-10 字正文边界、22 半磅/40 字标题阈值、题注判定 12 边界、表格豁免）、C 集成层 3 例（run_one 端到端：合规出报告/损坏明确报错/空 body 出报告）、D 性能 2 例。
+- **为什么**：用户要求「继续暴力测试」——延续每轮迭代对最新能力（docx 格式审查，上一轮真实问题测试交付）做破坏性输入验证的系列口径。
+- **验证**：`py -3 tests\bruteforce_docx.py` → 36 PASS / 0 FAIL / 4 OBS-INFO；挖出 3 处真缺陷（F1/F2/F3，见下条修复记录）；端到端合成报告 R-20261027-002/003 已按规程删除（入 outputs/.trash + ledger 墓碑）；全量 unittest 440 OK。
+
+### 2026-10-27 · 修复 · 暴力测试挖出的 docx 检查层/集成层 3 处缺陷（F1 空列表、F2 None 文本、F3 损坏文件崩溃）
+
+- **文件**：`tools/docx_format_checks.py`、`review.py`、`tests/test_docx_format.py`（+3 项回归保护）
+- **改了什么**：① F1：`check_heading` 两处 `paras[0]` 在空段列表时 IndexError——改为 `p0 = first_head or (paras[0] if paras else None)`，空文档回退「（文档首段）」（空文档无标题报 FORMAT-005 属合理语义）；② F2：段落 `text=None` 时 `p.get("text","").strip()` 抛 AttributeError（`dict.get` 默认值只在键缺失时生效）——全部 9 处文本读取点改为 `(p.get("text") or "")`；③ F3：损坏/非 docx 文件在 `read_target_text` docx 分支抛 ValueError，`run_one` 无兜底致 CLI traceback 崩溃、server 只拿到 stderr 尾巴——新增 `UnreadableTargetError(ValueError)`，`run_one` 捕获 `(ValueError, OSError)` 转明确报错（含文件名与原因），`main()` 打印「目标不可读：…」退出 1，不产出「看起来没问题」的空报告；server 既有非零退出兜底自动透传。
+- **为什么**：暴力测试 C2 实测损坏 docx 让 run_one 整条崩溃——违反项目底线「对任意输入都给结论」（不可读输入要么给结论、要么明确报错，唯独不能裸 traceback）；F1/F2 是空/None 输入防御缺口。
+- **验证**：`tests/test_docx_format.py` 17 项 OK（新增 `test_empty_paragraphs_no_crash`、`test_none_text_no_crash`、`test_broken_docx_raises_clean_error`，后者含「不产出任何报告」断言）；暴力测试 36 PASS / 0 FAIL；全量回归 **440 OK** / 146.263s；integrity ledger 174 条链完整。
 
 ### 2026-10-27 · 修改 · 公开推送清理：.gitignore 追加排除测试/报告/运行态并推送 GitHub
 

@@ -58,7 +58,12 @@ agents/
 state/
 
 # ---------- 2026-10-27 公开推送补充排除（用户要求：不上传测试文件和相关报告） ----------
-tests/
+# 用 `tests/*` 而不是 `tests/`：目录本身不排除，才能在下面把金标准集单独捞回来。
+# 金标准集是「判定基准」（数据），不是测试实现——它必须随仓库走，
+# 否则换台机器就没有"改规则前先看这个数"的底线了。
+tests/*
+!tests/golden/
+!tests/golden/**
 targets/
 config/llm_history.json
 config/learning.json

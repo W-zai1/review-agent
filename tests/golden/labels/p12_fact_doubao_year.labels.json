@@ -1,0 +1,16 @@
+{
+ "errors": [
+  {
+   "id": "L1",
+   "desc": "豆包推出年份错",
+   "match": [
+    [
+     "2023 年推出"
+    ]
+   ],
+   "exclude_dimensions": [
+    "style"
+   ]
+  }
+ ]
+}

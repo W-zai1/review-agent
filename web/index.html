@@ -114,6 +114,18 @@
           <div class="agent-hint" id="scenarioHint">全部规则参与（默认）</div>
         </div>
 
+        <!-- 格式规格：Word 版式按**哪一份委托方标准**判。
+             「正文必须宋体小四、固定 22 磅」是某份课程报告的要求，不是通用真理；
+             换份期刊/换个学校就全变。所以标准不进规则库，在这里选。
+             不选 = 不判字体字号行距（「没报出问题」≠「版式合规」，会写进报告）。 -->
+        <div class="pick-row">
+          <label for="formatSpecSelect">格式规格（Word 版式按哪套标准）</label>
+          <select id="formatSpecSelect">
+            <option value="">不判版式（默认）</option>
+          </select>
+          <div class="agent-hint" id="formatSpecHint">仅对 .docx 生效：不判字体/字号/行距</div>
+        </div>
+
         <!-- 审查目的与上传同一套「按钮 + 展开」：收起时把已填内容写在副标题上，
              否则用户会忘记自己设过目的（目的直接决定报告里多出一整块证据）。 -->
         <button class="entry-toggle purpose-toggle" id="purposeToggle" type="button"

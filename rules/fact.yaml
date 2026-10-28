@@ -18,7 +18,7 @@
 
 - rule_id: FACT-003
   dimension: fact
-  desc: 因果关系或推断性结论（"因此""说明""意味着"）必须有明确前提支撑，禁止无依据归因
+  desc: 因果关系或推断性结论（"因此""说明""意味着"）必须有明确前提支撑，禁止无依据归因。与 LOGIC-003 分工：本规则判「有没有前提」（因果连接词 + 成效/归因词同现、同句无数据/来源即缺前提），LOGIC-003 判「证据-结论强度」；同一句同时命中时由 LOGIC-003 主判，本规则折叠进 suppressed 留痕
   method: causal_claim_check
   severity: major
   source: 审查内部事实库 v1
@@ -26,7 +26,7 @@
 
 - rule_id: FACT-004
   dimension: fact
-  desc: 百分比/倍数/量级陈述需核对单位与统计口径，禁止混淆"环比/同比""累计/单季"等口径
+  desc: 百分比/倍数/量级陈述需核对单位与统计口径，禁止混淆"环比/同比""累计/单季"等口径。与 LOGIC-001 分工：量级矛盾/加总错误归 LOGIC-001（算术可判），本规则只管「口径未标注」这一线索；同一句已由 LOGIC-001 判出问题时，本规则不再重复列一条 minor
   method: unit_caliber_check
   severity: major
   source: 审查内部事实库 v1

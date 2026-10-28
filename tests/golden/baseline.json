@@ -1,0 +1,307 @@
+{
+ "recall_pct": 100.0,
+ "precision_pct": 100.0,
+ "labels_total": 21,
+ "labels_hit": 21,
+ "fp_total": 0,
+ "cases": [
+  {
+   "case": "c01_signed_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c02_share_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c03_rate_negative_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c04_negative_amount_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c05_unit_convert_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c06_period_diff_base_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c07_doubao_year_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c08_doubao_api_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c09_sum_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c10_ratio_cap_growth_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c11_law_trial_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c12_huawei_ok.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c13_huawei_other_year.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c14_internal_progress.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "p01_signed_tongbi.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p02_signed_tongbi_b.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p03_signed_huanbi.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p04_signed_huanbi_b.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p05_signed_two_hits.txt",
+   "kind": "positive",
+   "labels_total": 2,
+   "labels_hit": 2,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 2
+  },
+  {
+   "case": "p06_signed_two_hits_b.txt",
+   "kind": "positive",
+   "labels_total": 2,
+   "labels_hit": 2,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 2
+  },
+  {
+   "case": "p07_share_sum_110.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p08_share_sum_105.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p09_unit_convert_wrong.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p10_period_clash.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p11_fact_doubao_mau.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p12_fact_doubao_year.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p13_fact_laws_wrong.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p14_fact_genai_wrong.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p15_sum_wrong_1080.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p16_law_trial_12m.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p17_huawei_shipment.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p18_comp_missing_clause.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p19_causal_attribution.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  }
+ ],
+ "ts": "2026-10-28 11:40:11"
+}

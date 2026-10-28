@@ -38,6 +38,7 @@ server.py  Handler.do_GET / do_POST
 | 2.6 | `loadPurposeFiles` | GET `/api/purpose/files` | `_list_purpose_records` | `{ok,items[]{id,name,kind,chars,truncated,created,preview}}`（**不含原文**，只给 80 字预览） | 同上 |
 | 2.7 | `removePurposeFile` | DELETE `/api/purpose/files?id=` | `_delete_purpose_record` | `{ok,id,items[]}`（删暂存记录 + `_originals/` 归档原件）；id 非法（含路径穿越）或不存在 → `{ok:false,error}` | 同上 |
 | 2.8 | `loadScenarios` | GET `/api/scenarios` | 内联（`scenario.public_list`） | `{ok,version,default,items[]{id,name,desc,keep_note,disabled_count,disabled_rules[],disabled_dimensions[]}}`；配置损坏时 `{ok:false,error,items:[]}`（前端把下拉置灰并显示原因，不当成「没有情境」） | ScenarioApiTests |
+| 2.9 | `loadFormatSpecs` | GET `/api/format-specs` | 内联（`format_spec.public_list`） | `{ok,version,default,items[]{id,name,source,desc,checks[],disabled_count,disabled_rules[]}}`；`checks` = 该规格会判哪几项（正文字体/字号/首行缩进/行距/标题层级/图表编号），前端塞进下拉选项文案；配置损坏时 `{ok:false,error,items:[]}` | FormatSpecApiTests |
 | 3 | L304 `loadReports` | GET `/api/reports` | `_reports` | `items[].{id,verdict,target_type,target_path,target_name,review_mode,timestamp,issues,stats{blocker,major,minor,nit},report_hash,favorite,mtime}`；`favorites[]`=已收藏 ID。**排序唯一依据 `(timestamp, id)` 倒序，最新在最前**（不再有 `order`） | ReportsLogsIntegrityTests |
 | 4 | L424 `selectReport` | GET `/api/report?id=` | `_report` L574 | `ok`；`report.{review_id,verdict,review_mode,target_path,timestamp,stats,coverage,limitations,issues[]}` | 同上 |
 | 5 | L503 `loadIntegrity` | GET `/api/integrity` | `_integrity` L769 | `{ok,chain_ok,entries[]{seq,review_id,report_hash,report_hash_short,prev_hash,ts,ok,op,deleted,deleted_at},reports[]{id,ok,rules_ok,stale,rules_version,verdict,hash_short},broken_at,stale_count,rules_version,detail}` | 同上 + EmptyIntegrityTests |
@@ -209,11 +210,18 @@ config/charter.json ──→ review.py:build_charter(target_type)
 
 LLM 产出 ─→ llm_review.validate()
             ├ rule_id 在白名单   → 正常，severity 取规则库定义
-            ├ rule_id 匹配 OPEN-XXX → 开放发现，severity 取系统默认档(major)，
-            │                          issue.open_discovery=true
+            ├ rule_id 匹配 OPEN-XXX → 开放发现，severity 取系统默认档(minor，
+            │                          置信度 ≥0.85 才升 major)，issue.open_discovery=true，
+            │                          rule_text 标明「未经规则库定义」，单次最多 3 条
             └ 其它 rule_id       → 丢弃（附「清单外发现请用 OPEN-XXX 格式」）
             **所有分支都必须通过 quote 逐字校验**（安全线不放宽）
 ```
+
+**开放发现的可追溯性（2026-10-28 红队 C2）**：`OPEN-*` 不是规则库条目，因此
+① 每条带 `open_discovery: true`、`confidence_basis: "model"`、`rule_text` 写明未定义；
+② 报告顶层单独给一份 `open_discoveries[]{rule_id,severity,quote,confidence,source:"model"}`，
+不混在规则判定里；③ `limitations` 自报「模型另报 N 条规则清单外发现，须人工确认」。
+前端汇总表给这类条目加「规则外」标签，与 `AUTO-*`（自学习晋升）区分。
 
 ### 3.5.1 审查分层：确定性算术先行，语义模型补位
 
@@ -259,7 +267,9 @@ S3 语义层（LLM，按维度）
 | `coverage.chunked` / `coverage.chunks` | report.coverage | 是否分块审查、分了几块（长文不再截断） |
 | `coverage.type_detection` | report.coverage | 类型判定：`{type, confidence, source, reason}`，猜测置信度 <0.8 时只增检查不关检查 |
 | `excluded[]` | report | **模型自否**的条目（自己写了不成立/撤回/无需整改），不计入异议与待整改 |
-| `suppressed[]` | report | 长文里同类过多的 minor/nit，JSON 完整保留但清单不展开 |
+| `suppressed[]` | report | ①长文里同类过多的 minor/nit；②**归口折叠**的条目（同片段让位给结论级规则、内部进度豁免 COMP-004）。两类都带 `folded_into` / `fold_reason`，JSON 完整保留、清单不展开 |
+| `open_discoveries[]` | report | 规则清单外的模型发现（`OPEN-*`）：`{rule_id,severity,quote,confidence,source:"model"}`。与 `issues[]` 分开列，避免被误读成规则判定 |
+| `issue.folded_into` / `fold_reason` | issue（suppressed 内） | 归口折叠去向与理由（如 `FACT-004→LOGIC-001`） |
 | `issue.aggregated_count` / `aggregated_ids` | issue | 同类提示聚合后的总处数与其余条目 id（数据在 `suppressed` 里） |
 | `llm.cache_hits` | report.llm | 语义审命中缓存的次数（命中不消耗 token） |
 | `llm.dimensions[dim].finish_reason` | report.llm | `length` 表示输出被截断 |
@@ -301,6 +311,37 @@ review.py --scenario resume-screening
 
 **为什么关了什么必须进 limitations**：不然「未报出资质问题」会被读成
 「资质已核实」。二者差别很大，尤其在这种批量筛选场景。
+
+### 3.7 格式规格：Word 版式按哪套标准判（v0.7.5）
+
+```
+左栏「格式规格」下拉 ──GET /api/format-specs──→ format_spec.public_list()
+                     （每项带 checks[]：这条标准会判哪几项）
+        │ 选择（默认空 = 不判版式）
+        ▼
+startReview ─POST /api/review/start {file, format_spec:"course-report-v1"}
+        │  _resolve_format_spec()：未知 id → {ok:false}，**不起任务**
+        ▼
+review.py --format-spec course-report-v1
+        │  run_one(): 仅当目标是 .docx/.docm 才处理；scenario 之后、set_rule_index 之前
+        │  1) 按规格 disable_rules 过滤（none → FORMAT-001~005 不参与）
+        │  2) spec.check 经 ctx["format_spec"] 传给 docx_format_checks.run_all()
+        ▼
+报告：format_spec{id,name,version,source,desc,criteria{},disabled_rules[],disabled_detail[]}
+      + limitations 写明「哪几项本次未判」
+```
+
+**为什么数值不能写在 rules/ 里**：`rules/*.yaml` 是长期裁判尺度（什么算问题），
+而「正文宋体小四、固定 22 磅」是**某一份委托方的格式要求**，换份期刊就全变。
+写进规则库的结果是：规则库攒下多套互相矛盾的标准、审的时候没人知道选哪个、
+改标准还得改 Python。现在加新标准 = 在 `config/format_specs.yaml` 加一段。
+
+**为什么默认是 `none` 而不是某个"通用标准"**：字体/字号/行距没有通用正确答案。
+没有委托方标准时判任何一项都是瞎猜，误报会让人放弃整份清单。
+`none` 只保留 FORMAT-006（图表编号与引用一致），它不依赖具体版式数值。
+
+**为什么没选规格也要写 limitations**：不写，「没报出版式问题」会被读成「版式合规」。
+报告里必须出现「未提供格式规格：本报告不判断字体、字号、首行缩进、行距、标题层级」。
 
 ## 4. 安全防护（_guard_api，所有 /api/* 必经）
 

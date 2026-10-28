@@ -474,8 +474,198 @@ def check_ratio_cap(text):
     return findings
 
 
+# ---------- 7. 方向词 + 负号（双重否定，2026-10-28 补） ----------
+# 「同比下降 -3.2%」「环比增长 -1.8%」：文字已表达方向，负号再表达一次，二者互相否定。
+# 这是 owner 标注漏检里最高频的一类（annotations.jsonl 4 条中 2 条），纯形式即可判定，
+# 根本不该让 LLM 猜。护栏：方向词与负号必须**紧邻**（只允许空白）——
+# 「增长率为 -1.8%」「降幅收窄至 -3%」里"率为/至"隔开了方向与符号，
+# 比率本身可以取负值，不是双重否定，不匹配。
+SIGNED_DIR = re.compile(
+    r"(下降|增长|上升|下跌|回落|回升|降低|减少|增加|提升)"
+    r"\s*[-−－–]\s*(\d+(?:\.\d+)?)\s*[%％]")
+
+
+def check_signed_direction(text):
+    findings = []
+    for start, seg in sentences(text):
+        m = SIGNED_DIR.search(seg)
+        if not m:
+            continue
+        word, pct = m.group(1), m.group(2)
+        findings.append({
+            "rule_id": "LOGIC-009",
+            "dimension": "logic",
+            "quote": seg.strip(),
+            "start": start,
+            "evidence": (f"方向词「{word}」后紧跟负号「-{pct}%」，文字方向与符号方向互相否定"
+                         "（确定性形式校验，不依赖模型）；"
+                         f"规范写法二选一：「{word} {pct}%」或「变动率为 -{pct}%」"),
+            "suggestion": "删掉负号或删掉方向词，二选一。",
+            "confidence": 0.9,
+            "tool": "arith_check:signed_dir",
+        })
+    return findings
+
+
+# ---------- 8. 占比分项与合计（2026-10-28 补） ----------
+# 「占比分别为 45%、35%、30%，合计 110%」：分项加总与合计一致（45+35+30=110），
+# 所以「分项 vs 合计」这条查不出来——真正的问题是**占比的合计必须是 100%**。
+# 护栏：句内必须有「占比/份额/比例/比重」语境词、必须有「合计/总计/共」、
+# 分项 ≥2 个且逐个排除变化量语境（「同比增长 5%」不是分项）。
+SHARE_HEAD = re.compile(r"(占比|份额|比例|比重)")
+PCT_ITEM = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*[%％]")
+SHARE_TOTAL = re.compile(
+    r"(?:合计|总计|共|加总)\s*(?:为|是|约|达)?\s*(\d{1,3}(?:\.\d+)?)\s*[%％]?")
+SHARE_SUM_TOL = 2.0          # 百分点；分项四舍五入最多漂 0.5×n，拦得住 105/110 这类
+
+
+def check_share_sum(text):
+    findings = []
+    for start, seg in sentences(text):
+        if not SHARE_HEAD.search(seg):
+            continue
+        total_m = SHARE_TOTAL.search(seg)
+        if not total_m:
+            continue
+        stated = float(total_m.group(1))
+        items = []
+        for m in PCT_ITEM.finditer(seg[:total_m.start()]):
+            if _is_growth(seg, m.start(), m.end()):
+                continue          # 「同比增长 5%」是变化量，不是占比分项
+            items.append(float(m.group(1)))
+        if len(items) < 2:
+            continue
+        s = sum(items)
+        # 先查「分项 vs 合计」的算术错（这是加总检查的口语版，无计数词时它不敢开火）
+        if abs(s - stated) > max(0.5, stated * 0.002):
+            findings.append({
+                "rule_id": "LOGIC-001", "dimension": "logic",
+                "quote": seg.strip(), "start": start,
+                "evidence": (f"分项相加 {'+'.join(_fmt(i) for i in items)}={_fmt(s)}%，"
+                             f"文中合计写 {_fmt(stated)}%，相差 {_fmt(abs(s - stated))} 个百分点"
+                             "（确定性算术校验）"),
+                "suggestion": "核对分项或合计，二者必须一致。",
+                "confidence": 0.95, "tool": "arith_check:share_sum",
+            })
+            continue
+        # 再查「占比的合计应当是 100%」这一口径约束
+        if abs(s - 100) > SHARE_SUM_TOL:
+            findings.append({
+                "rule_id": "LOGIC-001", "dimension": "logic",
+                "quote": seg.strip(), "start": start,
+                "evidence": (f"占比分项相加 = {_fmt(s)}%，不等于 100%"
+                             f"（相差 {_fmt(abs(s - 100))} 个百分点，确定性口径校验；"
+                             "分项与文中合计一致，问题在合计本身不应偏离 100%）"),
+                "suggestion": ("占比合计应为 100%：若分项有遗漏请补全（如「其他」项），"
+                               "若口径本就不构成完整划分，请删去「合计」表述。"),
+                "confidence": 0.9, "tool": "arith_check:share_sum",
+            })
+    return findings
+
+
+# ---------- 9. 万/亿 单位换算（2026-10-28 补） ----------
+# 「约 1.2 亿元（即 1200 万元）」：1.2 亿 = 12000 万，换算差 10 倍。
+# 纯乘法可判定。护栏：两组「数字+单位」之间只允许出现换算连接词
+# （即/约/等于/相当于/合/折合/=）与括号——「1.2 亿元，其中 2000 万元」这类
+# 并列关系不得命中。
+UNIT_EQ = re.compile(
+    r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(万|亿)\s*元?\s*"
+    r"(?:[（(]\s*)?(?:即|约为?|等于|相当于|合|折合|=|[=＝])\s*(?:[）)]\s*)?"
+    r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(万|亿)\s*元?")
+UNIT_FACTOR = {"万": 1e4, "亿": 1e8}
+
+
+def check_unit_convert(text):
+    findings = []
+    for start, seg in sentences(text):
+        for m in UNIT_EQ.finditer(seg):
+            v1 = float(m.group(1).replace(",", "")) * UNIT_FACTOR[m.group(2)]
+            v2 = float(m.group(3).replace(",", "")) * UNIT_FACTOR[m.group(4)]
+            if v1 <= 0 or v2 <= 0:
+                continue
+            if abs(v1 - v2) / max(v1, v2) <= 0.005:      # 容差 0.5%，覆盖四舍五入
+                continue
+            findings.append({
+                "rule_id": "LOGIC-001", "dimension": "logic",
+                "quote": seg.strip(), "start": start,
+                "evidence": (f"「{m.group(1)}{m.group(2)}元」= {int(v1):,} 元，"
+                             f"「{m.group(3)}{m.group(4)}元」= {int(v2):,} 元，"
+                             f"换算相差约 {v1 / v2 if v1 > v2 else v2 / v1:.1f} 倍"
+                             "（确定性单位换算校验）"),
+                "suggestion": f"核对换算：1 亿 = 10,000 万，应为 {_fmt(v1 / UNIT_FACTOR[m.group(4)] if m.group(2) != m.group(4) else v1)}{m.group(4)}。",
+                "confidence": 0.95, "tool": "arith_check:unit_convert",
+            })
+            break
+    return findings
+
+
+# ---------- 10. 同口径反向断言（同比环比打架，2026-10-28 补） ----------
+# 「签约额同比增长 12%，签约额同比下降 5%」：同一指标、同一口径、两个互斥方向。
+# 护栏（宁漏不误）：
+#   · 只认「同比/环比 + 方向词 + 数字%」的显式变化断言；
+#   · 两个断言必须**同口径**（都是同比或都是环比——同比与环比基期不同，不构成矛盾）；
+#   · 必须能提取出**相同的主语**（紧邻口径词前面的名词），提不出或不同 → 跳过。
+CLASH_PERIOD = re.compile(
+    r"(同比|环比)\s*(?:较)?[^。；\n，,]{0,4}?"
+    r"(上升|增长|提升|提高|上涨|增加|涨|下降|下跌|回落|下滑|降低|减少|跌)"
+    r"\s*(?:了|约|近)?\s*(\d+(?:\.\d+)?)\s*[%％]")
+CLASH_UP = {"上升", "增长", "提升", "提高", "上涨", "增加", "涨"}
+SUBJECT_TAIL = re.compile(r"([\u4e00-\u9fa5]{1,6})$")
+
+
+def _clash_subject(seg, pos):
+    """取口径词前面的主语：紧邻的中文串，剥掉连接词。提不出返回 None。"""
+    tail = re.sub(r"[\s，,。；;、]+$", "", seg[:pos])
+    m = SUBJECT_TAIL.search(tail)
+    if not m:
+        return None
+    return re.sub(r"^(其中|另外|而|但|所以|因此|且)", "", m.group(1)) or None
+
+
+def _same_subject(a, b):
+    """主语等同：完全一致，或一个是另一个的后缀（「签约额」vs「三季度签约额」）。"""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return (len(a) >= 2 and len(b) >= 2
+            and (a.endswith(b) or b.endswith(a)))
+
+
+def check_period_clash(text):
+    findings = []
+    for start, seg in sentences(text):
+        claims = []
+        for m in CLASH_PERIOD.finditer(seg):
+            period, word = m.group(1), m.group(2)
+            polarity = "up" if word in CLASH_UP else "down"
+            subject = _clash_subject(seg, m.start())
+            if subject:
+                claims.append((period, polarity, subject, word, m.group(3)))
+        for i in range(len(claims)):
+            for j in range(i + 1, len(claims)):
+                p1, o1, s1, w1, n1 = claims[i]
+                p2, o2, s2, w2, n2 = claims[j]
+                if p1 != p2 or o1 == o2 or not _same_subject(s1, s2):
+                    continue
+                findings.append({
+                    "rule_id": "LOGIC-001", "dimension": "logic",
+                    "quote": seg.strip(), "start": start,
+                    "evidence": (f"同一句内对「{s1}」同时断言 {p1}{w1} {n1}% 与 {p2}{w2} {n2}%，"
+                                 "同口径下方向互斥（确定性一致性校验）"),
+                    "suggestion": "两个断言至少有一个方向或数字写错，核对原始数据后统一。",
+                    "confidence": 0.85, "tool": "arith_check:period_clash",
+                })
+                break
+            else:
+                continue
+            break
+    return findings
+
+
 CHECKS = (check_sums, check_weekdays, check_durations, check_ratios, check_tenure,
-          check_ratio_cap)
+          check_ratio_cap, check_signed_direction, check_share_sum,
+          check_unit_convert, check_period_clash)
 
 
 def run_all(text, active_rule_ids=None):

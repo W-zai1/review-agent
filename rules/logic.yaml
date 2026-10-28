@@ -69,3 +69,11 @@
   severity: major
   source: 逻辑一致性基线 v1
   auto_fix: false
+
+- rule_id: LOGIC-009
+  dimension: logic
+  desc: 方向词与负号并存的形式自相矛盾必须指出（如「同比下降 -3.2%」「环比增长 -1.8%」——文字已表达方向，负号再表达一次，二者互相否定；「增长率为 -3.4%」这类比率取负的写法不算）
+  method: numeric_form_contradiction
+  severity: minor
+  source: 数值形式自洽基线 v1
+  auto_fix: false

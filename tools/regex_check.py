@@ -10,7 +10,9 @@ import json
 
 # 千分位 1,360 / 1,234.5 也要认：会计与财报文本的标准写法
 NUM_RE = re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(亿|万|%|倍)?")
-DATE_RE = re.compile(r"(\d{4})\s*年(?:\s*(\d{1,2})\s*月)?")
+DATE_RE = re.compile(
+    r"(?P<year>\d{4})\s*年(?:\s*(?P<month>\d{1,2})\s*月)?"
+    r"|(?P<iso_year>\d{4})-(?P<iso_month>\d{1,2})-(?P<iso_day>\d{1,2})")
 # 常见 emoji / 符号表情范围
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2190-\u21FF\u2B00-\u2BFF\uFE0F]")
 CASUAL = ["吧", "呢", "啊", "嘛", "哎", "哦", "呗", "哈", "咋", "甭", "酱紫"]
@@ -98,12 +100,21 @@ def extract_numbers(text):
 
 
 def extract_dates(text):
+    """抽取年份/年月；2026-10-27 起支持 ISO 写法「2025-01-01」。
+
+    参考文献与政策文件普遍用 ISO 日期（「自 2025-01-01 施行」），
+    旧实现只认「YYYY 年」，导致这一整类可核验的硬事实全部漏抽。
+    """
     out = []
     for m in DATE_RE.finditer(text):
+        if m.group("year") is not None:
+            year, month = m.group("year"), m.group("month")
+        else:
+            year, month = m.group("iso_year"), m.group("iso_month")
         out.append({
             "raw": m.group(0),
-            "year": int(m.group(1)),
-            "month": int(m.group(2)) if m.group(2) else None,
+            "year": int(year),
+            "month": int(month) if month else None,
             "start": m.start(),
             "end": m.end(),
         })

@@ -1,0 +1,82 @@
+# 格式规格（format spec）—— 「这一次按哪套版式标准判」
+#
+# 为什么不在 rules/ 里：rules/*.yaml 是**长期裁判尺度**（什么算问题）。
+# 而「正文必须宋体小四、固定 22 磅行距」是**某一份委托方的格式要求**，
+# 换个期刊/换个学校/换个学期就全变。把一次性的格式要求写进规则库，
+# 会让规则库越攒越多套互相矛盾的标准，最后没人知道该选哪个。
+#
+# 所以分成两层：
+#   rules/format.yaml       → 只声明「要检查哪些维度」（FORMAT-001~006）
+#   config/format_specs.yaml → 每个规格给出具体数值（本文件）
+#
+# 加一份新标准 = 在下面加一段，**不改任何代码**。
+#
+# 字段说明（check 里只写你关心的项，没写的项就**不检查**）：
+#   body_font_east            允许的正文字体（中文字体名，可多个等价写法）
+#   body_size_halfpt          正文字号，单位「半磅」：24 = 12pt = 小四，21 = 10.5pt = 五号
+#   first_line_chars          首行缩进字符数 ×100（2 字符 = 200）
+#   first_line_twips_min/max  首行缩进的缇值区间（1 磅 = 20 缇；2 字符≈480 缇）
+#   line_twips                行距缇值（22 磅 = 440；1.5 倍行距请用 line_rule=auto）
+#   line_rule                 exact = 固定值；auto = 倍数/单倍
+#   heading_font              标题字体（用于识别「视觉标题段」）
+#   heading_min_size_halfpt   标题最小字号（半磅）
+#   heading_max_level         最多允许几级标题（3 = 允许三级）
+#   figref                    true = 检查「图表编号与正文引用一致」（与字体字号无关）
+#
+# 版本号：改动本文件必须升 version（报告会记录它，用于区分「换了标准」与「规格被改」）
+
+version: v1-2026-10-27
+
+# 不指定规格时用它：不做版式判定，只保留与标准无关的图表编号检查
+default: none
+
+specs:
+  - id: none
+    name: 不套用格式标准
+    source: ""
+    desc: >-
+      不做字体/字号/缩进/行距/标题层级的判定——这些没有"通用正确值"，
+      没有委托方标准时判任何一项都是瞎猜。
+      只保留「图表编号与正文引用一致」，它与具体版式标准无关。
+    check:
+      figref: true
+    disable_rules:
+      - FORMAT-001
+      - FORMAT-002
+      - FORMAT-003
+      - FORMAT-004
+      - FORMAT-005
+
+  - id: course-report-v1
+    name: 课程报告格式要求 v1
+    source: 课程报告格式要求 v1（课程作业模板）
+    desc: >-
+      正文中文宋体、小四（12pt）、首行缩进 2 字符、固定 22 磅行距、
+      两级或三级标题、图表编号与正文引用一致。
+    check:
+      body_font_east: ["宋体", "SimSun", "新宋体", "NSimSun", "宋体-GB2312"]
+      body_size_halfpt: 24
+      first_line_chars: 200
+      first_line_twips_min: 400
+      first_line_twips_max: 520
+      line_twips: 440
+      line_rule: exact
+      heading_font: 黑体
+      heading_min_size_halfpt: 22
+      heading_max_level: 3
+      figref: true
+    disable_rules: []
+
+  # ---- 以下是「加一份新标准长什么样」的样例，默认不启用 ----
+  # - id: journal-gbt7714-2026
+  #   name: 某期刊投稿格式（GB/T 7714 参考文献）
+  #   source: 《XX 学报》2026 年投稿须知第 3 节
+  #   desc: 正文宋体五号、单倍行距、首行缩进 2 字符、最多三级标题；参考文献按 GB/T 7714
+  #   check:
+  #     body_font_east: ["宋体", "SimSun"]
+  #     body_size_halfpt: 21        # 五号 = 10.5pt
+  #     first_line_chars: 200
+  #     line_rule: auto             # 单倍行距：只要求不是"固定值"
+  #     heading_max_level: 3
+  #     figref: true
+  #   disable_rules: [FORMAT-004]   # 不判固定行距（该刊允许单倍）

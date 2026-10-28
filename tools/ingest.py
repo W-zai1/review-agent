@@ -271,6 +271,7 @@ def _xml_text(xml: str) -> str:
 def extract_docx(path) -> tuple[str, dict]:
     """提取 .docx 文本（正文 + 页眉页脚）。"""
     meta = {"kind": "docx", "extractor": "docx-xml", "warnings": []}
+    truncated = []                    # 哪些成员因超限被截断（决定"空"该怎么解释）
     try:
         with zipfile.ZipFile(str(path)) as z:
             names = z.namelist()
@@ -281,6 +282,7 @@ def extract_docx(path) -> tuple[str, dict]:
             def _read_capped(member):
                 info = z.getinfo(member)
                 if info.file_size > MAX_DOCX_XML_BYTES:
+                    truncated.append(member)
                     meta["warnings"].append(
                         f"{member} 解压后 {info.file_size // 1024 // 1024}MB，"
                         f"超出 {MAX_DOCX_XML_BYTES // 1024 // 1024}MB 上限，已截断读取")
@@ -300,7 +302,15 @@ def extract_docx(path) -> tuple[str, dict]:
     if cut:
         meta["warnings"].append(cut)
     if not text.strip():
-        meta["warnings"].append("Word 文档内容为空")
+        if truncated:
+            # 别把"读不出来"说成"内容为空"：这是两份完全不同的处置。
+            # 实测 _originals/bomb.docx（100MB XML）只留下「Word 文档内容为空」，
+            # 用户会以为文件本来就没字，实际是恶意构造/结构损坏。
+            meta["warnings"].append(
+                "Word 文档未能提取正文：正文 XML 解压后超出上限、已截断读取，"
+                "疑似压缩炸弹或文件结构损坏——请人工确认，不要当作空文档处理")
+        else:
+            meta["warnings"].append("Word 文档内容为空")
     return text, meta
 
 

@@ -214,7 +214,15 @@ def extract(path) -> dict:
     except zipfile.BadZipFile:
         raise ValueError("Word 文件已损坏或不是 .docx 格式")
 
-    root = ET.fromstring(doc_xml)
+    try:
+        root = ET.fromstring(doc_xml)
+    except ET.ParseError as e:
+        # zip 结构正常但 document.xml 是坏 XML（截断/恶意构造）：
+        # 这是"文件坏了"，不是"代码出了问题"，必须翻译成 ValueError。
+        # 实测 target/uploads/_originals/bomb.docx 会抛 ParseError，
+        # 而 run_one 只把 ValueError/OSError 转成"文件不可读"，
+        # ParseError 会一路冒到进程顶部（CLI 打 traceback / 服务端 500）。
+        raise ValueError(f"Word 文档结构损坏（document.xml 无法解析：{e}）")
     theme_minor = _font_typeface(theme_xml, "minorFont", "Hans") if theme_xml else None
     theme_major = _font_typeface(theme_xml, "majorFont", "Hans") if theme_xml else None
     doc_default_sz = _doc_default_sz(styles_xml) if styles_xml else None

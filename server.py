@@ -115,6 +115,7 @@ import integrity  # noqa: E402
 import ingest  # noqa: E402
 import agent_spec  # noqa: E402
 import scenario  # noqa: E402
+import format_spec  # noqa: E402
 import rule_learning  # noqa: E402
 import rule_exec  # noqa: E402
 import llm_client  # noqa: E402
@@ -568,6 +569,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, scenario.public_list())
             except scenario.ScenarioError as e:
                 return self._send(200, {"ok": False, "error": str(e), "items": []})
+        if p == "/api/format-specs":
+            # 格式规格（docx 版式按哪套标准判）。同 scenarios：配置坏了要报错而不是空列表
+            try:
+                return self._send(200, format_spec.public_list())
+            except format_spec.FormatSpecError as e:
+                return self._send(200, {"ok": False, "error": str(e), "items": []})
         if p == "/api/purpose/files":
             # 暂存的目的文件（说明材料，不是待审对象）；不含原文，只给预览
             return self._send(200, {"ok": True,
@@ -636,6 +643,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "id": pid,
                                     "items": _list_purpose_records()})
         return self._send(404, {"error": "not found"})
+
+    # ----- 未实现的方法 -----
+    # 基类 BaseHTTPRequestHandler 对 PUT/PATCH 直接回 **501 + HTML**：
+    #   ① 501 属 5xx，任何"接口不许 5xx"的巡检都会把它当成服务故障；
+    #   ② 前端 fetch 拿到的是 HTML，`res.json()` 当场抛错，看不到原因。
+    # 统一改成 405 + JSON，并把 Allow 说清楚。
+    def _method_not_allowed(self):
+        allow = "GET, POST, DELETE"
+        body = json.dumps({"ok": False,
+                           "error": f"不支持的方法 {self.command}；允许：{allow}"},
+                          ensure_ascii=False).encode("utf-8")
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Allow", allow)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_PUT(self):
+        self._method_not_allowed()
+
+    def do_PATCH(self):
+        self._method_not_allowed()
+
+    def do_OPTIONS(self):
+        self._method_not_allowed()
 
     MAX_JSON_BODY = 1 * 1024 * 1024        # JSON 接口 1MB 上限（与文本 2MB / 二进制 20MB 对称）
 
@@ -1023,7 +1058,12 @@ class Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"R-\d{8}-\d{3}", str(rid)):
             return {"ok": False, "error": "报告 ID 格式不合法"}
         hit = OUTPUTS / f"{rid}.json"
-        if not hit.exists():
+        sidecar = OUTPUTS / f"{rid}.md"
+        # 只认 .json 会留下"清不掉的孤儿"：删除是「先移 json 再移 md」两次文件操作，
+        # 中途被打断（进程被杀 / 磁盘满）就只剩一个 .md，而 .json 已进回收站。
+        # 此时再删会报"未找到报告"，那个 .md 就永远躺在 outputs/ 里没人能处理。
+        # 所以判"找不到"要看两个文件都不在。
+        if not hit.exists() and not sidecar.exists():
             return {"ok": False, "error": f"未找到报告 {rid}"}
 
         confirm = str((data or {}).get("confirm") or "")
@@ -1320,6 +1360,9 @@ class Handler(BaseHTTPRequestHandler):
         scenario_opt, scenario_err = _resolve_scenario((data or {}).get("scenario"))
         if scenario_err:
             return {"ok": False, "error": scenario_err}
+        spec_opt, spec_err = _resolve_format_spec((data or {}).get("format_spec"))
+        if spec_err:
+            return {"ok": False, "error": spec_err}
         # 目的组装（手写 + 上传的目的文件）在启动前完成：id 非法/超量要直接报错，
         # 不能等任务跑起来才失败。组装后的文本经 --purpose 传给子进程，
         # --purpose-max 告知解析上限（文件类目的可超过 300 字）。
@@ -1358,11 +1401,13 @@ class Handler(BaseHTTPRequestHandler):
                 "type": type_opt,
                 "agent": agent_opt,
                 "scenario": scenario_opt,
+                "format_spec": spec_opt,
             }
         threading.Thread(
             target=_run_review_job,
             args=(job_id, file, llm_opt, progress, type_opt, agent_opt,
-                  purpose_text or None, purpose_max, purpose_quality, scenario_opt),
+                  purpose_text or None, purpose_max, purpose_quality, scenario_opt,
+                  spec_opt),
             daemon=True,
         ).start()
         return {"ok": True, "job_id": job_id}
@@ -1694,6 +1739,11 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": scenario_err}
         if scenario_opt:
             cmd.extend(["--scenario", scenario_opt])
+        spec_opt, spec_err = _resolve_format_spec((data or {}).get("format_spec"))
+        if spec_err:
+            return {"ok": False, "error": spec_err}
+        if spec_opt:
+            cmd.extend(["--format-spec", spec_opt])
         typed_purpose = _clean_purpose((data or {}).get("purpose"))
         purpose_text, purpose_err, purpose_quality = _assemble_purpose(
             typed_purpose, (data or {}).get("purpose_files"))
@@ -1751,9 +1801,26 @@ def _resolve_scenario(raw):
     return str(raw), None
 
 
+def _resolve_format_spec(raw):
+    """校验前端传来的格式规格 id。
+
+    空值返回 None：由 review.py 用配置里的 default（当前 none = 不判版式）。
+    不传空字符串给子进程，是因为 --format-spec "" 会被当成"选了空规格"。
+    """
+    if raw in (None, "", "default"):
+        return None, None
+    try:
+        known = [s["id"] for s in format_spec.load()["specs"]]
+        if str(raw) not in known:
+            return None, f"未知格式规格：{raw}；可选：{'、'.join(known)}"
+    except format_spec.FormatSpecError as e:
+        return None, f"格式规格配置错误：{e}"
+    return str(raw), None
+
+
 def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
                     agent_opt=None, purpose=None, purpose_max=None,
-                    purpose_quality=None, scenario_opt=None):
+                    purpose_quality=None, scenario_opt=None, format_spec_opt=None):
     """后台线程：跑 review.py，进度事件写入 progress_path。"""
     before = {p.stem for p in OUTPUTS.glob("R-*.json")}
     cmd = [str(PY), str(ROOT / "review.py"), file,
@@ -1769,6 +1836,9 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
     if scenario_opt:
         # 情境只决定"哪些规则参与"，关了什么会写进报告 limitations
         cmd.extend(["--scenario", scenario_opt])
+    if format_spec_opt:
+        # 格式规格只提供"版式判定的数值"，没选时由 review.py 用 default（none）
+        cmd.extend(["--format-spec", format_spec_opt])
     if purpose:
         cmd.extend(["--purpose", purpose])
         # 文件类目的可超过 300 字：把实际上限告诉解析层，避免二次截断
