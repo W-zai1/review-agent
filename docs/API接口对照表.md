@@ -271,6 +271,11 @@ S3 语义层（LLM，按维度）
 | `open_discoveries[]` | report | 规则清单外的模型发现（`OPEN-*`）：`{rule_id,severity,quote,confidence,source:"model"}`。与 `issues[]` 分开列，避免被误读成规则判定 |
 | `issue.folded_into` / `fold_reason` | issue（suppressed 内） | 归口折叠去向与理由（如 `FACT-004→LOGIC-001`） |
 | `issue.aggregated_count` / `aggregated_ids` | issue | 同类提示聚合后的总处数与其余条目 id（数据在 `suppressed` 里） |
+| `law_library{available,articles_total,laws[],cited[],skipped[],error?}` | report | 法条库：本次收录了几部法几条、**实际引用了哪几条**（`cited[]{law,law_name,article,article_no,text,status,citation}`）、哪些检查因缺条文没跑（`skipped[]`）。`available:false` 表示库不可用，本次未做法条级比对 |
+| `issue.citation` | issue | 单条依据：`{law,law_name,article,article_no,chapter,text,status,citation}`。`citation` 是可直接展示的一行文案（「《劳动合同法》第十九条（第二章 …）：原文」） |
+| `issue.citations[]` | issue | 同句命中多条法条时的全部依据（如既超试用期又压低工资）。`issue.citation` 恒等于 `citations[0]`，兼容只读单条的前端 |
+| `LAW-001` | rules/compliance.yaml | 法定量 vs 条文原文（试用期上限/竞业限制期限/试用期工资）。与 `FACT-001` 同句时**并入**其 evidence，不新增异议 |
+| `fact_gaps{recorded,new,repeat,log,kinds{},top[],usable_as_evidence,disabled?,reason?,error?}` | report | 知识库缺口：本次有多少判断是「库里没依据」时下的。`kinds` 是四类计数（`model_judgment` / `law_missing` / `unsourced_claim` / `watchlist_unasserted`），`top[]` 是前 5 条 `{gap_id,kind,entity_guess,quote}`。**`usable_as_evidence` 恒为 false**——缺口里的 quote 来自被审文档，不能当依据。`disabled:true` 表示本次用 `--no-gap-log` 运行（不落被审文本片段） |
 | `llm.cache_hits` | report.llm | 语义审命中缓存的次数（命中不消耗 token） |
 | `llm.dimensions[dim].finish_reason` | report.llm | `length` 表示输出被截断 |
 

@@ -1,8 +1,8 @@
 {
  "recall_pct": 100.0,
  "precision_pct": 100.0,
- "labels_total": 21,
- "labels_hit": 21,
+ "labels_total": 23,
+ "labels_hit": 23,
  "fp_total": 0,
  "cases": [
   {
@@ -124,6 +124,15 @@
   },
   {
    "case": "c14_internal_progress.txt",
+   "kind": "clean",
+   "labels_total": 0,
+   "labels_hit": 0,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 0
+  },
+  {
+   "case": "c16_law_compliant.txt",
    "kind": "clean",
    "labels_total": 0,
    "labels_hit": 0,
@@ -301,7 +310,16 @@
    "unlabeled": 0,
    "unlabeled_detail": [],
    "issue_count": 1
+  },
+  {
+   "case": "p20_law_probation_illegal.txt",
+   "kind": "positive",
+   "labels_total": 2,
+   "labels_hit": 2,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 2
   }
  ],
- "ts": "2026-10-28 11:40:11"
+ "ts": "2026-10-28 17:10:10"
 }

@@ -1991,6 +1991,73 @@ function locateEvidence(start, quote) {
 }
 
 
+function renderResearch(report) {
+  const box = $("#researchBlock");
+  if (!box) return;
+  const rs = report.research || {};
+  const items = rs.items || [];
+  if (!rs.enabled || (!rs.checked && !(rs.errors || []).length)) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const groups = [
+    ["refuted", "反驳（原文与来源不一致）", "rs-bad"],
+    ["supported", "支持（找到一致来源）", "rs-good"],
+    ["unverified", "未找到可比来源", "rs-muted"],
+  ];
+  const rows = groups.map(([key, title, cls]) => {
+    const list = items.filter((it) => it.status === key);
+    if (!list.length) return "";
+    return `<div class="research-group"><div class="research-group-title ${cls}">${title}</div>`
+      + list.map((it) => `<div class="research-item">
+          <div class="research-quote">${esc(it.quote || "")}</div>
+          <div class="research-reason">${esc(it.reason || "")}</div>
+          ${(it.sources || []).map((s) => s.url
+            ? `<a class="research-source" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title || s.url)}</a>`
+            : "").join("")}
+        </div>`).join("")
+      + "</div>";
+  }).join("");
+  box.classList.remove("hidden");
+  box.innerHTML = `<h2>事实核验（外部检索）<span class="rs-h2note">主张 ${rs.claims_found || 0} · 已查 ${rs.checked || 0} · 本地 ${rs.local_hits || 0} · 缓存 ${rs.cache_hits || 0} · 已学 ${rs.learned_hits || 0}</span></h2>
+    <div class="research-hint">「未找到」不等于虚假；「反驳」也只说明检索来源与原文数值不一致，最终口径需人工确认。</div>
+    ${rows || '<div class="rs-empty">本次没有可核验的库外事实主张。</div>'}`;
+}
+
+
+function renderActionPlan(report) {
+  const box = $("#actionPlan");
+  if (!box) return;
+  const plan = report.action_plan || {};
+  const items = plan.top || [];
+  if (!items.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  const rows = items.map((it, i) => {
+    const to = it.has_rewrite && it.to
+      ? `<pre class="plan-to">${esc(it.to)}</pre>`
+      : `<span class="plan-manual">需人工：${esc(it.how || "按依据改写")}</span>`;
+    return `<tr>
+      <td class="plan-no">${i + 1}</td>
+      <td class="plan-where">${esc(it.where || "")}</td>
+      <td class="plan-from">${esc(it.from || "（新增条款）")}</td>
+      <td>${to}</td>
+      <td class="plan-consequence">${esc(it.consequence || "")}</td>
+    </tr>`;
+  }).join("");
+  box.innerHTML = `<h2>整改单<span class="rs-h2note">${esc(plan.headline || "")}</span></h2>
+    <div class="plan-hint">只列能落到具体文本的改法；「需人工」的条目在下方问题清单里给判断依据。</div>
+    <div class="plan-wrap"><table class="plan-table">
+      <thead><tr><th>#</th><th>位置</th><th>原文</th><th>改成</th><th>不改的后果</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+
 function renderIssueList(report) {
   const box = $("#issueList");
   if (!box) return;
@@ -2008,14 +2075,23 @@ function renderIssueList(report) {
     const confText = confidence == null ? "" : `置信度 ${confidence.toFixed(2)}`;
     const confirm = confidence != null && confidence < 0.7 ? "（待人工确认）" : "";
     const dim = DIM_FULL[issue.dimension] || issue.dimension;
+    const quoteText = issue.fix && issue.fix.action === "insert"
+      ? "（缺失条款，应在" + (issue.fix.where || "合同末尾") + "新增）"
+      : issue.quote;
     return `<div class="issue">
       <div class="issue-header">
         <span class="issue-severity ${severity[1]}">${severity[0]} · ${esc(issue.rule_id)}</span>
         <span class="issue-dim">${esc(dim)}${issue.open_discovery ? " · 规则外发现" : ""}</span>
         <span class="issue-meta">${esc(issue.location || "")}${confText ? " · " + esc(confText) : ""}${confirm}</span>
       </div>
-      <div class="issue-quote">"${esc(issue.quote)}"</div>
+      <div class="issue-quote">"${esc(quoteText)}"</div>
       <div class="issue-evidence">${esc(issue.evidence)}</div>
+      ${issue.fix && issue.fix.has_rewrite && issue.fix.to
+        ? `<div class="issue-fix"><span class="issue-fix-label">${issue.fix.action === "insert" ? "新增条款" : "改为"}</span><pre>${esc(issue.fix.to)}</pre></div>`
+        : ""}
+      ${issue.fix && issue.fix.consequence
+        ? `<div class="issue-consequence"><b>不改的后果：</b>${esc(issue.fix.consequence)}</div>`
+        : ""}
       ${issue.suggestion ? `<div class="issue-suggestion">建议：${esc(issue.suggestion)}</div>` : ""}
     </div>`;
   }).join("");
@@ -2107,6 +2183,8 @@ function renderReport(report) {
   renderEvidence(report);
   renderAnnotatedText(report);
   renderIssueSummary(report);
+  renderActionPlan(report);
+  renderResearch(report);
   renderIssueList(report);
   renderExcluded(report);
   renderLimitations(report);
@@ -2602,6 +2680,9 @@ async function startReview(llmOverride) {
   // 格式规格只对 .docx 有意义；不选就不传，让后端用默认 none（并写进 limitations）
   if (state.formatSpec) payload.format_spec = state.formatSpec;
   if (llmOverride === true || llmOverride === false) payload.llm = llmOverride;
+  // 库外事实核验：默认勾选；关掉就只比对内置事实库（离线/涉密场景）
+  const researchBox = document.getElementById("researchToggle");
+  payload.research = !!(researchBox && researchBox.checked);
   const purpose = currentPurpose();
   if (purpose) payload.purpose = purpose;
   // 上传的目的文件：只传 id，文本由服务端从暂存区取出并组装

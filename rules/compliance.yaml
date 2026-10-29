@@ -30,3 +30,11 @@
   severity: minor
   source: 披露规范 v1
   auto_fix: false
+
+- rule_id: LAW-001
+  dimension: compliance
+  desc: 文本给出的法定量（试用期时长、竞业限制期限、试用期工资比例）必须与现行法条一致，且结论须给出条号以便核对。依据来自 knowledge/laws/ 的条文原文，不是模型记忆。与 FACT-001 分工：FACT-001 比对事实库的数值断言（无原文），本规则比对法条原文；同一句同时命中时本规则主判。边界：命中条文 ≠ 条文适用——例外情形（如非全日制用工不得约定试用期、劳务派遣另有规定）仍需人工判断，报告不得据此给出「合法/违法」的整体结论
+  method: law_article_compare
+  severity: major
+  source: 中华人民共和国劳动合同法（2012 修正）第十九条/第二十条/第二十四条
+  auto_fix: false

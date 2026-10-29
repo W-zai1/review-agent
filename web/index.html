@@ -198,6 +198,10 @@
 
         <!-- 操作按钮常驻底部：左栏内容比视口高时，按钮不能被挤到滚动区外面 -->
         <div class="left-actions">
+          <label class="research-toggle" title="对事实库外的数字/日期主张，联网检索来源并核验；关闭则只比对内置事实库">
+            <input type="checkbox" id="researchToggle" checked>
+            <span>联网核验库外事实</span>
+          </label>
           <button class="btn btn-primary" id="runBtn" type="button" disabled>运行审查（需配置 LLM）</button>
           <button class="btn btn-example" id="exampleBtn" type="button">✨ 用示例文件试跑</button>
         </div>
@@ -256,6 +260,10 @@
             <div class="anno-title">问题汇总 · 按类型归类</div>
             <div id="issueSummary"></div>
           </section>
+
+          <section class="rs-sec hidden" id="actionPlan"></section>
+
+          <section class="rs-sec hidden" id="researchBlock"></section>
 
           <section class="rs-sec hidden" id="issueList"></section>
 

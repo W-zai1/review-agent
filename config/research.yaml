@@ -1,0 +1,21 @@
+# 库外事实核验配置（review.py --research 时生效）
+#
+# 检索顺序：local（knowledge/sources）→ learned（state/learned_facts）→
+#           cache（state/research_cache）→ 公开网页（按 providers 顺序）
+# 离线/涉密环境：把 providers 改成 [local]，或运行时加 --no-research。
+providers: [local, so360_m, sogou_m, bing]
+max_claims_per_doc: 3          # 每份文档最多核验几条库外主张
+max_results: 8                 # 每个搜索引擎取几条结果
+timeout_seconds: 8             # 单个引擎/单页超时
+max_seconds: 60                # 整份文档核验的总预算，超时停止并留痕
+cache_ttl_days: 30             # 检索缓存有效期
+fetch_pages: 2                 # 抓前几条结果正文做同句校验（0 = 不抓）
+official_domains:              # 命中这些域名的来源按权威来源处理
+  - gov.cn
+  - stats.gov.cn
+  - caict.ac.cn
+  - cnnic.cn
+  - mohrss.gov.cn
+  - samr.gov.cn
+  - court.gov.cn
+  - npc.gov.cn

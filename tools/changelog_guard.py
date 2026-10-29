@@ -140,7 +140,11 @@ def git_changed(staged: bool):
     if staged:
         cmd = base + ["diff", "--cached", "--name-only", "--diff-filter=ACMRD"]
     else:
-        cmd = base + ["status", "--porcelain"]
+        # `-uall` 不能省：默认 -unormal 对**未跟踪的新目录**只输出目录名
+        # （`knowledge/laws/`），展开不了就判成"没有扩展名 → 不必登记"。
+        # 实测新增 knowledge/laws/（条文原文）与 tools/law_*.py 时前者被放行，
+        # 等于"往判定依据里塞了新东西，账本可以不知道"。
+        cmd = base + ["status", "--porcelain", "-uall"]
     try:
         res = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
                              text=True, encoding="utf-8", errors="replace")

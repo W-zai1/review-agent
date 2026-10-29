@@ -1487,3 +1487,41 @@ textarea#purposeInput:focus { border-color: #5b4fc7; }
   #resultView .sum-table { min-width: 520px; }
   #resultView .mx-table { min-width: 400px; }
 }
+
+/* ---- 整改单：把「改成什么」放在最显眼的位置 ---- */
+#resultView #actionPlan { border-left: 3px solid #C2410C; }
+#resultView .plan-hint { font-size: 11.5px; color: var(--rs-ink3); margin-bottom: 8px; }
+#resultView .plan-wrap { overflow-x: auto; }
+#resultView .plan-table { width: 100%; border-collapse: collapse; min-width: 720px; font-size: 12px; }
+#resultView .plan-table th { text-align: left; font-weight: 600; color: var(--rs-ink2); padding: 6px 8px; border-bottom: 1px solid #E5E7EB; white-space: nowrap; }
+#resultView .plan-table td { vertical-align: top; padding: 8px; border-bottom: 1px solid #F1F3F5; line-height: 1.65; }
+#resultView .plan-no { color: var(--rs-ink3); width: 24px; }
+#resultView .plan-where { color: var(--rs-ink2); white-space: nowrap; }
+#resultView .plan-from { color: var(--rs-ink3); max-width: 200px; }
+#resultView .plan-consequence { color: #B91C1C; max-width: 220px; }
+#resultView .plan-to { margin: 0; white-space: pre-wrap; font-family: inherit; color: #065F46; background: #F0FDF4; padding: 4px 6px; border-radius: 4px; }
+#resultView .plan-manual { color: #92400E; }
+#resultView .issue-fix { margin-top: 6px; padding: 6px 8px; background: #F0FDF4; border-radius: 4px; }
+#resultView .issue-fix-label { display: inline-block; font-size: 11px; font-weight: 700; color: #065F46; margin-bottom: 3px; }
+#resultView .issue-fix pre { margin: 0; white-space: pre-wrap; font-family: inherit; color: #065F46; font-size: 12px; line-height: 1.6; }
+#resultView .issue-consequence { margin-top: 5px; font-size: 12px; color: #B91C1C; line-height: 1.6; }
+
+/* ---- 联网核验开关：和运行按钮同排，不抢视觉 ---- */
+.left-actions .research-toggle {
+  display: flex; align-items: center; gap: 5px; margin-right: 10px;
+  font-size: 11.5px; color: var(--rs-ink2); cursor: pointer; user-select: none;
+}
+.left-actions .research-toggle input { margin: 0; }
+
+/* ---- 事实核验：支持/反驳/未找到三组，来源可点 ---- */
+#resultView #researchBlock { border-left: 3px solid #0E7490; }
+#resultView .research-hint { font-size: 11.5px; color: var(--rs-ink3); margin-bottom: 8px; }
+#resultView .research-group { margin-top: 8px; }
+#resultView .research-group-title { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+#resultView .research-group-title.rs-bad { color: #B91C1C; }
+#resultView .research-group-title.rs-good { color: #047857; }
+#resultView .research-group-title.rs-muted { color: var(--rs-ink3); }
+#resultView .research-item { padding: 6px 8px; border-bottom: 1px solid #F1F3F5; }
+#resultView .research-quote { font-size: 12px; color: var(--rs-ink); line-height: 1.65; }
+#resultView .research-reason { font-size: 11.5px; color: var(--rs-ink3); margin-top: 2px; }
+#resultView .research-source { display: block; font-size: 11.5px; color: #0E7490; text-decoration: none; margin-top: 3px; word-break: break-all; }

@@ -1,0 +1,22 @@
+{
+  "version": "法条库 v1",
+  "updated": "2026-10-28",
+  "note": "元数据与正文分离：正文（<id>.md）是慢变量，效力状态与来源会变。每部法必须交代 status/effective_date/source_url/retrieved_at/article_count，缺一不可（law_index.check 会拦）。",
+  "laws": [
+    {
+      "id": "labor-contract",
+      "name": "中华人民共和国劳动合同法",
+      "short": "劳动合同法",
+      "file": "labor-contract.md",
+      "status": "现行有效",
+      "effective_date": "2008-01-01",
+      "amended": "2012-12-28 全国人大常委会修正，修正决定自 2013-07-01 施行",
+      "article_count": 98,
+      "source_url": "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622.html",
+      "source_org": "中华人民共和国人力资源和社会保障部",
+      "retrieved_at": "2026-10-28",
+      "transport": "web_fetch（该站对 curl 有 JS 挑战，直接抓取只能拿到挑战页）",
+      "verify_note": "条号 1~98 连续、条数与官方目录一致；第 19/20/37/38 条另与钦州市钦南区检察院转载页逐字比对一致。文本经 web_fetch 转录，引用前请对照 source_url 原文。"
+    }
+  ]
+}

@@ -37,10 +37,15 @@ import regex_check
 import rule_exec
 import arith_check
 import retrieve
+import law_index
+import law_cite
+import fact_gap
 import lint
 import integrity
 import llm_client
 import llm_review
+import remediation
+import research
 
 try:
     import yaml
@@ -58,6 +63,10 @@ KNOWLEDGE = ROOT / "knowledge"
 OUTPUTS = ROOT / "outputs"
 LEDGER = ROOT / "ledger"
 LOGS = ROOT / "logs"
+STATE = ROOT / "state"
+# 知识库缺口日志。None = 自动推断（见 _gap_log_path）：
+# 测试把 OUTPUTS 重定向到临时目录时，缺口也跟着走，不会污染真实 state/。
+GAP_LOG = None
 
 for d in (OUTPUTS, LEDGER, LOGS):
     d.mkdir(exist_ok=True)
@@ -83,6 +92,10 @@ CALIBER_RE = re.compile(
     r"(同比|环比|占比|增长率|转化率|毛利率|覆盖率|完成率|口径|"
     r"占.{0,8}(总数|总人数|员工|人口|营收|收入)|比重|比例|份额)")
 TIMES_RE = re.compile(r"\d+(?:\.\d+)?\s*倍")
+# 合同/制度里的工资比例是**约定值**，不是对外披露的统计数据。
+# 要求「试用期工资为转正工资的 85%」标同比/环比是范畴错误（金标准 c16 踩过）。
+CONTRACT_RATIO_RE = re.compile(
+    r"(试用期[^。；\n]{0,12}工资|转正工资|约定工资|工资[^。；\n]{0,6}的\s*\d+\s*[%％])")
 BASELINE_RE = re.compile(r"(同比|环比|相比|较|增长|下降|提升|基线)")
 NEGATIVE_PREFIXES = ("无", "没有", "不存在", "不涉及", "未", "已解决", "已处理", "不包含")
 
@@ -171,6 +184,27 @@ def build_charter(target_type, agent=None):
 # ----------------------------------------------------------------------------
 def now_iso():
     return datetime.datetime.now().astimezone().isoformat()
+
+
+def _gap_log_path():
+    """知识库缺口清单落哪。
+
+    正常情况：`state/gap_log.jsonl`。
+    **测试把 OUTPUTS 重定向到临时目录时，缺口日志跟着产物目录走**——
+    否则跑一次全量回归就有几十份测试语料被当成"该补的缺口"写进真实清单，
+    清单立刻变成噪声（工单只能靠人读，脏了就没人读了）。
+    """
+    if GAP_LOG is False:
+        return None
+    if GAP_LOG:
+        return Path(GAP_LOG)
+    out = Path(OUTPUTS)
+    try:
+        if out.resolve() != (ROOT / "outputs").resolve():
+            return out.parent / "gap_log.jsonl"
+    except OSError:
+        pass
+    return STATE / "gap_log.jsonl"
 
 
 def _success_rate(tool_logs):
@@ -365,6 +399,10 @@ class Session:
         # 文本里出现、但事实库没有断言的高频实体：写进 limitations，明说"没判"，
         # 而不是让模型拿参数记忆去判真伪
         self.unverified_hits = []
+        # 法条库：本次引用到的条文（进报告顶层 law_library），以及
+        # 「本该跑但库里缺条文」的检查项（进 limitations——没查 ≠ 没问题）
+        self.law_cites = []
+        self.law_skipped = []
         self.llm_usage = {"input": 0, "output": 0, "calls": 0, "failures": 0}
         self.issue_counter = 0
         self.tool_ok = 0
@@ -534,7 +572,11 @@ def fact_heuristics(s: Session, text, active_ids):
         if "FACT-004" in active_ids and counters["FACT-004"] < 3:
             percent_issue = PERCENT_RE.search(sentence) and not CALIBER_RE.search(sentence)
             times_issue = TIMES_RE.search(sentence) and not BASELINE_RE.search(sentence)
-            if percent_issue or times_issue:
+            # 工资比例是约定值，不是披露数据：豁免并留痕（模型同规则命中也跟着让位）
+            if CONTRACT_RATIO_RE.search(sentence):
+                s.exempt("FACT-004", sentence,
+                         "工资比例是合同约定值，不是对外披露的统计数据")
+            elif percent_issue or times_issue:
                 detail = "百分比未标注同比/环比/占比等口径" if percent_issue else "倍数未说明比较基线"
                 add("FACT-004", sentence, pos,
                     f"正则启发式：{detail}",
@@ -606,8 +648,11 @@ def fact_review(s: Session, text, rules):
             ratio = base / exp_base if exp_base else 0
             tol = a.get("tolerance", 2)
             if ratio > tol or ratio < 1 / tol:
-                quote = sentence_at(text, idx)
-                loc = f"第 {sentence_no(text, idx)} 句"
+                # 引用「数字所在句」，不是「指标第一次出现的位置」：
+                # 合同里「第二条 试用期」是标题，数字在下一句；引标题读者找不到错在哪。
+                abs_pos = idx + v["start"]
+                quote = sentence_at(text, abs_pos)
+                loc = f"第 {sentence_no(text, abs_pos)} 句"
                 tr = time.perf_counter()
                 hits = retrieve.grep_knowledge(f"{entity} {attr}")
                 s.tool("retrieve", f"{entity} {attr}", f"命中 {len(hits)} 条知识库文档",
@@ -662,8 +707,9 @@ def fact_review(s: Session, text, rules):
             exp_base = exp["num"] * UNIT_FACTOR.get(exp["unit"], 1)
             base = v["num"] * UNIT_FACTOR.get(v["unit"] or exp["unit"], 1)
             if base > exp_base * (1 + 1e-9):
-                quote = sentence_at(text, idx)
-                loc = f"第 {sentence_no(text, idx)} 句"
+                abs_pos = idx + v["start"]
+                quote = sentence_at(text, abs_pos)
+                loc = f"第 {sentence_no(text, abs_pos)} 句"
                 s.add_issue(s.make_issue(
                     "fact", a["rule_id"], quote, loc,
                     a.get("note") or f"{entity}{attr} 超出上限",
@@ -1143,7 +1189,10 @@ def drop_covered_comp004(s: Session):
 # 处理原则不是删问题，而是**定归口**：结论级规则在就折叠线索级，进 suppressed 留痕。
 FOLD_INTO = {
     "FACT-003": ("LOGIC-003", "LOGIC-005", "LOGIC-002", "LOGIC-008"),
-    "FACT-004": ("LOGIC-001", "LOGIC-002", "LOGIC-009"),
+    # LAW-001 也在这条链上：合同里写「试用期工资 60%」时，LAW-001 已经用
+    # 第二十条原文判了违法（major），FACT-004 再补一句「百分比未标口径」
+    # 只是同一句上的噪声——条款比例本来就不需要标同比/环比。
+    "FACT-004": ("LOGIC-001", "LOGIC-002", "LOGIC-009", "LAW-001"),
 }
 
 # 内部工作进度语境：这些数字是"自己干了多少"，本身就是原始记录，
@@ -1208,6 +1257,47 @@ def collapse_rule_overlap(s: Session):
             "；".join(f"{f['rule_id']}→{f['folded_into']}" for f in folded)[:200],
             ["逐条并列展示"], "同一现象两条规则一轻一重，用户只会看到轻的那条；"
                               "折叠后仍可在报告 suppressed 里查到，不丢证据")
+    return s
+
+
+def merge_law_into_fact(s: Session):
+    """同一句已由 FACT-001 判为事实错误时，LAW-001 只并法条依据，不再重复列一条。
+
+    例：试用期 12 个月，事实库（第十九条上限）和法条库（第十九条原文）会各报一条。
+    读者看到的是「同一句话两条 major」，一条改了另一条还在。保留 FACT-001（通常更重），
+    把 LAW-001 的 citation 并进证据，LAW-001 进 suppressed。
+    """
+    def same_topic(a, b):
+        qa, qb = str(a.get("quote") or ""), str(b.get("quote") or "")
+        # 「试用期时长」和「试用期工资」是两件事，不能因为都有「试用期」就合并
+        if ("工资" in qa) != ("工资" in qb):
+            return False
+        if ("竞业" in qa) != ("竞业" in qb):
+            return False
+        for kw in ("试用期", "竞业", "工资", "年休假", "加班", "经济补偿", "服务期"):
+            if kw in qa and kw in qb:
+                return True
+        return _quote_overlap(qa, qb) >= 0.6
+
+    facts = [i for i in s.issues if i.get("rule_id") == "FACT-001"]
+    kept = []
+    for it in s.issues:
+        if it.get("rule_id") == "LAW-001":
+            rival = next((f for f in facts if f is not it and same_topic(f, it)), None)
+            if rival is not None:
+                cites = it.get("citations") or ([it["citation"]] if it.get("citation") else [])
+                if cites:
+                    rival.setdefault("citations", [])
+                    rival["citations"].extend(c for c in cites if c not in rival["citations"])
+                if it.get("evidence"):
+                    rival["evidence"] = ((rival.get("evidence") or "") +
+                                         "；法条依据：" + str(it["evidence"])[:300])
+                s.folded.append(dict(
+                    it, folded_into=rival["issue_id"],
+                    fold_reason="同句已由 FACT-001 判定；LAW-001 法条依据并入，不重复列出"))
+                continue
+        kept.append(it)
+    s.issues[:] = kept
     return s
 
 
@@ -1417,6 +1507,104 @@ def _h_comp004(s, text, rules, ctx):
     return drop_covered_comp004(s)
 
 
+def _dedupe_cites(cites):
+    """同一条文被多句引用时只留一份：报告的「依据清单」是按条看的，不是按句。"""
+    out, seen = [], set()
+    for c in cites or []:
+        key = (c.get("law"), c.get("article"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _h_law(s, text, rules, ctx):
+    """法定量断言 vs 真实条文（LAW-001）。
+
+    与 FACT-001 的分工：FACT-001 拿 `facts.json` 的数值断言判真伪，它手里
+    没有原文，所以只能说"和口径不符"；这里的依据是**法条原文 + 条号**，
+    读者能自己翻回去核对。两者对同一句开口时 LAW-001 更硬（有原文）。
+    """
+    ridset = {r["rule_id"] for r in rules}
+    if "LAW-001" not in ridset:
+        return s
+    try:
+        found, verified, skipped = law_cite.check(text)
+    except Exception as e:                                  # noqa: BLE001
+        # 法条库坏了必须显式记账：静默变成"本次没有法律依据可查"，
+        # 读者会把 pass 读成"法律上没问题"。
+        s.tool("law_cite", "法定量比对", f"法条库不可用：{e}"[:180], 0, status="failed")
+        s.law_skipped.append(f"法条库不可用（{e}），法定量断言未与条文比对。")
+        return s
+    s.law_skipped.extend(skipped)
+
+    # 同句多条违法合成**一条**异议，依据并列：一句里既超试用期又压低工资，
+    # 读者需要知道"这句话有两处问题"，而不是在清单里看到两条几乎一样的行。
+    # 检查器层面仍返回两条（law_cite 不丢信息），合并在报告层做。
+    groups = {}
+    for f in found:
+        if not f.get("quote") or f["quote"] not in text:
+            continue
+        groups.setdefault(f["quote"], []).append(f)
+
+    added, merged = 0, 0
+    for quote, fs in groups.items():
+        if any(i["rule_id"] == "LAW-001"
+               and _quote_overlap(i["quote"], quote) >= 0.85 for i in s.issues):
+            continue
+        citations = [f["citation"] for f in fs if f.get("citation")]
+        # 同一句话若已由 FACT-001（blocker，事实库断言）判过，不再并列一条：
+        # 把法条原文挂到它身上。结论取强的那条，依据补上更硬的原文——
+        # 两条并列会让读者以为是两个独立问题（金标准 p16 就是这么多出 1 条误报的）。
+        rival = next((i for i in s.issues if i["rule_id"] == "FACT-001"
+                      and _quote_overlap(i["quote"], quote) >= 0.6), None)
+        if rival is not None:
+            if citations:
+                rival.setdefault("citation", citations[0])
+                have = {c.get("article") for c in (rival.get("citations") or [])}
+                rival["citations"] = (rival.get("citations") or []) + [
+                    c for c in citations if c.get("article") not in have]
+                s.law_cites.extend(citations)
+                note = "；另有法条原文：" + "；".join(
+                    c["citation"][:110] for c in citations)
+                if note not in (rival.get("evidence") or ""):
+                    rival["evidence"] = ((rival.get("evidence") or "") + note)[:900]
+            merged += 1
+            continue
+        if len(fs) == 1:
+            evidence = fs[0]["evidence"]
+        else:
+            evidence = "；".join(f"{chr(0x2460 + n)}{f['evidence']}"
+                                for n, f in enumerate(fs))
+        pos = max(0, text.find(quote))
+        issue = s.make_issue(
+            "compliance", "LAW-001", quote, f"第 {sentence_no(text, pos)} 句",
+            evidence, " + ".join(dict.fromkeys(f["tool"] for f in fs)),
+            max(f["confidence"] for f in fs),
+            "；".join(dict.fromkeys(f["suggestion"] for f in fs)))
+        issue["citation"] = citations[0] if citations else None
+        issue["citations"] = citations
+        s.add_issue(issue)
+        s.law_cites.extend(citations)
+        added += 1
+    for v in verified:
+        if v["text"] not in s.verified_facts:
+            s.verified_facts.append(v["text"])
+    if added:
+        s.decision(f"法条核对命中 {added} 条（依据为条文原文）", "LAW-001",
+                   "；".join(i["tool"] for i in found)[:200],
+                   ["交给模型凭常识判断是否违法"],
+                   "法定量（试用期/竞业限制/试用期工资）有明确条文与上限，"
+                   "代码判定可复现，且报告能给出条号供读者核对")
+    if merged:
+        s.decision(f"{merged} 条法条依据并入 FACT-001（不新增异议）", "LAW-001",
+                   "同句已由事实库断言主判，法条原文作为更强依据附在其上",
+                   ["并列两条"],
+                   "同一现象只留一条主判定；并列会让人以为是两个独立问题")
+    return s
+
+
 def docx_format_review(s: Session, text, rules, ctx):
     """格式维度：对 .docx 版式结构做确定性检查（FORMAT-001~006）。
 
@@ -1472,6 +1660,7 @@ BUILTIN_HANDLERS = {
     "builtin:pattern": _h_pattern,
     "builtin:logic": _h_logic,
     "builtin:comp004_dedupe": _h_comp004,
+    "builtin:law_cite": _h_law,
     "builtin:format": docx_format_review,
 }
 
@@ -1935,7 +2124,8 @@ def read_target_text(path: Path):
 
 def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             type_override=None, agent_id=None, purpose=None, purpose_max=None,
-            purpose_notes=None, scenario=None, format_spec=None):
+            purpose_notes=None, scenario=None, format_spec=None,
+            research_enabled=False):
     t0 = time.perf_counter()
     # 非 UTF-8（GBK/UTF-16）不能让整个进程崩掉：按候选编码依次尝试。
     try:
@@ -2117,6 +2307,7 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # 归口必须在语义审之后：线索级规则在 S2 就产生了，但"让位给谁"要等模型
     # 给出结论级判定才知道（纯规则模式下没有对手，线索照常保留）。
     collapse_rule_overlap(s)
+    merge_law_into_fact(s)
     drop_internal_progress_comp004(s)
     dim_detail = {}
     for d, info in (llm_meta.get("dimensions") or {}).items():
@@ -2220,6 +2411,36 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
                         )[:120],
         })
 
+    # ---- S5.6 库外事实核验（可选，默认关闭；CLI/控制台显式开启）----
+    # 旧行为：库外主张一律不判，只在报告里写「未命中事实库，覆盖为 0」。
+    # 这对用户没有信息量——他要知道的是「这句话到底是不是真的」。
+    # 新行为：抽「实体 + 指标 + 数值」，先查本地来源库，再查公开网页；
+    # 支持/反驳都带来源，未找到就如实说「查过哪里、没找到」，不再伪造结论。
+    research_block = None
+    if research_enabled and "fact" in dims:
+        t = time.perf_counter()
+        try:
+            research_block = research.review_claims(
+                s, text, list(iter_sentences(text)), fact_assertions,
+                enabled=True, web=True)
+            # 检索新增的 FACT-001 可能和已有的 FACT-002/004 同句，再归口一次
+            collapse_rule_overlap(s)
+            merge_law_into_fact(s)
+        except Exception as e:                              # noqa: BLE001
+            # 检索失败不能影响主报告；把失败写进报告，不静默
+            s.tool("research", "库外事实核验", f"失败：{e}"[:180], 0, status="failed")
+            research_block = {"enabled": True, "error": f"{type(e).__name__}: {e}",
+                              "claims_found": 0, "checked": 0,
+                              "supported": [], "refuted": [], "unverified": []}
+        s.step("S5.6", "库外事实核验", latency_ms=(time.perf_counter() - t) * 1000, detail={
+            "主张": f"{research_block.get('claims_found', 0)} 条",
+            "支持": f"{len(research_block.get('supported') or [])} 条",
+            "反驳": f"{len(research_block.get('refuted') or [])} 条",
+            "未找到": f"{len(research_block.get('unverified') or [])} 条",
+            "缓存命中": f"{research_block.get('cache_hits', 0)} 条（不联网）",
+            "检索失败": f"{len(research_block.get('errors') or [])} 条",
+        })
+
     # ---- S6 裁定汇总 ----
     t = time.perf_counter()
     issues_sorted = sorted(s.issues, key=lambda i: SEV_ORDER.get(i["severity"], 9))
@@ -2256,6 +2477,10 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         verdict = "fail"
     elif stats["major"] > 0:
         verdict = "warn"
+    elif research_block and (research_block.get("unverified")
+                             or research_block.get("needs_confirm")):
+        # 有库外事实没核完，或只有单一来源反驳：不能给 pass。
+        verdict = "warn"
     else:
         verdict = "pass"
     s.decision(f"verdict={verdict}", "OVERALL-003",
@@ -2265,6 +2490,15 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     to_confirm = [i for i in issues_sorted if i["confidence"] < 0.7]
     to_fix = [i for i in issues_sorted if i["severity"] in ("blocker", "major")]
 
+    # ---- 整改单：每条 issue 必须回答「改哪一句 / 改成什么 / 不改会怎样」----
+    # 只给「建议」的报告仍然把改写工作留给用户；这一层把能确定性改的
+    # （法条上限、事实数值、用词、隐私脱敏、缺失条款模板）直接给出可替换文本，
+    # 改不了的明确标「需人工」，不假装有方案。
+    action_plan = remediation.attach(issues_sorted, fact_assertions)
+    for it in issues_sorted:
+        if it.get("fix") and it["fix"].get("consequence"):
+            it["consequence"] = it["fix"]["consequence"]
+
     core = (f"整体裁定 {verdict}：共 {len(s.issues)} 条异议"
             f"（blocker {stats['blocker']} / major {stats['major']} / minor {stats['minor']} / nit {stats['nit']}）。"
             + (f"交叉复核 {len(s.disputes)} 处争议待人工裁定。" if s.disputes else "")
@@ -2272,6 +2506,20 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
                if verdict != "pass"
                else "未发现阻断性问题，但「未发现」不等于「通过」："
                     "本引擎存在已知漏报（跨段推理、日期计算等），请结合人工复核确认。"))
+    if (verdict == "warn" and stats["major"] == 0 and research_block
+            and (research_block.get("unverified")
+                 or research_block.get("needs_confirm"))):
+        _bits = []
+        if research_block.get("needs_confirm"):
+            _bits.append(f"{len(research_block['needs_confirm'])} 条单一来源反驳待人工确认")
+        if research_block.get("unverified"):
+            _bits.append(f"{len(research_block['unverified'])} 条库外事实未找到可比来源")
+        core = ("整体裁定 warn：规则层未发现 major 问题，但"
+                + "、".join(_bits) + "（详见「事实核验」），需人工核验后再使用。")
+    if research_block and (research_block.get("refuted") or research_block.get("supported")):
+        core += (f" 外部事实核验：驳回 {len(research_block.get('refuted') or [])} 条、"
+                 f"支持 {len(research_block.get('supported') or [])} 条"
+                 f"（来源见报告「事实核验」）。")
     if review_mode == "rule-only" and llm_meta.get("available"):
         core += "注意：LLM 语义审调用失败，已降级为纯规则审。"
 
@@ -2336,13 +2584,28 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     if charter_text:
         coverage["charter"] = charter_text
     # 明确声明「本次没查什么」——只报问题数而不说覆盖边界，会给人虚假的安全感
-    coverage["uncovered"] = [
-        f"未做外部事实核验：仅比对项目内置事实库（本次命中 {matched_count}/{total_assertions} 条断言）",
-        "未验证文中引用的外部来源、链接与数据是否真实可访问",
-        "未审查图片/图表/附件内容（仅审可提取的文本层）",
-        "未做法律效力判断与条款可执行性评估（合规维仅检查要件齐备性）",
-        "模型输出存在推理与识别误差，所有结论均需人工复核",
-    ]
+    if research_enabled and "fact" in dims:
+        _r = research_block or {}
+        _un = len(_r.get("unverified") or [])
+        coverage["uncovered"] = [
+            (f"外部事实核验已执行：核对 {_r.get('checked', 0)} 条库外主张"
+             f"（支持 {len(_r.get('supported') or [])} / 反驳 {len(_r.get('refuted') or [])} / "
+             f"未找到 {_un}）。未找到不等于虚假；来源为公开网页，口径/时效可能不一致"),
+            "未逐条抓取所有引用来源的全文：核验以搜索摘要与已收录来源为主",
+            "未审查图片/图表/附件内容（仅审可提取的文本层）",
+            "未做法律效力判断与条款可执行性评估（合规维仅检查要件齐备性）",
+            "模型输出存在推理与识别误差，所有结论均需人工复核",
+        ]
+    else:
+        coverage["uncovered"] = [
+            "未做外部事实核验：仅比对项目内置事实库"
+            f"（本次命中 {matched_count}/{total_assertions} 条断言）；"
+            "如需联网核验，用 --research 运行",
+            "未验证文中引用的外部来源、链接与数据是否真实可访问",
+            "未审查图片/图表/附件内容（仅审可提取的文本层）",
+            "未做法律效力判断与条款可执行性评估（合规维仅检查要件齐备性）",
+            "模型输出存在推理与识别误差，所有结论均需人工复核",
+        ]
     if s.target_type == "code":
         # by-design，但必须让用户看见：代码对象只查安全与风格，不查事实/逻辑/合规
         coverage["uncovered"].append(
@@ -2378,7 +2641,8 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             f"事实库共 {total_assertions} 条断言，本次仅匹配 {matched_count} 条，未覆盖部分需人工核验。")
     # 事实审的弹药边界必须自报：库外实体只判"缺出处"，不判真伪。
     # 不写这句，读者会把"没报事实错误"当成"事实全对"。
-    if "fact" in dims and total_assertions:
+    if ("fact" in dims and total_assertions
+            and not (research_block and research_block.get("enabled"))):
         _ents = []
         for _a in fact_assertions:
             _e = str(_a.get("entity") or "")
@@ -2388,6 +2652,20 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             f"事实审的证据仅限事实库内 {total_assertions} 条断言（涉及："
             f"{'、'.join(_ents[:8])}{'等' if len(_ents) > 8 else ''}）；"
             "库外实体只判「缺可核验出处」，不判真伪——要判真伪请先补进 knowledge/facts.json。")
+    if research_block and (research_block.get("checked") or research_block.get("error")):
+        _r = research_block
+        if _r.get("error"):
+            limitations.append(f"库外事实核验失败（{_r['error']}），本次结论未包含外部检索。")
+        elif _r.get("enabled"):
+            limitations.append(
+                f"库外事实核验：检索 {_r.get('checked', 0)} 条主张"
+                f"（支持 {len(_r.get('supported') or [])} / 反驳 {len(_r.get('refuted') or [])} / "
+                f"未找到 {len(_r.get('unverified') or [])}）。"
+                "「未找到」表示公开检索没有给出可比来源，不等于该说法虚假；"
+                "「反驳」也只说明检索来源与原文数值不一致，最终口径需人工确认。")
+            if _r.get("errors"):
+                limitations.append(
+                    "部分检索失败：" + "；".join(str(e) for e in _r["errors"][:3])[:300])
     # 被点名但还没断言的高频实体：说清"没判"，避免"没报错=都对"
     if "fact" in dims and (getattr(s, "unverified_hits", None) or []):
         limitations.append(
@@ -2474,6 +2752,36 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             limitations.append(f"摄取提示：{warn}")
     if s.target_type == "contract":
         limitations.append("合同审为关键词 + 否定语境预筛，不构成法律意见，需人工复核条款结构。")
+    # 法条库的覆盖范围必须自报：读者要知道"这次引的依据是哪几部法、哪一版、
+    # 有没有限缩"。不写清楚，一条「依据：第十九条」会被当成"全部法律都查过了"。
+    law_lib_block = None
+    try:
+        _laws, _arts = law_index.load_all()
+        _desc = "、".join(
+            f"《{l['name']}》{l['status']}·{l['effective_date']}施行·{l['_loaded']} 条"
+            for l in _laws)
+        limitations.append(
+            f"法律依据仅限已收录的法条库：{_desc}，共 {len(_arts)} 条。"
+            "库外法律/条款不作引用，也不以模型记忆代替条文；"
+            "命中条文 ≠ 条文适用（例外情形仍需人工判断）。")
+        law_lib_block = {
+            "available": True,
+            "articles_total": len(_arts),
+            "laws": [{"id": l["id"], "name": l["name"], "status": l["status"],
+                      "effective_date": l["effective_date"],
+                      "articles": l["_loaded"], "source_url": l["source_url"],
+                      "retrieved_at": l["retrieved_at"]} for l in _laws],
+            # 本次真正被引用到的条文（去重，按法名+条号）
+            "cited": _dedupe_cites(s.law_cites),
+            "skipped": list(s.law_skipped),
+        }
+    except Exception as e:                                   # noqa: BLE001
+        limitations.append(f"法条库不可用（{e}）：本次未做法条级依据比对，"
+                           "涉及法律条款的结论仅为线索。")
+        law_lib_block = {"available": False, "error": str(e)[:200]}
+    for note in s.law_skipped:
+        if note not in limitations:
+            limitations.append(note)
     if len(active) < coverage["declared_rules"]:
         limitations.append(
             f"本次仅启用 {len(active)}/{coverage['declared_rules']} 条规则，结论范围相应收窄。")
@@ -2495,6 +2803,62 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             limitations.append(
                 "本次目的未派生审查目标：报告里的证据只按关键词定位，"
                 "不代表已按该目的做过判定。")
+
+    # ------------------------------------------------------------------
+    # 知识库缺口记账（docs/知识库自学习.md §8）
+    #
+    # 这不是给读者的结论，是给下一版 facts.json 的工单：本次有多少事实判断
+    # 是在「库里没有依据」的情况下作出的。它只写 state/，**不写事实库**——
+    # 缺口里的 quote 来自被审文档，永远只是「待审主张」，不是证据。
+    # ------------------------------------------------------------------
+    gap_block = None
+    try:
+        gap_path = _gap_log_path()
+        gap_rows = fact_gap.collect(
+            issues=issues_sorted,
+            unverified=getattr(s, "unverified_hits", None) or [],
+            law_skipped=list(s.law_skipped),
+            review_id=review_id, target=target_rel)
+        if gap_path is None:
+            # 显式关闭：报告必须写出来，否则「没记录」会被读成「没缺口」
+            gap_block = {"recorded": 0, "disabled": True, "usable_as_evidence": False,
+                         "reason": "本次以 --no-gap-log 运行，缺口未落盘（不写被审文本片段）"}
+        else:
+            written = fact_gap.record(gap_rows, path=gap_path) if gap_rows else {
+                "new": 0, "repeat": 0, "path": str(gap_path)}
+            gap_block = {
+                "recorded": len(gap_rows),
+                "new": written["new"],
+                "repeat": written["repeat"],
+                "log": str(gap_path),
+                "kinds": {},
+                "top": [{"gap_id": r["gap_id"], "kind": r["kind"],
+                         "entity_guess": r["entity_guess"],
+                         "quote": r["quote"][:60]} for r in gap_rows[:5]],
+                "usable_as_evidence": False,
+            }
+            for r in gap_rows:
+                gap_block["kinds"][r["kind"]] = gap_block["kinds"].get(r["kind"], 0) + 1
+            s.tool("fact_gap", "知识库缺口记账",
+                   f"{len(gap_rows)} 条（新增 {written['new']} / 已存在 {written['repeat']}）",
+                   0, status="success")
+            if gap_rows:
+                limitation = (
+                    f"本次有 {len(gap_rows)} 条判断缺少库内依据（模型按常识下的判断 / "
+                    "缺条文未执行的法定量检查 / 有主张但无出处），已记入知识库缺口清单"
+                    f"（{gap_block['log']}）。**没有依据的沉默不等于没有问题**；"
+                    "缺口只说明「当时没得比」，不说明「文中说法是错的」。")
+                if limitation not in limitations:
+                    limitations.append(limitation)
+                s.decision(
+                    f"记录知识库缺口 {len(gap_rows)} 条", "FACT-001",
+                    "；".join(f"{k} {v}" for k, v in gap_block["kinds"].items()),
+                    ["不记账（下次仍然靠人回忆该补什么）"],
+                    "缺口清单是下一版事实库的工时来源；不记就永远是手灌那几条")
+    except Exception as e:                                   # noqa: BLE001
+        # 记账失败不能影响审查结论，但必须留痕——否则「没记录」会被读成「没缺口」
+        s.tool("fact_gap", "知识库缺口记账", f"失败：{e}"[:180], 0, status="failed")
+        gap_block = {"error": str(e)[:200], "recorded": 0, "usable_as_evidence": False}
 
     # 完整性哈希（S1 起已可算 target/knowledge；logs 待写后算）
     target_hash = integrity.sha256_file(str(target_path))
@@ -2577,6 +2941,17 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         # 规则执行方式：deterministic / declarative / prompt_only 三类 rule_id 清单。
         # 没有这块，读者无法区分「代码算出来的」和「模型读出来的」。
         "rule_execution": exec_summary,
+        # 法条库：收录了什么、本次引到哪几条、哪些检查因缺条文没跑。
+        # 与 issues 分开：issues 说"哪里错了"，这里说"依据从哪来"。
+        "law_library": law_lib_block,
+        # 知识库缺口：本次有多少判断是「库里没依据」时下的，记进 state/gap_log.jsonl。
+        # 它回答的是"下一版事实库该补什么"，不是"文中哪里错了"。
+        "fact_gaps": gap_block,
+        # 库外事实核验：抽了哪些主张、查到了什么、支持/反驳/未找到各多少。
+        # 没有这一块，「未命中事实库」会被读成「事实没问题」。
+        "research": research_block,
+        # 整改单：每条 issue 的 fix（改哪一句/改成什么/不改会怎样）+ 前 N 条优先项。
+        "action_plan": action_plan,
         "limitations": limitations,
         "issues": issues_sorted,
         # 模型自否的条目：不进 to_fix / 统计，但保留下来（模型曾怀疑过也是信息）
@@ -2605,6 +2980,8 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         "裁定": f"{verdict}（blocker {stats['blocker']} / major {stats['major']} / "
                 f"minor {stats['minor']} / nit {stats['nit']}）",
         "待整改": f"{len(to_fix)} 条（blocker + major）",
+        "可直接改": f"{action_plan.get('concrete', 0)} 条（附改写文本）",
+        "需人工改": f"{action_plan.get('manual', 0)} 条",
         "待人工确认": f"{len(to_confirm)} 条（置信度 < 0.7）",
         "文本覆盖": f"{coverage['text_coverage_pct']}%"
                     f"（{coverage['chars_reviewed']:,}/{coverage['chars_total']:,} 字符）",
@@ -2756,6 +3133,59 @@ def render_md(report):
             if ou:
                 lines.append(f"  - 输出截断（结论可能不完整）：{'、'.join(ou)}")
     lines.append("")
+    plan = report.get("action_plan") or {}
+    if plan.get("top"):
+        lines.append("## 整改单（先改这几处）")
+        lines.append("")
+        lines.append("> 只列能落到具体文本的改法；「需人工」的条目在下方异议清单里给判断依据。")
+        lines.append("")
+        lines.append("| # | 位置 | 原文 | 改成 | 不改的后果 |")
+        lines.append("|---|---|---|---|---|")
+        for idx, it in enumerate(plan["top"], 1):
+            frm = (it.get("from") or "（新增条款）").replace("|", "丨").replace("\n", " ")
+            if it.get("has_rewrite") and it.get("to"):
+                to = str(it["to"]).replace("|", "丨").replace("\n", " ")
+            else:
+                to = "需人工：" + str(it.get("how") or "按依据改写").replace("|", "丨").replace("\n", " ")
+            lines.append(
+                f"| {idx} | {_md_flat(it.get('where'))} | {_md_safe(frm[:60])} "
+                f"| {_md_safe(to[:80])} | {_md_safe(str(it.get('consequence') or '')[:60])} |")
+        lines.append("")
+        lines.append(f"> {plan.get('headline', '')}")
+        lines.append("")
+    _rs = report.get("research") or {}
+    if _rs.get("enabled") and (_rs.get("checked") or _rs.get("errors")):
+        lines.append("## 事实核验（外部检索）")
+        lines.append("")
+        lines.append(
+            f"- 主张 **{_rs.get('claims_found', 0)}** 条，已查 **{_rs.get('checked', 0)}** 条："
+            f"支持 {len(_rs.get('supported') or [])} / 反驳 {len(_rs.get('refuted') or [])} / "
+            f"未找到 {len(_rs.get('unverified') or [])}；缓存命中 {_rs.get('cache_hits', 0)} 条；"
+            f"复用已学结论 {_rs.get('learned_hits', 0)} 条；命中本地来源 {_rs.get('local_hits', 0)} 条。")
+        lines.append("- 「未找到」只说明公开检索没有可比来源，**不等于虚假**；"
+                     "「反驳」说明检索来源与原文数值不一致，最终口径仍需人工确认。")
+        if _rs.get("needs_confirm"):
+            lines.append(f"- 其中 **{len(_rs['needs_confirm'])} 条**为单一来源反驳，"
+                         "已转入「待人工确认」，未进入整改单。")
+        for title, key in (("反驳（原文与来源不一致）", "refuted"),
+                           ("支持（找到一致来源）", "supported"),
+                           ("未找到可比来源", "unverified")):
+            items = _rs.get(key) or []
+            if not items:
+                continue
+            lines.append("")
+            lines.append(f"**{title}**")
+            for it in items[:5]:
+                lines.append(f"- {_md_flat(it.get('quote'))}")
+                lines.append(f"  - 检索：`{_md_flat(it.get('query'))}`；结论："
+                             f"{_md_flat(it.get('reason'))}")
+                for s in (it.get("sources") or [])[:2]:
+                    if s.get("url"):
+                        lines.append(f"  - 来源：[{_md_flat(s.get('title'))[:60]}]({s.get('url')})")
+        if _rs.get("errors"):
+            lines.append("")
+            lines.append("> 部分检索失败：" + "；".join(_md_flat(e) for e in _rs["errors"][:3]))
+        lines.append("")
     pur = report.get("purpose") or None
     if pur:
         lines.append("## 审查目的与目标证据")
@@ -2855,6 +3285,40 @@ def render_md(report):
             for l in pur["limitations"]:
                 lines.append(f"> {_md_flat(l)}")
         lines.append("")
+    _lib = report.get("law_library") or {}
+    if _lib.get("cited"):
+        lines.append("## 引用法条（依据原文）")
+        lines.append("")
+        lines.append("> 以下条文来自本地法条库，报告只引库内条文；"
+                     "命中条文不等于条文适用（例外情形需人工判断）。")
+        lines.append("")
+        for _c in _lib["cited"]:
+            lines.append(f"- **《{_c.get('law')}》{_c.get('article')}**"
+                         f"（{_c.get('status', '')}）")
+            lines.append(f"  {_md_safe(_c.get('text') or '')}")
+        if _lib.get("skipped"):
+            lines.append("")
+            lines.append("- 未执行的检查（法条库缺条文，不是没问题）：")
+            for _s in _lib["skipped"]:
+                lines.append(f"  - {_md_safe(_s)}")
+        lines.append("")
+    _gaps = report.get("fact_gaps") or {}
+    if _gaps.get("recorded"):
+        lines.append("## 知识库缺口（本次判断缺依据的地方）")
+        lines.append("")
+        lines.append("> 这一段说的是**我们手里缺什么**，不是文中哪里错了。"
+                     "缺口只说明当时没有库内依据可比，不说明文中说法是错的。")
+        lines.append("")
+        for _k, _n in (_gaps.get("kinds") or {}).items():
+            lines.append(f"- `{_k}`：{_n} 条 —— {fact_gap.KIND_DESC.get(_k, '')}")
+        for _t in (_gaps.get("top") or [])[:5]:
+            _q = (_t.get("quote") or "").replace("|", "丨")
+            lines.append(f"  - `{_t.get('gap_id')}` P{fact_gap.KIND_PRIORITY.get(_t.get('kind'), 9)}"
+                         f"｜{_t.get('entity_guess') or '未识别实体'}｜{_md_flat(_q)}")
+        lines.append("")
+        lines.append(f"> 清单：`{_gaps.get('log')}`；"
+                     "补齐只能走 `tools/fact_promote.py`（唯一写入口）+ 人工确认来源。")
+        lines.append("")
     if report["key_facts"]:
         lines.append("## 关键事实（已核验）")
         for k in report["key_facts"]:
@@ -2863,13 +3327,37 @@ def render_md(report):
     lines.append("## 异议清单（共 {} 条）".format(len(report["issues"])))
     for i in report["issues"]:
         lines.append(f"\n### [{i['issue_id']}] {i['dimension']} / {i['severity']}（conf {i['confidence']}）")
-        lines.append(f"- 原文：{_md_safe(i['quote'])}")
+        fix = i.get("fix") or {}
+        if fix.get("action") == "insert":
+            lines.append(f"- 原文：（缺失条款；应在{_md_safe(fix.get('where') or '合同末尾')}新增）")
+        else:
+            lines.append(f"- 原文：{_md_safe(i['quote'])}")
         lines.append(f"- 位置：{_md_safe(i['location'])}")
         auto_tag = "（自动提案·措辞级匹配，需人工确认）" if i["rule_id"].startswith("AUTO-") else ""
         lines.append(f"- 规则：{i['rule_id']}{auto_tag} — {_md_safe(i['rule_text'])}")
         lines.append(f"- 证据：{_md_safe(i['evidence'])}")
+        # 法条依据单独一行：读者要的是"哪一条"，不是在证据长文里找
+        _cites = i.get("citations") or ([i["citation"]] if i.get("citation") else [])
+        for _c in _cites:
+            if _c and _c.get("citation"):
+                _label = ("依据" if str(_c["citation"]).startswith("外部检索")
+                          else "法条依据")
+                lines.append(f"- {_label}：{_md_safe(_c['citation'])}")
         lines.append(f"- 工具：{i['tool']}")
         lines.append(f"- 建议：{_md_safe(i['suggestion'])}")
+        fix = i.get("fix") or {}
+        if fix:
+            lines.append(f"- 怎么改：{_md_safe(fix.get('how') or fix.get('summary') or '需人工复核')}")
+            if fix.get("has_rewrite") and fix.get("to"):
+                label = "新增条款" if fix.get("action") == "insert" else "改为"
+                body = str(fix["to"])
+                body = "\n".join("  > " + _md_safe(x) for x in body.splitlines())
+                lines.append(f"- {label}：\n{body}")
+            elif fix.get("action") == "insert" and fix.get("to"):
+                body = "\n".join("  > " + _md_safe(x) for x in str(fix["to"]).splitlines())
+                lines.append(f"- 新增条款：\n{body}")
+            if fix.get("consequence"):
+                lines.append(f"- 不改的后果：{_md_safe(fix['consequence'])}")
     if report["to_confirm"]:
         lines.append("\n## 待人工确认（confidence < 0.7）")
         for i in report["to_confirm"]:
@@ -2937,6 +3425,7 @@ def main():
     purpose_max = None
     purpose_notes = None
     scenario = None
+    research_enabled = False
     if "--scenario" in args:
         i = args.index("--scenario")
         if i + 1 < len(args):
@@ -3087,6 +3576,18 @@ def main():
     if "--no-llm" in args:
         use_llm = False
         args = [a for a in args if a != "--no-llm"]
+    if "--no-research" in args:
+        # 离线/涉密场景：不联网核验，报告会写明「未做外部事实核验」
+        research_enabled = False
+        args = [a for a in args if a != "--no-research"]
+    if "--research" in args:
+        research_enabled = True
+        args = [a for a in args if a != "--research"]
+    if "--no-gap-log" in args:
+        # 缺口清单里会存被审文本的片段。涉密/涉个人信息的材料可以不落这份工单
+        # （代价：下次仍然不知道该补什么，报告里 fact_gaps.disabled=True 会写明）。
+        globals()["GAP_LOG"] = False
+        args = [a for a in args if a != "--no-gap-log"]
     if "--llm" in args:
         use_llm = True
         args = [a for a in args if a != "--llm"]
@@ -3103,7 +3604,10 @@ def main():
               "--format-spec 指定格式规格（--list-format-specs 查看：docx 版式按哪套标准判，"
               "默认 none 即不判字体字号行距）；"
               "--purpose \"这份文本想干什么\"（按目的派生目标并定位证据，默认解析前 300 字）；"
-              "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）")
+              "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）；"
+              "--research 对事实库外的数字/日期主张联网检索来源并核验（默认关闭）；"
+              "--no-research 强制关闭联网核验；"
+              "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return
     target_arg = args[0]
     target_path = (ROOT / target_arg) if not os.path.isabs(target_arg) else Path(target_arg)
@@ -3116,7 +3620,8 @@ def main():
                          progress_path=progress_path, type_override=type_override,
                          agent_id=agent_id, purpose=purpose, purpose_max=purpose_max,
                          purpose_notes=purpose_notes, scenario=scenario,
-                         format_spec=format_spec)
+                         format_spec=format_spec,
+                         research_enabled=research_enabled)
     except agent_spec.AgentError as e:
         print(f"Agent 配置错误：{e}")
         sys.exit(2)

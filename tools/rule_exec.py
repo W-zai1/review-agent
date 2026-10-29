@@ -56,6 +56,7 @@ _BUILTIN = {
     "COMP-002": "compliance_review·生效/终止要件",
     "COMP-003": "compliance_review·争议解决要件",
     "COMP-004": "compliance_review·数据披露正则",
+    "LAW-001": "law_cite·法条原文比对（试用期/竞业限制/试用期工资）",
     "FORMAT-001": "docx_format·版式检查（正文字体）",
     "FORMAT-002": "docx_format·版式检查（正文字号）",
     "FORMAT-003": "docx_format·版式检查（首行缩进）",

@@ -1351,6 +1351,9 @@ class Handler(BaseHTTPRequestHandler):
         llm_opt = (data or {}).get("llm")
         if llm_opt not in (True, False, None):
             llm_opt = None
+        research_opt = (data or {}).get("research")
+        if research_opt not in (True, False, None):
+            research_opt = None
         type_opt = (data or {}).get("type")
         if type_opt not in TARGET_TYPES:
             type_opt = None
@@ -1398,6 +1401,7 @@ class Handler(BaseHTTPRequestHandler):
                 "report_id": None,
                 "error": None,
                 "llm": llm_opt,
+                "research": research_opt,
                 "type": type_opt,
                 "agent": agent_opt,
                 "scenario": scenario_opt,
@@ -1407,7 +1411,7 @@ class Handler(BaseHTTPRequestHandler):
             target=_run_review_job,
             args=(job_id, file, llm_opt, progress, type_opt, agent_opt,
                   purpose_text or None, purpose_max, purpose_quality, scenario_opt,
-                  spec_opt),
+                  spec_opt, research_opt),
             daemon=True,
         ).start()
         return {"ok": True, "job_id": job_id}
@@ -1726,6 +1730,11 @@ class Handler(BaseHTTPRequestHandler):
             cmd.append("--llm")
         elif llm_opt is False:
             cmd.append("--no-llm")
+        # 库外事实核验默认关闭；前端勾选后显式传 research:true
+        if (data or {}).get("research") is True:
+            cmd.append("--research")
+        else:
+            cmd.append("--no-research")
         type_opt = (data or {}).get("type")
         if type_opt in TARGET_TYPES:
             cmd.extend(["--type", type_opt])
@@ -1820,7 +1829,8 @@ def _resolve_format_spec(raw):
 
 def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
                     agent_opt=None, purpose=None, purpose_max=None,
-                    purpose_quality=None, scenario_opt=None, format_spec_opt=None):
+                    purpose_quality=None, scenario_opt=None, format_spec_opt=None,
+                    research_opt=None):
     """后台线程：跑 review.py，进度事件写入 progress_path。"""
     before = {p.stem for p in OUTPUTS.glob("R-*.json")}
     cmd = [str(PY), str(ROOT / "review.py"), file,
@@ -1829,6 +1839,10 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
         cmd.append("--llm")
     elif llm_opt is False:
         cmd.append("--no-llm")
+    if research_opt is True:
+        cmd.append("--research")
+    else:
+        cmd.append("--no-research")
     if type_opt:
         cmd.extend(["--type", type_opt])
     if agent_opt:

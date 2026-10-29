@@ -44,6 +44,135 @@
 
 # 2026-10-28
 
+### 2026-10-28 · 新增 · 整改单（改哪一句/改成什么/不改会怎样）+ 库外事实检索核验 + 已学结论复用
+
+- **文件**：`tools/remediation.py`、`tools/research.py`（新增）；`review.py`（`run_one` 增加 `research_enabled`，S5.6 核验、`action_plan`/`issue.fix`/`research` 入报告与 Markdown；LAW-001 与 FACT-001 同句归口）、`server.py`（前端 `research:true` 透传 `--research`）、`web/app.js` / `web/index.html` / `web/style.css`（整改单表格、issue 改法与后果、联网核验开关）、`config/research.yaml`、`knowledge/sources/`（2 条示例来源）、`demo/`（合同/事实两份合成样例 + 3 分钟脚本）、`tests/test_remediation.py`、`tests/test_research.py`
+- **改了什么**：每条 issue 现在带 `fix`：`where`（位置）/`from`/`to`（可替换文本）/`consequence`（不改的具体后果）/`action`（replace/insert/annotate/delete/manual）。法条上限、事实数值、用词、隐私脱敏、缺失条款模板由确定性规则生成；没有依据的标 `manual`，不猜。事实审新增：抽「实体+指标+数值」→ 本地来源库 → 已学结论 → 缓存 → 公开网页（360/搜狗，失败降级）→ 支持/反驳/未找到；**两个独立来源或官方来源才进整改单**，单一来源只进「待人工确认」；未找到不生成 issue，只在核验区说明查过什么。`state/learned_facts.jsonl` 沉淀已查实结论，下次同实体同指标直接复用，不再联网。`--research` 显式开启（CLI 默认关闭；控制台复选框默认勾选）。
+- **为什么**：原报告只到「可疑」：「补充 COMP-002 要求的条款」既不说补什么、也不说不改会怎样；事实维度只有 9 条断言，库外主张一律「无出处」，用户拿不到「是否属实」的判断。搜索引擎对中文垂类数据经常只返回官网导航，所以本地来源库优先、网页仅兜底；未找到不生成 issue，避免把「没查到」写成噪音。
+- **验证**：`tests.test_remediation` 7 项 + `tests.test_research` 10 项 OK；`tests.test_review` / `test_law_library` / `test_fact_learning` 136 项 OK；`tests.test_api_contract` 148 项 OK；`tests.test_purpose` / `test_match_matrix` 86 项 OK；全量 `unittest discover` **615 项 OK**。实测 `targets/selftest/st21_fact_xiaomi_research.txt`：规则层 0 条 → 检索反驳「5 亿」为「1.69 亿」，报告给出整句改写与来源；第二次运行命中本地来源（`local_hits=1`）不再联网；没有本地来源时会命中 `state/learned_facts.jsonl`（`local_hits=0 / learned_hits=1`），同样不联网。`st04_fact_law_trial.txt`：输出整句替换「试用期最长不得超过六个月」，不再只改数字留下「可以约定一年」的自相矛盾。`st05_fact_no_source.txt`：FACT-004「无出处」被检索结果吸收（suppressed），报告改判 `warn` 并写明「1 条库外事实未找到可比来源」，不再用 pass 掩盖未核验。`demo/` 两份合成样例：合同 5 条全部有可替换文本（试用期/工资/竞业/缺终止/缺争议解决）；事实样例给出「5 亿→1.69 亿」整句改写、未找到的 35% 进 warn、豆包 10 亿→1 亿。
+
+### 2026-10-28 · 新增 · 回测老库：`tools/fact_audit.py` 用摘除法算已入库断言的真实贡献
+
+- **文件**：`tools/fact_audit.py`（新增，约 250 行）、`README.md` §41、`docs/知识库自学习.md` §8/§10、`.workbuddy/memory/MEMORY.md`（压缩重写至 3000 字内）
+- **改了什么**：新增**只读**工具，对 `knowledge/facts.json` 的每条断言做 `库 vs 库 − 本条` 两轮预演，
+  复用 `fact_promote` 的 `_shadow_pass` / `_corpus_cases` / `_exercised_by` / `_shadow_llm`（不另写一套审查）。
+  五档结论：`kept`（找回真错误且无误报）/ `harmful`（让正确陈述变误报）/ `shadowed`（单独贡献 0 但同句有同伴在报）/
+  `weak_signal`（语料提到实体却零贡献）/ `unmeasured`（语料没提该实体）。参数 `--rule-only` / `--llm` /
+  `--only <实体>` / `--json [路径]`；退出码 1 只在出现 `harmful` 时（未测到与无信号是语料的债，不阻断但不隐藏）。
+- **为什么**：§40 把门禁修对了，但库里 9 条断言是**门禁之前**写进去的，没人用新尺子量过——
+  "这些断言可验吗"这个问题只能拿同一把尺子回测一次才答得出来。**不能直接拿现库断言当候选跑
+  `fact_promote shadow`**：`shadow` 的算法是 `库+候选 vs 库`，两边都是现库，增量恒 0，什么都测不出来。
+  必须摘除法，且 `before` 必须是"没有本条"——方向反了算出来的数没有任何人能读对。
+- **验证**：语料 35 份，按实体预过滤压到 **13 份**（数据安全法 0 份、豆包 4 份、华为 3 份、劳动合同法 2 份、
+  其余各 1 份）。`--rule-only` **3.7s**、`rule+llm` **1m51s**，两轮结论完全一致：
+  **6 kept / 2 shadowed / 1 unmeasured / 0 harmful**。9 条断言**无一条**在把对的判错
+  （摘掉后误报数不变，说明它们在干净语料上不开火）。
+
+### 2026-10-28 · 修复 · 预演的正贡献按「（语料, 标注）」定位：同名标注不再互相顶掉
+
+- **文件**：`tools/fact_promote.py`（`_shadow_pass` 的 `on` 改 key，新增 `_label_key`，`shadow` 的 `on_target_labels` 跟随）、`tests/test_fact_gate.py`（新增 `LabelKeyAcrossCasesTests` 2 项）、`README.md` §40.4/§41.3
+- **改了什么**：`_shadow_pass` 返回的 `on` 从 `{标注 id}` 改成 `{(语料名, 标注 id)}`；
+  `shadow()` 落盘的 `on_target_labels` 用 `_label_key()` 拍成 `语料:标注`（测试替身给的纯 id 原样放过，
+  不能把 `"L01"` 切成 `L:0`）。
+- **为什么**：回测老库时「豆包·月活」显示**正贡献 0**，可它明明找回了 `p11_fact_doubao_mau` 的 MAU 错误。
+  根因是**标注 id 只在单份语料内唯一**：`p11` 与 `p12` 的标注都叫 `L1`，`on.update(matched)` 把两份合并成一个，
+  `before` 轮里 `p12` 的 `L1` 已经在了，`after` 轮加进 `p11` 的 `L1` 看不出变化。
+  后果不是报错，而是 `gate` 看到 `on_target_hits == 0` → 判 `weak_signal` → `unverified` →
+  **一条好断言必须人工放行才能进库**。这种缺陷比"放过坏断言"更难发现：表现是"系统太保守"，
+  人只会顺手点放行，没人回头查为什么。
+- **验证**：`tests/test_fact_gate.py::LabelKeyAcrossCasesTests` 2 项（两份语料的同名标注必须算两次 /
+  `_label_key` 不切纯 id）全绿；两模块 **61 项 OK / 1.7s**，全量 **598 项 OK / 299.5s**
+  （原 595 项 + 本轮新增 3 项）。回测中豆包两条由 `shadowed` 转 `kept`，
+  `kept` 从 4 条升到 6 条。
+
+### 2026-10-28 · 修复 · 模型自提的 FACT-001 不再混进事实库的账（预演假误报 + 缺口漏记）
+
+- **文件**：`tools/fact_promote.py`（`_shadow_pass` 加 `tool` 过滤）、`tools/fact_gap.py`（`collect` 的跳过条件）、`tests/test_fact_learning.py`（新增 1 项）、`README.md` §40.4 第 3 条改写 + §41.4
+- **改了什么**：
+  1. `_shadow_pass` 只统计 `tool` **不以 `llm` 开头**的 `FACT-001`（即事实库判的）；
+  2. `fact_gap.collect` 的跳过条件从 `rid == "FACT-001"` 改成 `rid == "FACT-001" and "llm" not in tool`；
+  3. README §40.4 第 3 条原写「LLM 非确定性不影响这道门的判据，因为 FACT-001 是确定性判定」——**这句是错的，已改写**。
+- **为什么**：干净对照样本 `c08_doubao_api_ok`（豆包大模型/API 属另一口径，应 0 issue）在 26 轮预演里
+  偶发一条 `rule_id=FACT-001`、`tool=llm_api` 的 issue，而单独连跑 3 次都复现不出来（每次都是 FACT-002 + COMP-004）。
+  根因在 `review.validate`：它只把"quote 里**没有**事实库实体"的 FACT-001 降级成 FACT-002，
+  quote 里只要有实体（"豆包""华为"）就**原样保留 rule_id**。两层后果：
+  ① 预演把它当成事实库判的 → LLM 的偶发性直接变成"候选把对的判错"的证据（凭空多一条 `off_target`，误杀好候选）；
+  ② 缺口清单按 `rule_id` 一律跳过 → 模型裸判的 FACT-001 **不进账**，
+  而"没依据就开口"正是最该记的缺口。判据不能只信 `rule_id`（它不是排他的），还得看 `tool`。
+- **验证**：改后回测中「豆包·推出」的 `存量误报 1 → 0`，`rule-only` 与 `rule+llm` 两轮结论重新对齐；
+  新增 `test_model_written_fact_001_is_still_a_gap`（`FACT-001 + tool=llm_api` → `model_judgment`）通过，
+  原有 `test_library_assertion_is_not_a_gap`（`FACT-001 + tool=retrieve + regex` → 非缺口）仍绿。
+
+### 2026-10-28 · 修复 · 门禁心脏三处错：off_target 没减基线、shadow 关着 LLM、安全线只防 URL 不防数值（`tools/fact_promote.py`）
+
+- **文件**：`tools/fact_promote.py`（重写 `shadow`，新增 `_corpus_cases` / `_exercised_by` / `_shadow_pass` / `_shadow_llm` / `_num_set` / `_expected_numbers` / `_value_from_target`，重写 `gate` 与 `verdict`；`_source_ok` 返回三值区分「硬违规」；`promote`/`cmd_gate`/`cmd_shadow`/`cmd_list` 跟随）、`tools/fact_gap.py`（草稿补 `source_quote` 空字段）、`tests/test_fact_gate.py`（新增 27 项）、`tests/test_fact_learning.py`（`_cand` 补 `entity_confirmed`、`test_off_target_must_be_zero` 固定 rule-only 并断言 mode）、`docs/知识库自学习.md` §5/§8 门禁表、`README.md` §40
+- **改了什么**：
+  1. `off_target` 从**绝对值**改成**增量**：`after_off − before_off`，逐条用 `(语料名, normalize_issue)` 指纹对齐。存量误报单独记 `off_target_baseline` + `off_target_baseline_cases`，不归咎候选但写进 warnings。
+  2. `shadow` 从写死 `use_llm=False` 改成**跟随生产配置**（`_shadow_llm(None)` 读 `llm_client.load_config()`，本地端点免 key），`metrics.mode` 记 `rule+llm` / `rule-only`；`--rule-only` 只作排查降级，降级必须留标记。
+  3. 新增 `value_from_target`：期望值与被审文档 `evidence_quote` 里的数字重合时，必须有独立的 `source_quote` 且其中含该数值，且 `source_quote` 不能是被审文档原句（比对去掉空白与标点）。`5,000 万台` 与 `0.5 亿` 归一为同一数。
+  4. `gate` 结论拆四档 `verdict`：`pass` / `incomplete`（草稿没填完）/ `rejected`（实质否决）/ `unverified`（测不出来）。`entity_confirmed` 为假 → incomplete；`source_url` 指向 `targets/` 或 `file:` → `source_from_target`（否决，不是"字段没填"）。
+  5. 语料预过滤：只跑正文含 `entity` 的用例（FACT-001 触发前提就是 `entity in text`），跳过的份数记 `corpus_skipped`。35 份语料实测压到 3～4 份。
+  6. `weak_signal` / `unmeasured` 从"只警告"改成**拦截**（`unverified`），必须 `--allow-unmeasured` 人工放行，放行写进 `metrics.override` 与 warnings。
+  7. shadow 抛异常从"警告"改成 `shadow_failed` 否决（fail-closed）：预演跑不起来就没有负贡献证据，不能算通过。
+  8. 新增 `confirm-entity <cid> --entity <写法> --by <人>` 命令：草稿里 `entity` 是正则剥出来的（「华为」会被剥成「华」），改对实体必须留痕（`from`/`to`/`by`/`at`），不能靠手工改 JSON。
+- **为什么**：复核结论是「外壳的工程纪律都对，但唯一真正守门的环节算法是错的」——① `off_target = sum(after)` 没减基线，语料里只要有一条存量误报，任何候选都过不了，合法断言全被误杀；② 纯规则模式下 FACT-002/003/004、LOGIC-004 根本不存在，在那里算"误报零容忍"测的不是生产行为；③ `_source_ok` 只查 URL 字符串里有没有 `targets/`，草稿里的 `evidence_quote` 就是被审文档原句，把「华为出货 5 亿」抄进 expected 再贴个真 URL 照样放行——红线防住了"拿文档当链接"，没防住"拿文档当数字"。另外 `entity_confirmed:false` 只写在草稿里从没人检查，人对着正则猜错的实体填数，后续冲突检查全按错实体走。
+- **验证**：新增 `tests/test_fact_gate.py` **27 项 OK**（增量算账 / 指纹对齐 / 模式跟随生产 / 崩溃 fail-closed / 数值三条拒绝路径 / 四档结论 / replace 守门 / 实体确认留痕），`test_fact_learning.py` 31 项仍全绿，两模块合计 **58 项 OK / 1.7s**，全量 **595 项 OK / 245.2s**。真实 LLM 双跑对照（35 份语料、压到 3 份）：错误断言「毛利率 90%」→ `off_target` 增量 **3**（c01/p01/p02 三份干净语料全被判错）、`off_target_baseline=0`、28s；合理断言「毛利率 26%（±2 倍容差）」→ `off_target` 增量 **0**、9s，仅 `weak_signal` 拦（语料没有该属性的阳性标注）。旧实现下前者与后者都会被算出同一个绝对值，无法区分。
+
+### 2026-10-28 · 修改 · replace 加乐观锁防清库、批量导入补冲突检查（`tools/fact_promote.py` + `tools/fact_import.py`）
+
+- **文件**：`tools/fact_promote.py`（`replace_all` 加 `expect_current` / `allow_shrink` / 空列表拒绝；新增 `_bulk_conflicts`，`bulk_append` 走静态检查并记 `metrics.shadow="skipped-bulk"`）、`tools/fact_import.py`（`--replace` 传当前条数、新增 `--allow-shrink`、`ValueError` 转成人话退出码 2）、`tests/test_fact_gate.py`（`ReplaceAllGuardTests` 5 项）
+- **改了什么**：`replace_all` 现在必须给 `expect_current` 且与当前断言数一致（乐观锁），条数减少必须显式 `allow_shrink`，空列表一律拒绝。`bulk_append` 在写库前对每一行做 `no_conflict` 检查（同实体同属性两个值直接拒绝，并指出是第几行），审计行标记 `metrics.shadow="skipped-bulk"` 说明批量路径没有跑预演。`fact_import` 捕获该 `ValueError` 并返回退出码 2，不再抛 traceback。
+- **为什么**：「只增不改不删」写在设计文档里，但 `replace_all` 能一次删光整库，且没有任何东西区分"迁移"和"传错文件"；批量导入更彻底——它绕过门禁直接 `_apply`，能把两个互相矛盾的断言同时塞进库，之后 `fact_review` 拿两个不同的期望值判同一句话，结论取决于遍历顺序。批量路径跑不了 shadow（N 条 × 2 轮全语料），但**冲突检查不能省**。
+- **验证**：`ReplaceAllGuardTests` 5 项（缺 `expect_current` / 条数不符 / 空列表 / 未授权收缩 / watchlist 必须保留）全绿；实际导入 1 行 `宁德时代` → 版本 1.1.0→1.1.1、`total=10`；重复导入同一行 → `added=0, replaced=1`、版本不变（幂等）；缺 `source_url`/`review_due` → 退出码 2 并逐行点名。
+
+### 2026-10-28 · 新增 · 知识库缺口清单：让审查器自己报「该补哪条事实」（`tools/fact_gap.py`）
+
+- **文件**：`tools/fact_gap.py`（新增，约 470 行）、`review.py`（`GAP_LOG` 全局 + `_gap_log_path()` + S6 前记账 + `--no-gap-log`）、`tests/test_fact_learning.py`（`GapCollectTests` / `GapLogStoreTests` / `GapIsolationTests` / `ReviewGapIntegrationTests` 共 22 项）、`README.md` §39、`docs/知识库自学习.md` §8
+- **改了什么**：新增四类缺口识别——`model_judgment`（模型在 fact 维度下判断且非 FACT-001）、`law_missing`（LAW-001 因缺条文未执行）、`unsourced_claim`（FACT-002/003）、`watchlist_unasserted`（点名 watchlist 实体），追加到 `state/gap_log.jsonl`。每行写死 `usable_as_evidence: false`；重复出现追加 `op=repeat`、补齐后追加 `op=resolve`，不覆盖也不删行。报告新增顶层 `fact_gaps{recorded,new,repeat,log,kinds,top,usable_as_evidence}`，MD 报告新增「知识库缺口」小节，limitations 增一句边界说明。`--no-gap-log` 关闭落盘（报告记 `disabled:true`）。
+- **为什么**：用户判断「法典和证据库几乎是空的，流程再严密也只是把错误记录得滴水不漏」。此前审到库外实体只有两种结局：静默跳过、或模型按参数记忆裸判（`tool=llm_api`），两者都不留任何工单，于是 facts.json 永远停在手灌的 9 条。规则侧早就有 `rule_miner` 提案，事实侧没有对应物。
+- **验证**：`tests/test_fact_learning.py` 31 项全绿；一段「据行业报告显示，微信月活 14 亿」文本实跑记录 3 条（1 `unsourced_claim` + 2 `watchlist_unasserted`），limitations 出现「缺少库内依据」；FACT-001（库内断言）不记缺口、非 fact 维度不记；同一句写两遍只留 1 条；改 `review_id` 后 `gap_id` 不变；缺口日志随 `review.OUTPUTS` 重定向落到临时目录（真实 `state/` 无写入）；审查前后 `knowledge/facts.json` sha256 不变。
+
+### 2026-10-28 · 新增 · 候选断言门禁与唯一写入口（`tools/fact_promote.py`）
+
+- **文件**：`tools/fact_promote.py`（新增，约 700 行）、`review.py`（无写入）、`docs/知识库自学习.md` §5/§10、`docs/API接口对照表.md`（`fact_gaps` 字段行）、`README.md` §39.3
+- **改了什么**：新增 `status/list/show/gate/shadow/promote/rollback/log` 七个命令。门禁六道：`schema`（entity/attr/期望值/note/review_due）、`source_verifiable`（http(s) 或「《法名》第X条」，且**拒绝指向 targets/**）、`type_correct`（`max` 必须 `unit_hint`、`number` 的 `tolerance` 必须 >1、`date` 必须四位年份）、`no_conflict`（同实体同属性同年度不许两个值）、`off_target`（必须为 0）、`on_target_hits`（可为 0，但记 `weak_signal`）。`promote` 必须 `--confirm-manual`（`--auto` 退出码 2）；写库顺序为快照 → 升 `knowledge_version` → 追加断言 → `state/fact_log.jsonl` 记账 → 缺口 resolve；`rollback` 按 `candidate_id` 精确删除并再升版本。`_apply` 做幂等去重（同实体同属性同类型同年份同期望值不重复写）。
+- **为什么**：没有唯一入口，"人工补据"就会退化成手工编辑 `facts.json`——不留审计、不升版本、历史报告被判成「知识库被篡改」（红），而且没人核对来源。`off_target` 这一道尤其关键：存一条「把对的判错」的事实，比漏一条危害更大。
+- **验证**：门禁四类拒绝实测——毛利率写 90% → `off_target=3`（命中 c01/p01/p02 三份干净或已标注用例）并拒绝；`source_url=targets/uploads/...` → 拒绝并给出「被审对象不能当证据」；`type=max` 缺 `unit_hint` → 拒绝；豆包月活写 10 亿 → 拒绝并指出与现有断言 1 亿冲突。晋升闭环：版本 1.1.0→1.1.1、断言带 `source_url/retrieved_at/review_due/promoted_by`、快照留存、缺口转 resolve；回滚后断言数回到 9、版本再升一级。
+
+### 2026-10-28 · 修改 · 批量导入改走治理路径，修掉「重写整库」与相对路径崩溃（`tools/fact_import.py`）
+
+- **文件**：`tools/fact_import.py`、`tools/fact_promote.py`（新增 `bulk_append` / `replace_all`）、`tests/test_fact_learning.py`（2 项导入用例）
+- **改了什么**：`--by` 改为必填；每一行必须带 `source_url` + `review_due`，缺行直接拒绝（退出码 2）；写入统一走 `fact_promote.bulk_append`（快照 + 升版本 + 记账），`--replace` 走 `replace_all`（同样快照并保留 `watchlist`）。修两处缺陷：① 旧实现重建 `payload` 时**丢掉 `watchlist`**，跑一次批量导入就把 4 条「刻意不写断言」的说明冲掉；② 回显用 `FACTS_PATH.relative_to(ROOT)`，指向仓库外路径时直接抛 `ValueError`，新增 `_rel()` 兜底。
+- **为什么**：批量导入最容易变成「往事实库灌来源不明数字」的快捷方式——它曾经是唯一能写 `facts.json` 却不过任何门禁的路径，与「唯一入口」的设计直接冲突。丢 `watchlist` 与相对路径崩溃是写测试时暴露出来的真实缺陷（临时知识库目录一放就炸）。
+- **验证**：同一份 CSV 连跑两次，断言数 9→10→10（幂等），版本只升一次（1.1.0→1.1.1），`watchlist` 仍为 4 条；缺 `source_url`/`review_due` 的行被拒（退出码 2，点名到行）。
+
+### 2026-10-28 · 修复 · changelog_guard 对新目录只看到目录名，整部法典被放行
+
+- **文件**：`tools/changelog_guard.py`（`git_changed` 的 `status` 加 `-uall`）、`tests/test_changelog_guard.py`（+2 项，其中一项 mock `subprocess.run` 锁住 `-uall`）
+- **改了什么**：`git status --porcelain` 改为 `git status --porcelain -uall`。默认 `-unormal` 对**未跟踪的新目录**只输出一行 `?? knowledge/laws/`；目录名没有扩展名，`must_register()` 判成「不必登记」，于是新加的 `knowledge/laws/{index.json,labor-contract.md,synonyms.json}` 三个文件在守门时被折叠成一行"不登记"。同类风险还有 `tools/law_*.py` 这类新目录下的代码。
+- **为什么**：本轮新增法条库后跑 `--explain`，输出里赫然是 `[不登记] knowledge/laws/`——那三个文件是**判定依据**（法条原文），改了它们等于改了裁判尺度，账本却可以不知道。守门工具漏掉新增目录，比没有守门更糟：它给了一个"已检查"的假信号。
+- **验证**：修前 `--explain` 为 `改动=19`、`knowledge/laws/` 一行「不登记」；修后 `改动=25`，`knowledge/laws/index.json`、`labor-contract.md`、`synonyms.json` 逐个列出并标「需要登记」，`漏登记=0`（因本轮已在账本登记）。`tests/test_changelog_guard.py` **17 项 OK**（新增 `test_new_directory_is_expanded_to_files` 断言命令行含 `-uall` 且 `decide()` 会因此拦下，新增 `test_law_library_files_must_register`）。
+
+### 2026-10-28 · 新增 · 法条库：把「模型常识」换成「条文原文」（LAW-001）
+
+- **文件**：`knowledge/laws/`（新增：`index.json`、`labor-contract.md`、`synonyms.json`）、`tools/law_index.py`（新增）、`tools/law_ingest.py`（新增）、`tools/law_cite.py`（新增）、`review.py`（新增 `_h_law` / `_dedupe_cites` / `Session.law_cites/law_skipped` / `CONTRACT_RATIO_RE`；`FOLD_INTO` 加 `LAW-001`；报告新增 `law_library`；limitations 新增覆盖自报）、`rules/compliance.yaml`（新增 `LAW-001`）、`tools/rule_exec.py`（登记执行器）、`agents/doc-review/manifest.json`（1.3.0 → 1.4.0，checks 加 `builtin:law_cite`）、`config/knowledge_version.txt`（1.0.3 → 1.1.0）、`config/rules_version.txt`（a4 → a5）、`tests/test_law_library.py`（新增 16 项）、`tests/golden/cases/{p20_law_probation_illegal,c16_law_compliant}.txt`（新增）+ `labels/p20_*.labels.json` + `baseline.json` 重存、`README.md` §38、`docs/API接口对照表.md`
+- **改了什么**：
+  1. **数据层**：每部法一个 md（条头「第X条　」，章/节用 `##`/`###`）+ 一份 `index.json` 元数据（`status`/`effective_date`/`source_url`/`retrieved_at`/`article_count`）。首批收录《劳动合同法》98 条，来源人社部官网，`verify_note` 记录条号 1~98 连续、且第 19/20/37/38 条与钦州检察院转载页逐字比对一致。
+  2. **索引层** `tools/law_index.py`：按「第X条」切条（条号必须等于期望的下一条，否则视为正文引用并并入上一条）；`search()` 用关键词 + 同义词扩展，用户词的权重 1.0、扩展词 0.5；`get_article()` 按条号**精确取**（确定的事不交给检索猜——实测「竞业限制三年」检索会飘到第 23 条）；`check()` 把「条号连续 + 条数与声明一致 + 元数据齐全」当门禁。
+  3. **导入层** `tools/law_ingest.py`：`--file raw.txt --article-count N ...` 一条命令入库，切条/校验/写 index/升 `knowledge_version` 全自动；`--dry-run` 只切不写。公网页面分页（实测钦州页只到第 50 条）这类残缺文本会被 `条数不符` 拦下。
+  4. **判定层** `tools/law_cite.py`（LAW-001，确定性）：只判三类「超限即违法」的法定量——试用期 > 6 个月（第十九条）、竞业限制 > 2 年（第二十四条）、试用期工资 < 80%（第二十条）。超限报 major 并附条文原文；**未超限记「已核验」**（"查了没问题"与"没查"必须分开）；法条库缺条文时返回 `skipped`，由报告 limitations 明说"该项未执行"。
+  5. **报告契约**：issue 新增 `citation` / `citations`（法名 + 章 + 条号 + 原文）；顶层新增 `law_library{available, articles_total, laws[], cited[], skipped[]}`；limitations 自报「法律依据仅限已收录的法条库：…；库外不作引用；命中条文 ≠ 条文适用」。
+  6. **归口**：同句已由 `FACT-001`（blocker，事实库断言）判过时，法条原文并入它的 `evidence` 而不新增一条；同句多类违法（如既超试用期又压低工资）在报告层合成一条、依据用 ①② 并列。`FACT-004` 对「试用期工资比例」豁免（工资比例是约定值，不是披露数据）。
+- **为什么**：用户的原话是「能不能让这个系统连接真实数据库，比如中华人民共和国法典，然后通过关键词匹配在对应章节找出相关依据」——前面几轮的原生痛点是「事实库只有 2 条，模型凭记忆判法律问题」。收了库以后，报告能说「依据《劳动合同法》第十九条」并给出原文，读者可以自己翻回去核对；而在此之前，evidence 里只有模型自己的措辞。同时明确划了边界：**检出条文 ≠ 条文适用**（例外情形仍要人判），所以不允许据此给"合法/违法"的总体结论。
+- **验证**：
+  - 法条库自检：`law_index.py --check` 通过（1 部法 / 98 条 / 条号 1~98 连续）；`--article 19` 与 `--article 第十九条` 都能取到第十九条全文。
+  - 检查器：一片违法合同（试用期 12 个月 + 工资 60% + 竞业 3 年）报 3 条 LAW-001，条号分别 19/20/24；合法样本（3 个月 / 85% / 2 年）0 条 issue、3 条「已核验」；「试用期不得超过十二个月」仍报（把上限说错也是错）；「营收同比增长 60%」不报。
+  - 导入门禁：50 条文本声明 98 条 → `[FAIL] 条数不符`、退出码 1；5 条文本声明 5 条 → 退出码 0。
+  - 端到端：合同用例报告 `law_library.cited` = {第十九条, 第二十条, 第二十四条}，limitations 含「法律依据仅限已收录的法条库」；`rule_execution.deterministic` 26 条（含 LAW-001），不再是「仅提示」。
+  - 回归：`tests/test_law_library.py` **16 项 OK**（含金标准外的排序用例：`竞业限制 不得超过二年` 必须排到第 24 条——初版被长同义词压到第 23 条，已用「用户词 1.0 / 扩展词 0.5」修正）。
+  - 金标准：**35 例 / 23 标注 / 召回 100% / 精确率 100% / 误报 0**（新增 p20 阳性 + c16 干净对照，基线已重存）。首跑曾因 p16 同句被 FACT-001 与 LAW-001 各报一条而产生 1 条误报，改为「并入 FACT-001」后归零。
+  - 全量回归 **537 项 OK / 244.9s**（含本轮新增的 2 项守门测试）；docx 暴测 A 14 + B 17 + 31 全绿；`integrity.py verify`：ledger 223 条链完整、161 份报告 STALE（规则/知识库/Agent 升级，属正常演进）、**0 TAMPER**。
+
 ### 2026-10-28 · 修改 · 事实库 7 → 9 条：新增「上限」类型与年度口径（红队 A1/A2/A3）
 
 - **文件**：`knowledge/facts.json`（7 → 9 条断言 + `watchlist` 4 条）、`knowledge/kb_laws.md`（新增「数值类条款」表）、`config/knowledge_version.txt`（1.0.2 → 1.0.3）、`review.py`（`fact_review` 新增 `max` 分支 / `year_ctx` / `watchlist` 采集；`limitations` 自报未核实体）、`tests/test_fact_library.py`、`tests/test_redteam_20261028.py`（新增）
