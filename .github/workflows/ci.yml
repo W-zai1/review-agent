@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # 项目的主运行环境是 Windows（OCR / .bat / 路径处理），CI 跟主环境保持一致。
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # tests/ 在本仓库被 .gitignore 排除（对抗样本不公开），clone 出来没有
+      # 那 600 多项回归测试。checks/ 是可公开的最小不变量集，必须绿。
+      - name: Public invariants
+        run: python -m unittest discover -s checks -v
+
+      # 本地/私有镜像若带 tests/，就顺带跑全量；没有则跳过，不伪装成"跑过了"。
+      - name: Full regression (when tests/ is present)
+        shell: pwsh
+        run: |
+          if (Test-Path tests) {
+            python -m unittest discover -s tests -v
+          } else {
+            Write-Host "tests/ not present in this checkout - skipped (see checks/)"
+          }
+
+      - name: Golden suite (recall / false positives must not regress)
+        run: python tools/golden_eval.py
+
+      - name: Changelog guard (clean tree must pass)
+        run: python tools/changelog_guard.py --explain

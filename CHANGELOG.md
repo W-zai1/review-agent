@@ -42,6 +42,19 @@
 
 ---
 
+# 2026-10-29
+
+### 2026-10-29 · 修复 · 法条分档/覆盖率真话/控制台安全边界，补可复现基线与 CI（v0.9.0）
+
+- **文件**：`tools/law_cite.py`、`review.py`、`server.py`、`tools/llm_client.py`、`web/app.js`、`tools/version.py`（新增）、`VERSION`（新增）、`requirements.txt`（新增）、`.github/workflows/ci.yml`（新增）、`checks/test_invariants.py`（新增）、`tests/golden/cases/p21_law_probation_tier.txt` / `p22_law_probation_tier2.txt` / `p23_law_salary_chinese.txt` 及对应 labels（新增）、`tests/golden/baseline.json`、`README.md`、`docs/API接口对照表.md`；本地回归另改 `tests/test_law_library.py`、`tests/test_api_contract.py`，新增 `tests/test_coverage_truth.py`（`tests/` 不入库，公开仓库以 `checks/` 为准）
+- **改了什么**：
+  1. **法条**：`LAW-001` 按《劳动合同法》第十九条分档——3 个月以上不满 1 年→≤1 个月；1 年以上不满 3 年→≤2 个月；3 年以上/无固定期限→≤6 个月；不满 3 个月/以完成一定工作任务为期限→不得约定。支持「自 YYYY 年 M 月 D 日起至 … 止」日期区间；支持「百分之六十」这类中文数字。期限未知且 ≤6 个月时只记 `skipped`、不再给「已核验」；>6 个月仍按绝对上限报。
+  2. **覆盖率**：`plan_chunks` 抽成 `plan_chunk_spans`（文本输出逐字节不变）；`semantic_review` 记录每个 `(维度, 块)` 的成败与字符区间；`chars_reviewed` 改为成功区间并集，`complete` 绑定 `failed_chunks`；报告/limitations/Markdown 写清「哪一段没进模型」。顺手把 S4 从「只统计」改成真丢弃 `quote` 不可回溯的 issue（空 quote 与占位式缺失项保留）。
+  3. **控制台安全**：`/api/llm/test` 切 host 且无新 key 时拒绝，本地端点允许但清空继承的 key，`base_url` 带 userinfo 直接拒绝；`_guard_api` 的 Origin 校验改为 host + 真实监听端口，带 Origin 的写请求必须带 `X-Review-Console: 1`；`masked_key()` 只留前缀；`_send_file` 用 `resolve().relative_to()` + `is_file()` 判边界，`/static/` 目录不再 500。
+  4. **可复现基线**：新增 `VERSION` + `tools/version.py`，报告 `model_version`、控制台 `server_version`、README 标题统一读它；新增 `requirements.txt`；新增 `.github/workflows/ci.yml`；新增 `checks/test_invariants.py`（公开、无敏感样本，覆盖法条分档/覆盖率/安全/版本）。CI 明确：`tests/` 不入库时不假装跑过，改为跑 `checks/` + `golden_eval`。
+- **为什么**：审计实测「本合同期限为一年，试用期为四个月」被判 `pass`、`key_facts` 写「未超法定上限 6 个月」，把违法条款认证成合规；202 份历史报告 `complete=False` 一次没出现，LLM 失败块被 `continue` 后仍打印「全覆盖」；`/api/llm/test` 可把已保存的 Key 发到任意 host，且 Origin 校验丢端口让本机任意页面成为同源；README 标题 v0.2.7、报告 v0.2.7-demo、控制台 0.1、正文 v0.8.2 四处版本互相矛盾；`tests/` 被 `.gitignore` 排除导致 CI 实际 0 项。
+- **验证**：全量 `python -m unittest discover -s tests -v` → **642 项 OK / 231.7s**；契约 `tests.test_api_contract` → **158 项 OK / 170.8s**（原 148 + 新增 10 项安全回归）；法条 `tests.test_law_library` → 22 项 OK；覆盖率 `tests.test_coverage_truth` → 11 项 OK；公开 `python -m unittest discover -s checks -v` → 14 项 OK；金标准 `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0，基线已重存。端到端复跑同一句：`verdict=warn`、`key_facts=[]`、`LAW-001` 证据写「一年以上不满三年，试用期不得超过 2 个月，本文写四个月」，不再出现「已核验 6 个月」。
+
 # 2026-10-28
 
 ### 2026-10-28 · 新增 · 整改单（改哪一句/改成什么/不改会怎样）+ 库外事实检索核验 + 已学结论复用

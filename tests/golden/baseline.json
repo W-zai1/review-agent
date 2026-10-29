@@ -1,8 +1,8 @@
 {
  "recall_pct": 100.0,
  "precision_pct": 100.0,
- "labels_total": 23,
- "labels_hit": 23,
+ "labels_total": 26,
+ "labels_hit": 26,
  "fp_total": 0,
  "cases": [
   {
@@ -319,7 +319,34 @@
    "unlabeled": 0,
    "unlabeled_detail": [],
    "issue_count": 2
+  },
+  {
+   "case": "p21_law_probation_tier.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p22_law_probation_tier2.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
+  },
+  {
+   "case": "p23_law_salary_chinese.txt",
+   "kind": "positive",
+   "labels_total": 1,
+   "labels_hit": 1,
+   "unlabeled": 0,
+   "unlabeled_detail": [],
+   "issue_count": 1
   }
  ],
- "ts": "2026-10-28 17:10:10"
+ "ts": "2026-10-29 22:13:01"
 }

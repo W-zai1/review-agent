@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-review.py —— 审查 Agent 主流程 S1~S6 (Demo v0.2.7)
+review.py —— 审查 Agent 主流程 S1~S6 (Demo v0.9.0)
 
 定位：独立审查裁判。只读 targets/，所有产物只落到 outputs/ 与 logs/。
 不修改原文件、不自动整改，只给出带证据（quote + rule_id + source + tool + confidence）的裁定。
@@ -46,6 +46,7 @@ import llm_client
 import llm_review
 import remediation
 import research
+import version
 
 try:
     import yaml
@@ -72,6 +73,8 @@ for d in (OUTPUTS, LEDGER, LOGS):
     d.mkdir(exist_ok=True)
 
 SEV_ORDER = {"blocker": 0, "major": 1, "minor": 2, "nit": 3}
+# 版本号唯一事实源：根目录 VERSION（tools/version.py 读取）。
+REPORT_MODEL_VERSION = version.report_version()
 UNIT_FACTOR = {"亿": 1e8, "万": 1e4, "%": 0.01, "倍": 1.0, "": 1.0}
 
 # 事实审的确定性启发式（FACT-002/003/004）
@@ -1404,15 +1407,18 @@ def aggregate_repeats(issues):
     return [i for i in issues if i["issue_id"] not in folded], folded
 
 
-def plan_chunks(text, limit, overlap=400):
-    """把长文按段落边界切成 ≤limit 的块，相邻块重叠 overlap 字符。
+def plan_chunk_spans(text, limit, overlap=400):
+    """把长文按段落边界切成 ≤limit 的块，返回 [(start, end), ...] 区间。
 
     为什么按段落切：句子被切断会让模型读到残缺语义，反而制造误报。
     重叠是为了让跨块的相邻句至少在某一块里是完整的。
+
+    覆盖率必须和分块用同一套区间：事后再用 text.find(chunk) 反查并不可靠——
+    重复段落会把后面的块钉到前面出现的位置，重叠块的并集也会算错。
     """
     if len(text) <= limit:
-        return [text]
-    chunks, pos, n = [], 0, len(text)
+        return [(0, len(text))]
+    spans, pos, n = [], 0, len(text)
     while pos < n:
         end = min(pos + limit, n)
         if end < n:
@@ -1423,11 +1429,63 @@ def plan_chunks(text, limit, overlap=400):
             if cut < limit * 0.5:
                 cut = limit - 1
             end = pos + cut + 1
-        chunks.append(text[pos:end])
+        spans.append((pos, end))
         if end >= n:
             break
         pos = max(end - overlap, pos + 1)
-    return chunks
+    return spans
+
+
+def plan_chunks(text, limit, overlap=400):
+    """plan_chunk_spans 的文本版：输出必须与切分区间逐字节一致（缓存键依赖）。"""
+    return [text[start:end] for start, end in plan_chunk_spans(text, limit, overlap)]
+
+
+def covered_chars(spans):
+    """求若干 [start, end) 区间的并集长度（块间重叠只算一次）。"""
+    total = 0
+    cur_start = cur_end = None
+    for start, end in sorted(spans):
+        if end <= start:
+            continue
+        if cur_start is None:
+            cur_start, cur_end = start, end
+        elif start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            total += cur_end - cur_start
+            cur_start, cur_end = start, end
+    if cur_start is not None:
+        total += cur_end - cur_start
+    return total
+
+
+def _span_label(start, end):
+    """把字符区间渲染成「6000–11800」；拿不到合法整数就说未知。"""
+    if isinstance(start, int) and isinstance(end, int):
+        return f"{start}–{end}"
+    return "未知区间"
+
+
+def failed_chunk_limitation(failed_chunks, chunks):
+    """把块级失败写成 limitations 的一条说明（前 3 条展开，其余给数量）。
+
+    只写"部分块失败"没有信息量：用户要知道**哪一段**没进模型。
+    """
+    items = list(failed_chunks or [])
+    if not items:
+        return ""
+    parts = []
+    for f in items[:3]:
+        parts.append(
+            f"第 {f.get('chunk')}/{chunks} 块"
+            f"（字符 {_span_label(f.get('start'), f.get('end'))}，维度 {f.get('dim')}）"
+            "语义审失败，该段仅经过规则层，未进入模型复核")
+    note = "；".join(parts)
+    if len(items) > 3:
+        note += (f"；另有 {len(items) - 3} 处块级失败未逐条展开"
+                 "（见 coverage.failed_chunks）")
+    return note + "——本次结论不代表上述字符段已审。"
 
 
 # ---------------------------------------------------------------------------
@@ -1850,12 +1908,19 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
     chars_total = len(text)
     # 长文分块：不再截断后半段（截断等于"没审"，而报告还要据此下结论）
     chunk_size = min(cfg.max_input_chars, getattr(cfg, "chunk_chars", 6000))
-    chunks = (plan_chunks(text, chunk_size,
-                          getattr(cfg, "chunk_overlap", 400))
-              if getattr(cfg, "chunking", True) else [text])
+    if getattr(cfg, "chunking", True):
+        chunk_spans = plan_chunk_spans(text, chunk_size,
+                                       getattr(cfg, "chunk_overlap", 400))
+        chunks = [text[start:end] for start, end in chunk_spans]
+    else:
+        chunks = [text]
+        chunk_spans = [(0, len(text))]
     chunked = len(chunks) > 1
-    chars_reviewed = (chars_total if chunked
-                      else min(chars_total, cfg.max_input_chars))
+    # 每个 (dimension, chunk) 的尝试/成败都要留痕：失败块绝不能静默算成已审。
+    chunks_attempted = 0
+    chunks_succeeded = 0
+    failed_chunks = []
+    reviewed_spans = []
     if chunked:
         s.decision(f"原文 {chars_total:,} 字符超出单次上限，改为 {len(chunks)} 块送审",
                    "OVERALL-005",
@@ -1875,6 +1940,8 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
         dim_finish = ""
         for ci, chunk in enumerate(chunks, 1):
             tag = f"{dim}" + (f"|块{ci}/{len(chunks)}" if chunked else "")
+            span_start, span_end = chunk_spans[ci - 1]
+            chunks_attempted += 1
             started = time.perf_counter()
             try:
                 res = llm_review.review_dimension(
@@ -1888,8 +1955,20 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
                 s.decision(f"{tag} 语义审调用失败", "OVERALL-004",
                            str(e)[:150], ["重试", "换端点"], "重试已耗尽，不阻塞其他块/维度")
                 meta["errors"].append(f"{dim}#{ci}: {str(e)[:160]}")
+                failed_chunks.append({
+                    "dim": dim, "chunk": ci,
+                    "start": span_start, "end": span_end,
+                    "error": str(e)[:200],
+                })
                 continue
 
+            chunks_succeeded += 1
+            # 成功块按真实区间记覆盖。单块模式（chunking=False）下 review_dimension
+            # 只会把前 max_input_chars 字符送进模型，覆盖区间也必须同步截到那里；
+            # 分块模式下块本身 ≤max_input_chars，这一步是恒等变换。
+            covered_end = min(span_end,
+                              span_start + max(0, int(cfg.max_input_chars)))
+            reviewed_spans.append((span_start, covered_end))
             elapsed = (time.perf_counter() - started) * 1000
             success_calls += 1
             if res.get("cached"):
@@ -1995,7 +2074,11 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
     meta["output_truncated_dimensions"] = output_truncated_dims
     meta["input_truncated_dimensions"] = input_truncated_dims
     meta["chars_total"] = chars_total
-    meta["chars_reviewed"] = chars_reviewed
+    # 真实覆盖 = 成功块区间的并集（重叠只算一次）；失败块覆盖的字符不计入。
+    meta["chars_reviewed"] = min(covered_chars(reviewed_spans), chars_total)
+    meta["chunks_attempted"] = chunks_attempted
+    meta["chunks_succeeded"] = chunks_succeeded
+    meta["failed_chunks"] = failed_chunks
     meta["cache_hits"] = cache_hits
     meta["chunked"] = chunked
     meta["chunks"] = len(chunks)
@@ -2003,6 +2086,71 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
     meta["open_discoveries"] = sum(
         1 for i in s.issues if i.get("open_discovery"))
     return s, ("rule+llm" if success_calls else "rule-only"), meta
+
+
+def coverage_from_llm_meta(llm_meta, chars_total):
+    """由语义审 meta 推导真实文本覆盖与「是否完整」（纯函数，便于单测）。
+
+    complete 旧口径只看输入/输出截断，块级调用失败被 `continue` 掉后仍报
+    「全覆盖」——202 份历史报告里 complete=False 一次没出现过，根因就在这里。
+    现在多一个硬条件：任何 (dimension, chunk) 失败都使 complete=False。
+    """
+    meta = llm_meta or {}
+    try:
+        chars_total = max(0, int(chars_total or 0))
+    except (TypeError, ValueError):
+        chars_total = 0
+
+    in_trunc = list(meta.get("input_truncated_dimensions") or [])
+    out_trunc = list(meta.get("output_truncated_dimensions") or [])
+    failed = []
+    for item in meta.get("failed_chunks") or []:
+        if not isinstance(item, dict):
+            continue
+        failed.append({
+            "dim": item.get("dim"),
+            "chunk": item.get("chunk"),
+            "start": item.get("start"),
+            "end": item.get("end"),
+        })
+
+    # 兼容纯规则模式 / 旧 meta：没有 chars_reviewed 时按整篇算——没有调用模型
+    # 不算"失败"。但不能用 `or chars_total`：全块失败时 0 是有效值，
+    # falsy 回退会把 0 变成全文，正是这次要修的假全覆盖。
+    if meta.get("chars_reviewed") is None:
+        reviewed = 0 if failed else chars_total
+    else:
+        try:
+            reviewed = int(meta.get("chars_reviewed"))
+        except (TypeError, ValueError):
+            reviewed = 0
+    reviewed = max(0, min(reviewed, chars_total))
+
+    try:
+        attempted = max(0, int(meta.get("chunks_attempted") or 0))
+    except (TypeError, ValueError):
+        attempted = 0
+    try:
+        succeeded = max(0, int(meta.get("chunks_succeeded") or 0))
+    except (TypeError, ValueError):
+        succeeded = 0
+
+    complete = not in_trunc and not out_trunc and not failed
+    # 防御：定位/切分异常导致实际覆盖不足时也不能称"全覆盖"。
+    if reviewed < chars_total:
+        complete = False
+    return {
+        "chars_total": chars_total,
+        "chars_reviewed": reviewed,
+        "text_coverage_pct": (round(reviewed / chars_total * 100)
+                              if chars_total else 100),
+        "chunks_attempted": attempted,
+        "chunks_succeeded": succeeded,
+        "failed_chunks": failed,
+        "input_truncated_dimensions": in_trunc,
+        "output_truncated_dimensions": out_trunc,
+        "complete": complete,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -2349,6 +2497,34 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
 
     # ---- S4 证据锚定（已在各 reviewer 内绑定 quote/rule/evidence/tool/confidence）----
     t = time.perf_counter()
+    # 日志一直写「quote 必须逐字出现，否则丢弃」，但旧实现只统计不丢弃。
+    # 这里把安全线补成真动作：非空 quote 无法逐字回查原文的条目移出报告；
+    # 缺失型问题（quote 为空）是「原文没有某条款」，不是伪造证据，保留。
+    dropped_unanchored = []
+    kept_issues = []
+    for i in s.issues:
+        q = i.get("quote")
+        # 占位式 quote（如空文档格式检查的「（文档首段）」）没有可回查的原文，
+        # 属于缺失型问题，保留；只丢「声称引了原文、却回查不到」的条目。
+        placeholder = (isinstance(q, str) and q.startswith("（")
+                       and q.endswith("）"))
+        if q and q not in text and not placeholder:
+            dropped_unanchored.append(i)
+        else:
+            kept_issues.append(i)
+    if dropped_unanchored:
+        s.issues = kept_issues
+        _sample = "、".join(
+            f"{i.get('issue_id')}/{i.get('rule_id')}"
+            for i in dropped_unanchored[:5])
+        s.tool("evidence_anchor", "quote 逐字校验",
+               f"丢弃 {len(dropped_unanchored)} 条 quote 未命中原文：{_sample}"[:200],
+               0, status="failed")
+        s.decision(
+            f"S4 丢弃 {len(dropped_unanchored)} 条 quote 不可回溯的异议",
+            "OVERALL-004", f"示例：{_sample}"[:150],
+            ["保留并在报告标注不可回溯"],
+            "quote 无法逐字回查原文 = 结论不可审计，不能进入报告")
     traceable = sum(1 for i in s.issues if i.get("quote") and i["quote"] in text)
     dim_count = {}
     for i in s.issues:
@@ -2547,17 +2723,11 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     }
     # 文本覆盖率：审了多少字 / 一共多少字。只报问题数不报覆盖率，
     # 用户会默认"全文都审过了"——长文截断时这是最危险的错觉。
+    # 真实口径从语义审 meta 推导：成功块区间的并集 + 失败块清单。
     chars_total = len(text)
-    chars_reviewed = (llm_meta or {}).get("chars_reviewed") or chars_total
-    chars_reviewed = min(chars_reviewed, chars_total)
-    coverage["chars_total"] = chars_total
-    coverage["chars_reviewed"] = chars_reviewed
-    coverage["text_coverage_pct"] = (
-        round(chars_reviewed / chars_total * 100) if chars_total else 100)
-    coverage["input_truncated_dimensions"] = list(
-        (llm_meta or {}).get("input_truncated_dimensions") or [])
-    coverage["output_truncated_dimensions"] = list(
-        (llm_meta or {}).get("output_truncated_dimensions") or [])
+    text_cov = coverage_from_llm_meta(llm_meta, chars_total)
+    coverage.update(text_cov)
+    chars_reviewed = text_cov["chars_reviewed"]
     coverage["chunked"] = bool((llm_meta or {}).get("chunked"))
     coverage["chunks"] = int((llm_meta or {}).get("chunks") or 1)
     coverage["source_encoding"] = source_encoding
@@ -2570,13 +2740,14 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         "source": "manual" if type_override else "auto",
         "reason": type_info.get("reason", ""),
     }
-    coverage["complete"] = (
-        not coverage["input_truncated_dimensions"]
-        and not coverage["output_truncated_dimensions"])
     if not coverage["complete"]:
         # 结论正文也要说，不能只藏在 limitations 里（很多人只看裁定那一段）
-        core += (f" 注意：本次语义审仅覆盖 {coverage['text_coverage_pct']}% 的原文"
-                 f"（{chars_reviewed:,}/{chars_total:,} 字符），未覆盖部分未被审查。")
+        if chars_reviewed < chars_total:
+            core += (f" 注意：本次语义审仅覆盖 {coverage['text_coverage_pct']}% 的原文"
+                     f"（{chars_reviewed:,}/{chars_total:,} 字符），未覆盖部分未被审查。")
+        if coverage["failed_chunks"]:
+            core += (f" 另有 {len(coverage['failed_chunks'])} 个「维度×块」语义审失败，"
+                     "相关字符段未完成模型复核，本次结论不代表该段已审。")
     if source_meta:
         # 文本由 PDF / Word / 压缩包抽取而来：标注来源，便于回溯原件
         coverage["source"] = source_meta
@@ -2695,11 +2866,25 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             f"以下维度的模型输出被 max_tokens 截断（finish_reason=length）："
             f"{'、'.join(coverage['output_truncated_dimensions'])}——"
             "已救回写完的条目，但排在其后的发现可能丢失，这些维度不能视为「已审完」。")
+    # 块级失败：旧实现失败块 continue 后仍按全文算覆盖，报告因此写「全覆盖」。
+    # 逐条列出失败块字符区间，并说明该段只经过规则层。
+    if coverage["failed_chunks"]:
+        _note = failed_chunk_limitation(coverage["failed_chunks"],
+                                        coverage["chunks"])
+        limitations.insert(0 if not coverage["input_truncated_dimensions"] else 1,
+                           _note)
     if coverage.get("chunked"):
-        limitations.append(
-            f"长文分块审查：原文 {chars_total:,} 字符按段落切成 {coverage['chunks']} 块分别送审，"
-            "全文均已覆盖；但**相隔很远的段落之间的语义冲突**没有被模型同时看到，"
-            "这类跨块问题依赖确定性算术层与人工复核兜底。")
+        if coverage["failed_chunks"]:
+            limitations.append(
+                f"长文分块审查：原文 {chars_total:,} 字符按段落切成 "
+                f"{coverage['chunks']} 块分别送审；其中 "
+                f"{len(coverage['failed_chunks'])} 处「维度×块」失败，"
+                "失败块对应的字符段未完成语义审（区间见上一条失败块说明）。")
+        else:
+            limitations.append(
+                f"长文分块审查：原文 {chars_total:,} 字符按段落切成 {coverage['chunks']} 块分别送审，"
+                "全文均已覆盖；但**相隔很远的段落之间的语义冲突**没有被模型同时看到，"
+                "这类跨块问题依赖确定性算术层与人工复核兜底。")
     folded_n = sum(i.get("aggregated_count", 0) - 1 for i in issues_sorted
                    if i.get("aggregated_count"))
     if folded_n:
@@ -2972,7 +3157,7 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         "stats": stats,
         "llm": llm_meta,
         "reviewer": "independent-review-agent",
-        "model_version": "v0.2.7-demo",
+        "model_version": REPORT_MODEL_VERSION,
         "timestamp": now_iso(),
     }
 
@@ -3132,6 +3317,15 @@ def render_md(report):
                 lines.append(f"  - 输入截断（其后内容未审）：{'、'.join(un)}")
             if ou:
                 lines.append(f"  - 输出截断（结论可能不完整）：{'、'.join(ou)}")
+            failed = cov.get("failed_chunks") or []
+            for f in failed[:3]:
+                lines.append(
+                    f"  - 块级语义审失败：第 {f.get('chunk')}/{cov.get('chunks', '?')} 块"
+                    f"（字符 {_span_label(f.get('start'), f.get('end'))}，"
+                    f"维度 {f.get('dim')}）——该段仅经过规则层，未进入模型复核")
+            if len(failed) > 3:
+                lines.append(f"  - 另有 {len(failed) - 3} 处块级语义审失败，"
+                             "详见报告 coverage.failed_chunks")
     lines.append("")
     plan = report.get("action_plan") or {}
     if plan.get("top"):

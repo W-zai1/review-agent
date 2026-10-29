@@ -1,7 +1,7 @@
-# 审查 Agent 项目（Demo v0.2.7）
+# 审查 Agent 项目（Demo v0.9.0）
 
 > 来源定义：`review-agent-framework.md`（已随仓库归档，审查 Agent 框架定义 v0.2，Demo 版）
-> 当前实现：v0.2.7 —— 按诊断报告修复 F1~F5 与 O1/O2/O5：事实维度补齐、规则目录哈希、服务请求防护、合同否定语境、交叉复核用例、ID 锁、日志即时落盘、回归测试。
+> 当前实现：v0.9.0 —— 修正法条分档与中文数字（试用期不再一律按 6 个月放行）、覆盖率如实反映失败块、控制台收紧 Origin/自定义头并堵住 Key 外送；补齐依赖清单、可公开的 `checks/` 与 CI。
 > 定位：个人日常 / Demo。只读、独立裁判、可举证、可迭代。**跑通一次完整审查闭环**即可。
 >
 > 改动流水见 **`CHANGELOG.md`**（逐条登记增删改：文件 / 改了什么 / 为什么 / 怎么验的）。
@@ -35,6 +35,10 @@
 ```
 review-agent/
 ├── README.md
+├── VERSION                 # 版本号唯一事实源（review.py / server.py / README 都读它）
+├── requirements.txt        # 运行时依赖（仅 pyyaml；PDF/OCR 为可选增强）
+├── .github/workflows/ci.yml # CI：公开不变量 + 金标准（tests/ 不入库时不会假装跑过）
+├── checks/                 # 可公开的最小不变量集（法条分档/覆盖率/控制台安全/版本）
 ├── CHANGELOG.md            # 改动流水：每次增删改逐条登记（想查"谁动了哪一处"看这里）
 ├── .githooks/pre-commit    # 提交前调用 changelog_guard，漏登记就拦（core.hooksPath 指向它）
 ├── review-agent-framework.md  # 框架定义原文（v0.2，来源文档）
@@ -45,14 +49,17 @@ review-agent/
 │   ├── format_specs.yaml   # 格式规格（Word 版式的**数值**：字体/字号/行距…）
 │   ├── llm.local.json      # 前端保存的覆盖配置（运行时生成，含 Key，勿提交）
 │   └── rules.state.json    # 规则启停状态（运行时生成，勿提交）
-├── rules/                  # 规则库（YAML，16 条）
+├── rules/                  # 规则库（YAML，33 条）
 │   ├── fact.yaml           #   FACT-001~004
 │   ├── safety.yaml         #   SAFE-001~004
-│   ├── compliance.yaml     #   COMP-001~004
+│   ├── compliance.yaml     #   COMP-001~004 + LAW-001
+│   ├── logic.yaml          #   LOGIC-001~009
 │   ├── format.yaml         #   FORMAT-001~006（只声明查哪些维度，数值在 config/format_specs.yaml）
-│   └── style.yaml          #   STYLE-001~004（004 = 硬编码密钥 + lint）
-├── knowledge/              # 事实库 / 政策基线
+│   └── style.yaml          #   STYLE-001~005（004 = 硬编码密钥 + lint）
+├── knowledge/              # 事实库 / 法条库 / 政策基线
 │   ├── facts.json          #   机器可读事实断言（事实审比对用）
+│   ├── laws/               #   法条原文（一部法一个 md）+ index/synonyms
+│   ├── sources/            #   库外事实核验的本地来源库
 │   ├── kb_doubao.md        #   豆包事实文档
 │   └── kb_policy.md        #   合同/披露合规基线
 ├── targets/                # 待审对象（只读）
@@ -174,10 +181,16 @@ python tools/arith_check.py targets/adversarial_meeting_001.txt
 # 日志统计（成功率 / 耗时 / token）
 python tools/log_summary.py
 
-# 回归测试（stdlib unittest，无需 pytest）
+# 全量回归（stdlib unittest，无需 pytest；tests/ 是本地/私有镜像的 600+ 项，公开仓库不含）
 python -m unittest discover -s tests -v
 
-# 仅跑前后端接口契约测试（锁定 web/app.js ↔ server.py，约 50s）
+# 公开不变量（随仓库走，CI 跑这套；不含敏感样本）
+python -m unittest discover -s checks -v
+
+# 金标准评测（召回/误报不允许低于基线）
+python tools/golden_eval.py
+
+# 仅跑前后端接口契约测试（锁定 web/app.js ↔ server.py，约 170s）
 python -m unittest tests.test_api_contract -v
 
 # 批量导入事实断言（CSV / JSON）

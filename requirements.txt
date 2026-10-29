@@ -1,0 +1,8 @@
+# 运行时硬依赖：只有 YAML 解析。
+# 其余能力（PDF / Word / 图片 OCR）走标准库或可选适配器，缺库时降级并在报告里注明。
+pyyaml>=6.0,<7
+
+# 可选增强（不装也能跑，装了对应摄取能力更强）：
+# pypdf>=4                 # PDF 文本层抽取
+# rapidocr-onnxruntime     # 图片 OCR（Windows 也可用系统 WinRT OCR）
+# python-docx              # 仅部分测试/夹具生成用到（审查本身用 zip+xml，不依赖它）

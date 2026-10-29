@@ -120,6 +120,7 @@ import rule_learning  # noqa: E402
 import rule_exec  # noqa: E402
 import llm_client  # noqa: E402
 import rules_store  # noqa: E402
+import version  # noqa: E402
 
 # 可选对象类型 = 所有 Agent 声明过的类型并集。
 # 写死的四个值意味着「加一个场景就得改服务端」，这正是这次要拆掉的东西。
@@ -459,15 +460,54 @@ def _hostname_from_header(value):
     return value
 
 
-def _origin_host(origin):
+def _origin_parts(origin):
+    """解析 Origin，返回 (scheme, hostname, port)；非 http(s) 或非法 URL 返回 None。
+
+    端口缺失时按 scheme 补默认值，否则 `Origin: http://127.0.0.1`
+    （监听 80）会被误判成端口不同。
+    """
     try:
-        return (urlsplit(origin).hostname or "").lower()
+        parts = urlsplit(str(origin or "").strip())
+        scheme = (parts.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return None
+        host = (parts.hostname or "").lower()
+        if not host:
+            return None
+        port = parts.port
     except ValueError:
-        return ""
+        return None
+    if port is None:
+        port = 80 if scheme == "http" else 443
+    return scheme, host, port
+
+
+def _url_netloc(url):
+    """返回 URL 的 (hostname, port)；端口缺失按 scheme 归一化，非法 URL 返回 None。"""
+    try:
+        parts = urlsplit(str(url or "").strip())
+        host = (parts.hostname or "").lower()
+        if not host:
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 80 if (parts.scheme or "").lower() == "http" else \
+                (443 if (parts.scheme or "").lower() == "https" else None)
+    return host, port
+
+
+def _url_has_userinfo(url):
+    """URL 的 authority 里是否带 user:pass@（凭据不允许进配置文件/响应）。"""
+    try:
+        return "@" in urlsplit(str(url or "")).netloc
+    except ValueError:
+        return False
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ReviewAgentConsole/0.1"
+    server_version = f"ReviewAgentConsole/{version.__version__}"
 
     # ----- 通用响应 -----
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
@@ -486,11 +526,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_file(self, path: Path):
-        if not path.exists() or not str(path.resolve()).startswith(str(WEB.resolve())):
+        # 用 resolve()+relative_to 判边界：字符串前缀会让 web_evil/ 通过，
+        # 也会把 /static/ 这种目录送进 read_bytes() 抛 500。
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(WEB.resolve())
+        except (ValueError, OSError):
             return self._send(404, {"error": "not found"})
-        data = path.read_bytes()
+        if not resolved.is_file():
+            return self._send(404, {"error": "not found"})
+        data = resolved.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", _ctype(path))
+        self.send_header("Content-Type", _ctype(resolved))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -499,15 +546,39 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _guard_api(self):
-        """拒绝非本机 Host、跨站 Origin 与 cross-site 请求（CSRF / DNS rebinding）。"""
-        host = _hostname_from_header(self.headers.get("Host"))
-        if host and host not in LOCAL_HOSTS:
+        """拒绝非本机 Host、跨站 Origin 与跨站写请求（CSRF / DNS rebinding）。
+
+        Origin 必须同时匹配 Host 与真实监听端口——只比 hostname 会让
+        http://127.0.0.1:<别的端口> 被当成本源。浏览器跨源写请求还必须带
+        X-Review-Console 自定义头（跨源无法免预检自带）；无 Origin 的
+        curl / CLI / 测试客户端保持兼容。
+        """
+        host_header = self.headers.get("Host")
+        host = _hostname_from_header(host_header)
+        if not host:
+            # HTTP/1.1 必须带 Host；HTTP/1.0 客户端允许省略，保持兼容。
+            if str(self.request_version or "") >= "HTTP/1.1":
+                self._send(403, {"ok": False, "error": "缺少 Host 头"})
+                return False
+        elif host not in LOCAL_HOSTS:
             self._send(403, {"ok": False, "error": "Host 不被允许"})
             return False
         origin = self.headers.get("Origin")
-        if origin and _origin_host(origin) not in LOCAL_HOSTS:
-            self._send(403, {"ok": False, "error": "跨站请求已被拒绝"})
-            return False
+        if origin:
+            parts = _origin_parts(origin)
+            if parts is None:
+                self._send(403, {"ok": False, "error": "跨站请求已被拒绝"})
+                return False
+            _scheme, origin_host, origin_port = parts
+            listen_port = self.server.server_address[1]
+            if (host and origin_host != host) or origin_port != listen_port:
+                self._send(403, {"ok": False, "error": "跨站请求已被拒绝"})
+                return False
+            if self.command in ("POST", "DELETE", "PUT", "PATCH") and \
+                    (self.headers.get("X-Review-Console") or "").strip() != "1":
+                self._send(403, {"ok": False,
+                                 "error": "缺少 X-Review-Console 请求头"})
+                return False
         if (self.headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
             self._send(403, {"ok": False, "error": "跨站请求已被拒绝"})
             return False
@@ -664,9 +735,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_PUT(self):
+        if not self._guard_api():
+            return
         self._method_not_allowed()
 
     def do_PATCH(self):
+        if not self._guard_api():
+            return
         self._method_not_allowed()
 
     def do_OPTIONS(self):
@@ -677,7 +752,9 @@ class Handler(BaseHTTPRequestHandler):
     def _json_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length > self.MAX_JSON_BODY:
-            # 读入前就拒，避免把超大 body 全量读进内存
+            # 读入前就拒，避免把超大 body 全量读进内存；
+            # 但 body 还在 socket 里，必须关连接，否则 keep-alive 下一条请求会错位。
+            self.close_connection = True
             self._send(413, {"ok": False,
                              "error": f"请求体超过 {self.MAX_JSON_BODY // 1024} KB 上限"})
             return None
@@ -721,15 +798,18 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         name = _safe_upload_name((q.get("name") or [""])[0])
         if not name:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False, "error": "文件名无效"}
         ext = os.path.splitext(name)[1].lower()
         if ext not in UPLOAD_ALLOWED:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False, "error": f"不支持的文件类型：{ext or '无扩展名'}"}
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except (TypeError, ValueError):
             length = 0
         if length <= 0:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False, "error": "文件为空"}
         is_binary = ext in UPLOAD_BINARY_EXTS
         limit = UPLOAD_MAX_BINARY_BYTES if is_binary else UPLOAD_MAX_BYTES
@@ -829,15 +909,18 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         name = _safe_upload_name((q.get("name") or [""])[0])
         if not name:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False, "error": "文件名无效"}
         ext = os.path.splitext(name)[1].lower()
         if ext not in UPLOAD_ALLOWED:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False, "error": f"不支持的文件类型：{ext or '无扩展名'}"}
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except (TypeError, ValueError):
             length = 0
         if length <= 0:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False, "error": "文件为空"}
         is_binary = ext in UPLOAD_BINARY_EXTS
         limit = UPLOAD_MAX_BINARY_BYTES if is_binary else UPLOAD_MAX_BYTES
@@ -845,6 +928,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return {"ok": False, "error": f"文件超过 {limit // (1024 * 1024)} MB 限制"}
         if len(_list_purpose_records()) >= PURPOSE_STAGE_MAX:
+            self.close_connection = True   # body 未读，避免 keep-alive 错位
             return {"ok": False,
                     "error": f"目的文件暂存已满（{PURPOSE_STAGE_MAX} 个），"
                              "请先删除不用的目的文件"}
@@ -1640,8 +1724,17 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": str(e)}
 
         base_url = str(data.get("base_url") or "").strip().rstrip("/")
-        if base_url and not (base_url.startswith("http://") or base_url.startswith("https://")):
-            return {"ok": False, "error": "Base URL 必须以 http:// 或 https:// 开头"}
+        effective_base = base_url or base.base_url
+        if _url_has_userinfo(effective_base):
+            # userinfo 会原样回显并写进 llm_history.json，等于明文留凭据
+            return {"ok": False,
+                    "error": "Base URL 不允许包含用户名/密码（userinfo）"}
+        if base_url:
+            if not (base_url.startswith("http://") or base_url.startswith("https://")):
+                return {"ok": False,
+                        "error": "Base URL 必须以 http:// 或 https:// 开头"}
+            if _url_netloc(base_url) is None:
+                return {"ok": False, "error": "Base URL 格式不合法"}
 
         # 草稿优先：用户刚填的超时与 token 预算必须生效。
         # 思考型模型(deepseek-r1 / qwen3 系列)思考链会先吃满 max_tokens，
@@ -1666,10 +1759,25 @@ class Handler(BaseHTTPRequestHandler):
             cfg.model = model
         if data.get("clear_key"):
             cfg.api_key = ""
+            key_supplied = False
         else:
             key = str(data.get("api_key") or "").strip()
+            key_supplied = bool(key)
             if key:
                 cfg.api_key = key
+
+        # 防「沿用旧 Key 测试新 host」：_save_llm_config / _restore_llm_history
+        # 都有这道校验，只有试连曾漏掉——那等于把真 Key 交给任意 host。
+        # 本机 / 局域网端点不需要 Key：允许试连，但必须把继承来的 Key 清掉。
+        if base.api_key and not key_supplied and cfg.api_key:
+            saved_netloc = _url_netloc(base.base_url)
+            target_netloc = _url_netloc(cfg.base_url)
+            if target_netloc != saved_netloc:
+                if llm_client._is_local(cfg.base_url):
+                    cfg.api_key = ""
+                else:
+                    return {"ok": False,
+                            "error": "切换服务商后请重新填写 API Key"}
 
         if not cfg.available:
             return {"ok": False, "error": "缺少 API Key（且不是本地端点），无法测试"}

@@ -22,6 +22,7 @@
 反向也成立：**没超限的要记"已核验"**——因为"查了没问题"和"没查"是
 两件事，报告必须能分开说。
 """
+import datetime
 import os
 import re
 import sys
@@ -85,11 +86,116 @@ def _guard_quote_clause(sent, words):
     return any(w in sent for w in words)
 
 
+# 第十九条是分档的，不是一句「六个月」：
+#   3 个月以上不满 1 年 → 1 个月；1 年以上不满 3 年 → 2 个月；
+#   3 年以上固定期限 / 无固定期限 → 6 个月；不满 3 个月 / 以完成一定工作任务为期限 → 不得约定。
+# 扁平按 6 个月放行会把「一年期合同 + 四个月试用期」认证成合规（已实测）。
+_TERM_RE = re.compile(
+    r"(?:劳动)?合同期限(?:为|是|：|:)?\s*" + _NUM + r"\s*(个月|月|年)")
+_TERM_SHORT_RE = re.compile(
+    r"本合同(?:为)?\s*" + _NUM + r"\s*年(?:期)?"
+    r"(?:固定期限|期限)?(?:劳动合同)?")
+_DATE_RANGE_RE = re.compile(
+    r"自\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(?:起|开始)?\s*"
+    r"至\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(?:止|结束)?")
+# 试用期工资：同时支持「60%」「百分之六十」「百分之 60」。
+_SALARY_RE = re.compile(
+    r"试用期[^。；\n]{0,24}?工资[^。；\n]{0,24}?"
+    r"(?:百分之\s*" + _NUM + r"|(\d+(?:\.\d+)?)\s*[%％])")
+
+
+def _date_range_months(sent):
+    """把「自 2026 年 1 月 1 日起至 2029 年 12 月 31 日止」换算成月数。
+
+    按“起止日都包含”算天数，再按 30.4375 天/月折算并四舍五入：
+    一年期合同会得到 12 个月，不会被 365/30 算成 11 个月而错降一档。
+    日期非法/倒置 → None（交给调用方按“无法定档”处理）。
+    """
+    m = _DATE_RANGE_RE.search(sent or "")
+    if not m:
+        return None
+    try:
+        start = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        end = datetime.date(int(m.group(4)), int(m.group(5)), int(m.group(6)))
+    except ValueError:
+        return None
+    days = (end - start).days + 1
+    if days <= 0:
+        return None
+    return round(days / 30.4375)
+
+
+def _explicit_term_months(*sources):
+    """从若干段文本里抽「合同期限 N 年/月」；多个不同值 → None（不猜）。"""
+    values = set()
+    for source in sources:
+        for m in _TERM_RE.finditer(source or ""):
+            n = _to_num(m.group(1))
+            if n is not None:
+                values.add(n * 12 if m.group(2) == "年" else n)
+        for m in _TERM_SHORT_RE.finditer(source or ""):
+            n = _to_num(m.group(1))
+            if n is not None:
+                values.add(n * 12)
+    return int(next(iter(values))) if len(values) == 1 else None
+
+
+def _term_months(text, sent):
+    """返回 (合同期限月数 | None, 说明)。
+
+    优先级：同句日期区间 → 同句显式期限 → 全文唯一日期区间/显式期限 →
+    「无固定期限 / 以完成一定工作任务为期限」标记（同句优先）。
+    显式期限必须先于标记判断：一份合同同时出现「一年期」和引文里的
+    「无固定期限」时，不能把引文当成本合同的期限。
+    """
+    months = _date_range_months(sent)
+    if months is not None:
+        return months, "合同起止日期"
+    months = _explicit_term_months(sent)
+    if months is not None:
+        return months, "合同期限"
+
+    # 同句明确写了合同类型时，优先于全文里的其他期限：
+    # “另：无固定期限劳动合同的试用期不得超过六个月”不能被上一句的
+    # “一年期合同”带偏成 2 个月档。
+    if "以完成一定工作任务为期限" in (sent or ""):
+        return 0, "以完成一定工作任务为期限"
+    if "无固定期限" in (sent or ""):
+        return 36, "无固定期限"
+
+    months = _date_range_months(text)
+    if months is not None:
+        return months, "合同起止日期"
+    months = _explicit_term_months(text)
+    if months is not None:
+        return months, "合同期限"
+
+    if "以完成一定工作任务为期限" in (text or ""):
+        return 0, "以完成一定工作任务为期限"
+    if "无固定期限" in (text or ""):
+        return 36, "无固定期限"
+    return None, "合同期限未写明"
+
+
+def _probation_cap(term_months):
+    """按第十九条档位返回 (上限月数 | None, 档位说明)。"""
+    if term_months is None:
+        return None, "合同期限无法确定"
+    if term_months < 3:
+        return 0, "合同期限不满三个月"
+    if term_months < 12:
+        return 1, "合同期限三个月以上不满一年"
+    if term_months < 36:
+        return 2, "合同期限一年以上不满三年"
+    return 6, "合同期限三年以上/无固定期限"
+
+
 def check(text, min_conf=0.6):
     """返回 (issues, verified, skipped)。
 
-    `skipped` 非空表示「本该跑但法条库缺条文」——必须由调用方写进
-    limitations。静默跳过等于报告正常但少跑一整类检查，那比报错更危险。
+    `skipped` 非空表示「本该跑但判不了」——法条库缺条文，或合同期限未写明
+    导致试用期档位无法确定。必须由调用方写进 limitations：静默跳过等于
+    报告正常但少跑一整类检查，那比报错更危险。
     """
     issues, verified = [], []
     try:
@@ -107,34 +213,76 @@ def check(text, min_conf=0.6):
                                   ("劳动合同法 第二十四条 竞业限制期限", art24))
                if not art]
 
+    skip_notes = []
+
     for sent in _sentences(text):
         # ---- 1) 试用期时长 ----
+        term_months, _term_reason = _term_months(text, sent)
+        cap, cap_label = _probation_cap(term_months)
         for m in re.finditer(r"试用期[^。；\n]{0,24}?" + _NUM + r"\s*(个月|月|年)", sent):
             n = _to_num(m.group(1))
             if n is None:
                 continue
             months = n * 12 if m.group(2) == "年" else n
-            if months <= 6:
-                if art19:
-                    verified.append({
-                        "text": f"试用期约定 {m.group(1)}{m.group(2)}，未超法定上限 6 个月",
-                        "citation": _cite_dict(art19)})
-                continue
+            written = f"{m.group(1)}{m.group(2)}"
             quote_wrong = _guard_quote_clause(sent, ["不得超过", "不超过", "上限"])
-            issues.append({
-                "rule_id": "LAW-001",
-                "quote": sent,
-                "evidence": (f"《{art19['law_short']}》{art19['no_cn']}：试用期最长不得超过六个月"
-                             f"（三年以上固定期限/无固定期限）；本文写「{m.group(1)}{m.group(2)}」"
-                             f"≈{months:g} 个月，超出法定上限。"),
-                "severity": "major",
-                "confidence": 0.9 if not quote_wrong else 0.75,
-                "tool": "law_cite:试用期上限",
-                "citation": _cite_dict(art19),
-                "suggestion": ("按合同期限下调试用期：三个月以上不满一年→≤1 个月；"
-                               "一年以上不满三年→≤2 个月；三年以上/无固定期限→≤6 个月。"
-                               "超出部分已履行的，按第八十三条支付赔偿金。"),
-            })
+
+            # 合同期限定不了档：>6 个月仍违法（6 是任何档位的绝对上限）；
+            # ≤6 个月则只能说“判不了”，绝不能说“已核验”。
+            if cap is None:
+                if months > 6:
+                    issues.append({
+                        "rule_id": "LAW-001",
+                        "quote": sent,
+                        "evidence": (f"《{art19['law_short']}》{art19['no_cn']}：试用期最长不得超过六个月"
+                                     f"；本文写「{written}」≈{months:g} 个月，超出任何合同期限档位的上限。"),
+                        "severity": "major",
+                        "confidence": 0.9 if not quote_wrong else 0.75,
+                        "tool": "law_cite:试用期上限",
+                        "citation": _cite_dict(art19),
+                        "suggestion": ("按合同期限分档：三个月以上不满一年→≤1 个月；"
+                                       "一年以上不满三年→≤2 个月；三年以上/无固定期限→≤6 个月。"
+                                       "超出部分已履行的，按第八十三条支付赔偿金。"),
+                    })
+                else:
+                    note = (f"合同期限未写明，试用期「{written}」的档位无法确定"
+                            "（第十九条），本条未判「已核验」")
+                    if note not in skip_notes:
+                        skip_notes.append(note)
+                break
+
+            if cap == 0:
+                issues.append({
+                    "rule_id": "LAW-001",
+                    "quote": sent,
+                    "evidence": (f"《{art19['law_short']}》{art19['no_cn']}：{cap_label}"
+                                 "，不得约定试用期；本文写「" + written + "」。"),
+                    "severity": "major",
+                    "confidence": 0.9 if not quote_wrong else 0.75,
+                    "tool": "law_cite:试用期上限",
+                    "citation": _cite_dict(art19),
+                    "suggestion": "删除试用期约定，或把合同期限调整为三个月以上并重新约定。",
+                })
+                break
+
+            if months > cap:
+                issues.append({
+                    "rule_id": "LAW-001",
+                    "quote": sent,
+                    "evidence": (f"《{art19['law_short']}》{art19['no_cn']}：{cap_label}，"
+                                 f"试用期不得超过 {cap} 个月；本文写「{written}」≈{months:g} 个月，"
+                                 f"超出该档上限 {months - cap:g} 个月。"),
+                    "severity": "major",
+                    "confidence": 0.9 if not quote_wrong else 0.75,
+                    "tool": "law_cite:试用期上限",
+                    "citation": _cite_dict(art19),
+                    "suggestion": (f"按{cap_label}，试用期压到 {cap} 个月以内；"
+                                   "超出部分已履行的，按第八十三条支付赔偿金。"),
+                })
+            elif art19:
+                verified.append({
+                    "text": (f"试用期约定 {written}，未超{cap_label}的 {cap} 个月上限"),
+                    "citation": _cite_dict(art19)})
             break       # 一句只报一条，避免同一句里两个数字各报一次
 
         # ---- 2) 竞业限制期限 ----
@@ -162,13 +310,19 @@ def check(text, min_conf=0.6):
             break
 
         # ---- 3) 试用期工资比例 ----
-        for m in re.finditer(r"试用期[^。；\n]{0,24}?工资[^。；\n]{0,24}?"
-                             r"(\d+(?:\.\d+)?)\s*[%％]", sent):
-            pct = float(m.group(1))
+        for m in _SALARY_RE.finditer(sent):
+            if m.group(1):
+                pct = _to_num(m.group(1))
+                written = f"百分之{m.group(1)}"
+            else:
+                pct = float(m.group(2))
+                written = f"{m.group(2)}%"
+            if pct is None:
+                continue
             if pct >= 80:
                 if art20:
                     verified.append({
-                        "text": f"试用期工资为 {pct:g}%，不低于法定 80%",
+                        "text": f"试用期工资为 {written}，不低于法定 80%",
                         "citation": _cite_dict(art20)})
                 continue
             issues.append({
@@ -176,7 +330,7 @@ def check(text, min_conf=0.6):
                 "quote": sent,
                 "evidence": (f"《{art20['law_short']}》{art20['no_cn']}：试用期工资不得低于"
                              f"本单位相同岗位最低档工资或约定工资的百分之八十，且不得低于"
-                             f"当地最低工资标准；本文写 {pct:g}%，低于法定下限。"),
+                             f"当地最低工资标准；本文写 {written}，低于法定下限。"),
                 "severity": "major",
                 "confidence": 0.88,
                 "tool": "law_cite:试用期工资",
@@ -194,7 +348,7 @@ def check(text, min_conf=0.6):
             continue
         seen.add(key)
         uniq.append(it)
-    return uniq, verified, skipped
+    return uniq, verified, skipped + skip_notes
 
 
 def lookup(query, top_n=3):

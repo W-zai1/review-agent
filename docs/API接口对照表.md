@@ -3,8 +3,9 @@
 > 对象：`web/app.js`（前端，零依赖原生 JS） ↔ `server.py`（后端，标准库 `http.server`）
 > 维护约定：**任何一侧增删接口或改字段，必须同步更新本表 + `tests/test_api_contract.py`**，
 > 否则契约测试会红。本表与契约测试共同保证「前端调的每个接口都有后端代码，且字段对得上」。
+> 检索方式：**只写函数/符号名，不写行号**——行号会随代码漂移；定位时直接搜函数名。
 >
-> 最近核对：2026-10-26 · 契约测试 130 项全绿（`python -m unittest tests.test_api_contract -v`）
+> 最近核对：2026-10-29 · 契约测试以 `python -m unittest tests.test_api_contract -v` 的实际输出为准
 
 ## 1. 架构与请求链路
 
@@ -14,7 +15,8 @@
         │  API_BASE 来自 web/config.js（"" = 同源，部署时改这里）
         ▼
 server.py  Handler.do_GET / do_POST
-  ├─ _guard_api()        Host / Origin / Sec-Fetch-Site 防护（仅放行本机）
+  ├─ _guard_api()        Host + Origin(host,port) + Sec-Fetch-Site；带 Origin 的写请求
+  │                      还必须带 X-Review-Console: 1（仅放行本机）
   ├─ 静态路由            / → web/index.html；/static/<path> → web/
   └─ /api/* 业务 handler
         ├─ 规则库      tools/rules_store.py + config/rules.state.json
@@ -24,44 +26,44 @@ server.py  Handler.do_GET / do_POST
         └─ 完整性      tools/integrity.py + ledger/chain.log
 ```
 
-错误约定：所有 `/api/*` 一律返回 HTTP 200 + JSON（业务错误用 `{"ok": false, "error": "..."}`）；
-仅静态资源缺失与安全防护拒绝使用 403 / 404。前端 `api()` 只解析 JSON，
-非 JSON 响应会统一显示「响应解析失败（HTTP n）」。
+错误约定：所有 `/api/*` 业务错误一律返回 HTTP 200 + JSON（`{"ok": false, "error": "..."}`）；
+安全防护拒绝（Host / Origin 端口 / 缺 `X-Review-Console` / 跨站）用 403，静态资源缺失用 404。
+前端 `api()` 只解析 JSON，非 JSON 响应会统一显示「响应解析失败（HTTP n）」。
 
 ## 2. 接口对照总表（25 个前端调用点）
 
 | # | 前端调用点（app.js） | 方法 + 路径 | 后端 handler（server.py） | 响应契约（前端消费的字段） | 契约测试 |
 |---|---|---|---|---|---|
-| 1 | L130 `loadTargets` | GET `/api/targets` | `_targets` L324 | `items[].{name,rel,size,mtime,uploaded,role,reviewable}`；**排序 = 可审对象在前 + 组内 mtime 降序**（刚上传的排第一）；`role=labels`（`*.labels.json` 机读标注）`reviewable=false`，前端置灰不可选，后端 `_resolve_target` 直接拒绝 | TargetsTests |
-| 2 | L175 `uploadFile`（裸 fetch） | POST `/api/upload?name=` | `_upload` L339 | 文本：`ok` + `file.{name,rel,size}`；二进制：`ok` + `kind`(pdf/docx/image/zip) + `file`（首个可审对象） + `extracted[].{name,rel,chars,from,archive}` + `warnings[]` + `extractor` + `original`；图片额外经 OCR 转写，`warnings` 说明识别误差；失败 `error` | UploadTests + BinaryUploadTests |
+| 1 | `loadTargets` | GET `/api/targets` | `_targets` | `items[].{name,rel,size,mtime,uploaded,role,reviewable}`；**排序 = 可审对象在前 + 组内 mtime 降序**（刚上传的排第一）；`role=labels`（`*.labels.json` 机读标注）`reviewable=false`，前端置灰不可选，后端 `_resolve_target` 直接拒绝 | TargetsTests |
+| 2 | `uploadFile`（裸 fetch） | POST `/api/upload?name=` | `_upload` | 文本：`ok` + `file.{name,rel,size}`；二进制：`ok` + `kind`(pdf/docx/image/zip) + `file`（首个可审对象） + `extracted[].{name,rel,chars,from,archive}` + `warnings[]` + `extractor` + `original`；图片额外经 OCR 转写，`warnings` 说明识别误差；失败 `error` | UploadTests + BinaryUploadTests |
 | 2.5 | `uploadPurposeFile`（裸 fetch） | POST `/api/purpose/upload?name=` | `_purpose_upload` | `{ok,id,name,kind,chars,truncated,preview,warnings[],items[]}`；与 `/api/upload` 同一套白名单/体积上限/摄取链，但产物暂存 `state/purpose_uploads/`（**不进 targets/**），文本截断至 2000 字并记 warning；提取不到文本（扫描件/无 OCR）明确拒绝；暂存满 20 个拒绝 | PurposeUploadTests |
 | 2.6 | `loadPurposeFiles` | GET `/api/purpose/files` | `_list_purpose_records` | `{ok,items[]{id,name,kind,chars,truncated,created,preview}}`（**不含原文**，只给 80 字预览） | 同上 |
 | 2.7 | `removePurposeFile` | DELETE `/api/purpose/files?id=` | `_delete_purpose_record` | `{ok,id,items[]}`（删暂存记录 + `_originals/` 归档原件）；id 非法（含路径穿越）或不存在 → `{ok:false,error}` | 同上 |
 | 2.8 | `loadScenarios` | GET `/api/scenarios` | 内联（`scenario.public_list`） | `{ok,version,default,items[]{id,name,desc,keep_note,disabled_count,disabled_rules[],disabled_dimensions[]}}`；配置损坏时 `{ok:false,error,items:[]}`（前端把下拉置灰并显示原因，不当成「没有情境」） | ScenarioApiTests |
 | 2.9 | `loadFormatSpecs` | GET `/api/format-specs` | 内联（`format_spec.public_list`） | `{ok,version,default,items[]{id,name,source,desc,checks[],disabled_count,disabled_rules[]}}`；`checks` = 该规格会判哪几项（正文字体/字号/首行缩进/行距/标题层级/图表编号），前端塞进下拉选项文案；配置损坏时 `{ok:false,error,items:[]}` | FormatSpecApiTests |
-| 3 | L304 `loadReports` | GET `/api/reports` | `_reports` | `items[].{id,verdict,target_type,target_path,target_name,review_mode,timestamp,issues,stats{blocker,major,minor,nit},report_hash,favorite,mtime}`；`favorites[]`=已收藏 ID。**排序唯一依据 `(timestamp, id)` 倒序，最新在最前**（不再有 `order`） | ReportsLogsIntegrityTests |
-| 4 | L424 `selectReport` | GET `/api/report?id=` | `_report` L574 | `ok`；`report.{review_id,verdict,review_mode,target_path,timestamp,stats,coverage,limitations,issues[]}` | 同上 |
-| 5 | L503 `loadIntegrity` | GET `/api/integrity` | `_integrity` L769 | `{ok,chain_ok,entries[]{seq,review_id,report_hash,report_hash_short,prev_hash,ts,ok,op,deleted,deleted_at},reports[]{id,ok,rules_ok,stale,rules_version,verdict,hash_short},broken_at,stale_count,rules_version,detail}` | 同上 + EmptyIntegrityTests |
+| 3 | `loadReports` | GET `/api/reports` | `_reports` | `items[].{id,verdict,target_type,target_path,target_name,review_mode,timestamp,issues,stats{blocker,major,minor,nit},report_hash,favorite,mtime}`；`favorites[]`=已收藏 ID。**排序唯一依据 `(timestamp, id)` 倒序，最新在最前**（不再有 `order`） | ReportsLogsIntegrityTests |
+| 4 | `selectReport` | GET `/api/report?id=` | `_report` | `ok`；`report.{review_id,verdict,review_mode,target_path,timestamp,stats,coverage,limitations,issues[]}` | 同上 |
+| 5 | `loadIntegrity` | GET `/api/integrity` | `_integrity` | `{ok,chain_ok,entries[]{seq,review_id,report_hash,report_hash_short,prev_hash,ts,ok,op,deleted,deleted_at},reports[]{id,ok,rules_ok,stale,rules_version,verdict,hash_short},broken_at,stale_count,rules_version,detail}` | 同上 + EmptyIntegrityTests |
 | 5.4 | `markFalsePositive` / `markFalseNegative` | POST `/api/annotations` | `_add_annotation` | body `{kind, by, report_id?, issue_id?, target_path?, quote?, dimension?}` → `{ok,annotation{...}}`；`quote` 必须逐字出现在被审文本，否则 `{ok:false,error}`（**只能写标注，不能写规则库**） | LearningApiTests |
 | 5.6 | （控制台未接） | GET `/api/annotations?id=` | 内联 | `{ok,items[]{ts,kind,by,target_path,quote,dimension,report_id,issue_id,note,trusted}}` | LearningApiTests |
 | 5.7 | （控制台未接） | GET `/api/learning` | `rule_learning.summary` | `{ok,rules_version,annotations,negatives,candidates,by_status,promoted[],rolled_back[],auto_this_week,quota_week}`（只读） | LearningApiTests |
 | 5.8 | `loadCandidates`（规则库右上角） | GET `/api/candidates` | `rule_learning.console_candidates` | `{ok,count,pending,items[]{candidate_id,dimension,status,severity,anchor,pattern,require,guard,desc,suggestion,confidence,provenance[]{doc,quote,by,ts},metrics{corpus_size,hit_doc_count,offtarget_count,internal_offtarget_count,suppressed_others,redundant_count,redundant_covered_by[],offtarget_docs[]},gate{passed,reasons[]},human_review{decision,decided_at,by,note},pending}}`；待审（pending）排在最前 | CandidateReviewApiTests |
 | 5.9 | `decideCandidate`（批准/拒绝） | POST `/api/candidates/decide` | `_decide_candidate` | body `{candidate_id, decision:approve\|reject, note?, by?}` → `{ok,candidate_id,decision,dimension,status,human_review{...},next_step}`；**只写候选文件的 `human_review`，不动 rules/**；candidate_id 非法（含路径穿越）与 decision 非法均返回 `{ok:false,error}`；服务端设 `REVIEW_AGENT_ANNOTATION_TOKEN` 时需 `X-Review-Token` 头 | 同上 |
 | 5.5 | `loadAgents` | GET `/api/agents` | 内联 | `{ok,items[]{id,name,version,description,auto,dimensions[]{id,label,color},target_types[],checks[],boundaries[],rules}}`；manifest 无效时该项带 `error` 字段而不是整体 500 | AgentApiTests |
-| 6 | L572 `loadRules` | GET `/api/rules` | `_rules` L585 | `{ok,items[]{rule_id,dimension,desc,severity,method,source,file,enabled,capability{kind,executor,label}},total,enabled,dimensions,execution{deterministic,declarative,prompt_only}}` | RulesTests |
-| 7 | L608 `toggleRule` | POST `/api/rules/toggle` | `_toggle_rule` L615 | `{ok,rule_id,enabled,enabled_count,total}` | 同上 |
-| 8 | L631 `loadLogs` | GET `/api/logs?id=` | `_logs` L641 | `{ok,id,task{steps[]{step,name,status,ts,latency_ms,detail{}},final_status},decisions[]{ts,decision,rule_id,rationale,alternatives,why_not_alternative},tools[]{ts,tool,input,output_summary,latency_ms,status,retry},cost{total_latency_ms,llm_*}}` | ReportsLogsIntegrityTests |
+| 6 | `loadRules` | GET `/api/rules` | `_rules` | `{ok,items[]{rule_id,dimension,desc,severity,method,source,file,enabled,capability{kind,executor,label}},total,enabled,dimensions,execution{deterministic,declarative,prompt_only}}` | RulesTests |
+| 7 | `toggleRule` | POST `/api/rules/toggle` | `_toggle_rule` | `{ok,rule_id,enabled,enabled_count,total}` | 同上 |
+| 8 | `loadLogs` | GET `/api/logs?id=` | `_logs` | `{ok,id,task{steps[]{step,name,status,ts,latency_ms,detail{}},final_status},decisions[]{ts,decision,rule_id,rationale,alternatives,why_not_alternative},tools[]{ts,tool,input,output_summary,latency_ms,status,retry},cost{total_latency_ms,llm_*}}` | ReportsLogsIntegrityTests |
 | 9 | `startReview` | POST `/api/review/start` | `_start_review` | body `{file, llm?, type?, agent?, purpose?, purpose_files?, scenario?}`；`scenario` = 审查情境 id（`general` / `resume-screening`，见 §3.6；未知 id 直接返回 `{ok:false,error}`，错误文案含「未知审查情境」，**不起任务**）；`purpose` = 「审查目的」（≤300 字，控制字符清洗后经 `--purpose` 传给子进程）；`purpose_files` = 暂存的目的文件 id 数组（≤5，启动前校验，id 不存在/超量直接 `{ok:false,error}` 不起任务）；两者可同时用，服务端组装成一段目的并经 `--purpose-max <实际字数>` 告知解析上限（文件类目的可超 300 字）；`{ok,job_id}`；冲突时 `error` 含「进行中」；未知 `agent` 直接返回 `{ok:false,error:"未知 Agent：…；可选：…"}`（**不启动任务**）；报告新增 `purpose{text,lexicon_version,intents[],terms[],goals[]{id,intent,question,status,evidence_ids[]},evidence[]{id,quote,start,relation,source,rule_id,goal_id,goal_ids[],intent_id,relevance,rationale,judged},judge{mode,calls,error,judged,unjudged},limitations[]}`，未填目的时为 `null` | AsyncReviewTests + AgentApiTests + PurposeApiTests + PurposeUploadTests |
-| 10 | L784 `pollJob` | GET `/api/review/status?job=` | `_review_status` L692 | `{ok,job{id,file,status,created,finished,report_id,error,llm,type},steps[]{step,name,status,ts,latency_ms},report}` | 同上 |
-| 11 | L861 `loadProviders` | GET `/api/llm/providers` | 内联 L239 | `{ok,items[]{id,name,base_url,model,models[],needs_key,local,hint}}` | LlmConfigTests |
-| 12 | L918 `loadLlmStatus` | GET `/api/llm/status` | `_llm_status` L845 | `{ok,enabled,available,base_url,endpoint,model,api_key(masked),api_key_set,timeout,max_retries,max_tokens,source,local_override}` | 同上 |
-| 13 | L1002 `saveLlm` | POST `/api/llm/config` | `_save_llm_config` L855 | `{ok,saved,status{…同 12}}`；校验失败 `error` | 同上 |
-| 14 | L1044 `testLlm` | POST `/api/llm/test` | `_test_llm` L936 | 成功 `{ok,model,endpoint,latency_ms,usage,reply,note}`；`reply` 为空时 `note` 给出原因（思考型模型 token 预算不足）；失败 `{ok:false,error}` | 同上 |
-| 15 | L1074 `resetLlm` | POST `/api/llm/reset` | `_reset_llm_config` L988 | `{ok,status{…同 12}}` | 同上 |
-| 16 | L393 `confirmDeleteReport` | **DELETE** `/api/report?id=` | `_delete_report` L500 | 成功 `{ok,id,moved[],trash,ledger_tombstone}`；未确认 `{ok:false,need_confirm:true,error}` | ReportManagementTests |
-| 17 | L448 `toggleFavorite` | POST `/api/reports/favorite` | `_set_favorite` | body `{id:"R-xxx", favorite:true|false}` → `{ok,id,favorite,favorites[]}`；`favorite` 非布尔 / id 格式非法 / 报告不存在 → `{ok:false,error}`；重复收藏幂等 | ReportManagementTests |
-| 18 | L976 `loadLlmHistory` | GET `/api/llm/history` | `_load_llm_history()` | `{ok,items[]{base_url,model,api_key_set,last_used_at}}`（最近 12 条，**不含 Key 明文**） | LlmMemoryTests |
-| 19 | L1013 `applyHistoryItem` | POST `/api/llm/history/restore` | `_restore_llm_history` L994 | `{ok,status{…同 12}}`；换 host 且无 Key → `{ok:false,error}` | 同上 |
+| 10 | `pollJob` | GET `/api/review/status?job=` | `_review_status` | `{ok,job{id,file,status,created,finished,report_id,error,llm,type},steps[]{step,name,status,ts,latency_ms},report}` | 同上 |
+| 11 | `loadProviders` | GET `/api/llm/providers` | 内联 | `{ok,items[]{id,name,base_url,model,models[],needs_key,local,hint}}` | LlmConfigTests |
+| 12 | `loadLlmStatus` | GET `/api/llm/status` | `_llm_status` | `{ok,enabled,available,base_url,endpoint,model,api_key(masked),api_key_set,timeout,max_retries,max_tokens,source,local_override}` | 同上 |
+| 13 | `saveLlm` | POST `/api/llm/config` | `_save_llm_config` | `{ok,saved,status{…同 12}}`；校验失败 `error` | 同上 |
+| 14 | `testLlm` | POST `/api/llm/test` | `_test_llm` | 成功 `{ok,model,endpoint,latency_ms,usage,reply,note}`；`reply` 为空时 `note` 给出原因（思考型模型 token 预算不足）；失败 `{ok:false,error}` | 同上 |
+| 15 | `resetLlm` | POST `/api/llm/reset` | `_reset_llm_config` | `{ok,status{…同 12}}` | 同上 |
+| 16 | `confirmDeleteReport` | **DELETE** `/api/report?id=` | `_delete_report` | 成功 `{ok,id,moved[],trash,ledger_tombstone}`；未确认 `{ok:false,need_confirm:true,error}` | ReportManagementTests |
+| 17 | `toggleFavorite` | POST `/api/reports/favorite` | `_set_favorite` | body `{id:"R-xxx", favorite:true|false}` → `{ok,id,favorite,favorites[]}`；`favorite` 非布尔 / id 格式非法 / 报告不存在 → `{ok:false,error}`；重复收藏幂等 | ReportManagementTests |
+| 18 | `loadLlmHistory` | GET `/api/llm/history` | `_load_llm_history()` | `{ok,items[]{base_url,model,api_key_set,last_used_at}}`（最近 12 条，**不含 Key 明文**） | LlmMemoryTests |
+| 19 | `applyHistoryItem` | POST `/api/llm/history/restore` | `_restore_llm_history` | `{ok,status{…同 12}}`；换 host 且无 Key → `{ok:false,error}` | 同上 |
 
 后端另提供 1 个**前端未调用**的兼容接口：`POST /api/review`（`_run_review` L777，
 同步跑 `review.py` 返回最新报告，供命令行/脚本使用；同样支持 `purpose` / `purpose_files`；

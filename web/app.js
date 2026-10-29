@@ -65,7 +65,11 @@ function esc(value) {
 }
 
 function api(path, opts) {
-  return fetch(API_BASE + path, opts).then(async (res) => {
+  // 所有写请求都带自定义头：跨站页面无法在不触发预检的情况下伪造它
+  const options = Object.assign({}, opts);
+  options.headers = Object.assign(
+    { "X-Review-Console": "1" }, (opts && opts.headers) || {});
+  return fetch(API_BASE + path, options).then(async (res) => {
     try {
       return await res.json();
     } catch (e) {
@@ -215,7 +219,7 @@ async function uploadFile(file) {
   try {
     const res = await fetch(
       `${API_BASE}/api/upload?name=${encodeURIComponent(file.name)}`,
-      { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file }
+      { method: "POST", headers: { "Content-Type": "application/octet-stream", "X-Review-Console": "1" }, body: file }
     );
     let data = null;
     try { data = await res.json(); } catch (e) { data = null; }
@@ -1441,7 +1445,7 @@ async function loadPurposeFiles() {
 async function uploadOnePurposeFile(file) {
   const res = await fetch(
     `${API_BASE}/api/purpose/upload?name=${encodeURIComponent(file.name)}`,
-    { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file }
+    { method: "POST", headers: { "Content-Type": "application/octet-stream", "X-Review-Console": "1" }, body: file }
   );
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }

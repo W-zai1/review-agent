@@ -208,12 +208,17 @@ class LLMConfig:
         return bool(self.api_key) or _is_local(self.base_url)
 
     def masked_key(self):
+        """只回显前缀，绝不回显末几位。
+
+        `sk-` 这类公共前缀不构成秘密；末 4 位是真值的一部分，连同前 4 位
+        足以在低熵 Key 上爆破出大部分内容。
+        """
         key = self.api_key or ""
         if not key:
             return ""
         if len(key) <= 8:
             return "***"
-        return f"{key[:4]}…{key[-4:]}"
+        return f"{key[:3]}…"
 
     def public_dict(self):
         return {
