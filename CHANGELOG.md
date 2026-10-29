@@ -44,6 +44,19 @@
 
 # 2026-10-29
 
+### 2026-10-29 · 新增/修复 · 控制台长任务、冻结式 holdout、金标准防假绿灯、配置静默失效（v0.9.1）
+
+- **文件**：`server.py`、`web/app.js`、`tools/holdout_eval.py`（新增）、`checks/test_console_reliability.py`（新增）、`checks/test_holdout.py`（新增）、`holdout/README.md` + `holdout/cases/.gitkeep` + `holdout/labels/.gitkeep`（新增）、`tools/golden_eval.py`、`tools/llm_client.py`、`review.py`、`checks/test_invariants.py`、`.gitignore`、`VERSION`、`README.md`、`docs/API接口对照表.md`；`docs/盲测协议.md` 增补（该文件被 gitignore，仅本地）
+- **改了什么**：
+  1. **控制台长任务**：审查超时从写死 300s 改为 `REVIEW_TIMEOUT`（默认 1800s，`--review-timeout` > `REVIEW_AGENT_REVIEW_TIMEOUT` > 默认，clamp 30–86400）；同步/异步两条链路都带实际 `timeout` 字段与超时文案。服务启动时扫 `logs/.jobs/*.jsonl`：能按「目标 + 时间窗」对上报告就恢复 `done`，对不上就明确 `error`（永不伪造 running）；清理 7 天前进度文件。前端 `pollJob` 加 `clearTimeout`、try/catch、连续 3 次失败才提示（1s/2s 退避），后台标签页暂停、回前台恢复。
+  2. **holdout**：新增 `tools/holdout_eval.py`。`holdout/cases/*.txt` + `holdout/labels/*.labels.json` 与 `tests/golden/` 物理隔离；`--save-manifest` 生成 sha256 清单，缺清单/多文件/少文件/改一个字节都退出 2，拒绝出分；recall/precision 给 Wilson 95% 置信区间；空 holdout 退出 2 并提示先收 30–50 份真实文档。`holdout/README.md` 写清“先盲标、后看模型、冻结后不调参”。
+  3. **金标准防假绿灯**：`golden_eval.regressed()` 不再只比 `labels_hit` 绝对数；召回率下降、误报上升、基线用例被删/改名都判回归（新增 3 项测试）。
+  4. **配置/锁/契约**：`llm_client.load_config` 真正传 `chunking/chunk_chars/chunk_overlap`（此前 yaml/UI 改了也不生效），并补环境变量；`review.py` 的 review_id 锁加 `atexit` 兜底清理（异常退出不再留 `.R-*.lock`）；报告加 `schema_version: "1.1"`。
+- **为什么**：300s 硬超时让长文 + LLM 在控制台必然失败（202 份报告只有 33 份 LLM、1 份分块）；`JOBS` 纯内存导致服务重启后前端永久停在“审查中…”；`pollJob` 无 try/catch，fetch 一断就永不复原；金标准只看绝对命中数，新增用例会掩盖召回下降；`chunking` 等配置项从 yaml 读进来却没进 `LLMConfig`，用户调参无效且无告警；`id_lock.unlink()` 不在 `finally`，异常路径会漏锁。
+- **验证**：全量 `python -m unittest discover -s tests -v` → **642 项 OK / 233.2s**；契约 `tests.test_api_contract` → **158 项 OK / 156.0s**；公开 `python -m unittest discover -s checks -v` → **48 项 OK**；`node --check web/app.js` 通过；`python tools/holdout_eval.py` 在空目录 → 退出 2 并打印“没有真实 holdout 文档”；金标准 **38 用例 / 26 标注 / 召回 100% / 误报 0**。超时单测覆盖默认/env/clamp/CLI 优先级；job 恢复覆盖有报告→done、无报告→error、超时标记、其他目标不误配。
+
+# 2026-10-29
+
 ### 2026-10-29 · 修复 · 法条分档/覆盖率真话/控制台安全边界，补可复现基线与 CI（v0.9.0）
 
 - **文件**：`tools/law_cite.py`、`review.py`、`server.py`、`tools/llm_client.py`、`web/app.js`、`tools/version.py`（新增）、`VERSION`（新增）、`requirements.txt`（新增）、`.github/workflows/ci.yml`（新增）、`checks/test_invariants.py`（新增）、`tests/golden/cases/p21_law_probation_tier.txt` / `p22_law_probation_tier2.txt` / `p23_law_salary_chinese.txt` 及对应 labels（新增）、`tests/golden/baseline.json`、`README.md`、`docs/API接口对照表.md`；本地回归另改 `tests/test_law_library.py`、`tests/test_api_contract.py`，新增 `tests/test_coverage_truth.py`（`tests/` 不入库，公开仓库以 `checks/` 为准）

@@ -98,6 +98,28 @@ def render(res, baseline):
     return "\n".join(lines)
 
 
+def regressed(res, baseline):
+    """返回 (是否回归, 原因列表)。
+
+    旧逻辑只比 `labels_hit` 的绝对数：从 23 条加到 26 条时，即使新用例
+    漏了 1 条（25 > 23），也会被判"没变差"。这里按召回率、误报数、
+    基线用例是否被删三条一起看。
+    """
+    reasons = []
+    base_cases = {c.get("case") for c in (baseline.get("cases") or [])}
+    new_cases = {c.get("case") for c in (res.get("cases") or [])}
+    missing = sorted(base_cases - new_cases)
+    if missing:
+        reasons.append(f"基线用例被删/改名 {len(missing)} 个：{'、'.join(missing[:5])}")
+    if res.get("recall_pct", 0) < baseline.get("recall_pct", 0):
+        reasons.append(
+            f"召回下降 {baseline.get('recall_pct', 0)}% → {res.get('recall_pct', 0)}%")
+    if res.get("fp_total", 0) > baseline.get("fp_total", 0):
+        reasons.append(
+            f"误报上升 {baseline.get('fp_total', 0)} → {res.get('fp_total', 0)}")
+    return bool(reasons), reasons
+
+
 def main():
     ap = argparse.ArgumentParser(description="金标准测试集批量评测")
     ap.add_argument("--save-baseline", action="store_true",
@@ -142,10 +164,11 @@ def main():
         return
 
     if baseline:
-        worse = (res["labels_hit"] < baseline["labels_hit"]
-                 or res["fp_total"] > baseline["fp_total"])
+        worse, reasons = regressed(res, baseline)
         print(f"对比基线：召回 {baseline['recall_pct']}% → {res['recall_pct']}%，"
               f"误报 {baseline['fp_total']} → {res['fp_total']}")
+        for r in reasons:
+            print(f"  [回归] {r}")
         sys.exit(1 if worse else 0)
 
 

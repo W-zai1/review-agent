@@ -53,6 +53,8 @@ const state = {
   integrity: null,
   job: null,
   poll: null,
+  pollFails: 0,
+  pollBusy: false,
   tab: "review",
   purposeFiles: [],
 };
@@ -2708,40 +2710,94 @@ async function startReview(llmOverride) {
   pollJob();
 }
 
-async function pollJob() {
-  if (!state.job) return;
-  const jobId = state.job.id;
-  const data = await api("/api/review/status?job=" + encodeURIComponent(jobId));
-  if (!data.ok) {
-    toast(data.error || "查询进度失败", true);
-    state.job = null;
-    updateRunState();
+function schedulePoll(delay) {
+  clearTimeout(state.poll);
+  state.poll = null;
+  // 后台标签页不跑轮询：回到前台由 visibilitychange → resumePoll() 恢复。
+  if (!state.job || document.hidden) return;
+  state.poll = setTimeout(pollJob, delay);
+}
+
+// 网络抖动 / 服务重启时不要一次失败就断链：第 1、2 次静默退避，
+// 连续 3 次才提示并收起任务、恢复按钮。成功一次就清零。
+function retryPoll(message) {
+  state.pollFails = (state.pollFails || 0) + 1;
+  if (state.pollFails < 3) {
+    schedulePoll(state.pollFails === 1 ? 1000 : 2000);
     return;
   }
-  state.job = data.job;
-  renderProgress(data.steps || [], state.selected ? state.selected.name : "");
-  if (data.job.status === "running") {
-    state.poll = setTimeout(pollJob, 350);
-    return;
-  }
-  if (data.job.status === "done" && data.report) {
-    state.currentReport = data.report;
-    state.currentLog = data.report.review_id;
-    renderReport(data.report);
-    // 跑完就把步骤条收起：结论已经出来了，进度条再占一块只会把裁定往下推
-    const progress = $("#progressCard");
-    if (progress) progress.classList.add("hidden");
-    await loadReports();
-    await loadIntegrity();
-    renderHistory();
-    populateLogSelect();
-    if (state.tab === "logs") loadLogs(state.currentLog);
-    toast(`审查完成：${data.report.review_id} · ${String(data.report.verdict).toUpperCase()}`);
-  } else {
-    toast(`审查失败：${data.job.error || "未知错误"}`, true);
-  }
-  state.job = data.job;
+  toast(message || "查询进度失败", true);
+  state.pollFails = 0;
+  state.job = null;
+  state.poll = null;
   updateRunState();
+}
+
+function pausePoll() {
+  if (state.poll) {
+    clearTimeout(state.poll);
+    state.poll = null;
+  }
+}
+
+function resumePoll() {
+  if (document.hidden || !state.job) return;
+  if (state.job.status !== "running") return;
+  if (state.poll || state.pollBusy) return;
+  state.pollFails = 0;
+  pollJob();
+}
+
+async function pollJob() {
+  clearTimeout(state.poll);
+  state.poll = null;
+  if (!state.job) return;
+  // 后台标签页暂停轮询，避免白跑请求；回前台时恢复。
+  if (document.hidden) return;
+  if (state.pollBusy) return;
+  state.pollBusy = true;
+  const jobId = state.job.id;
+  try {
+    let data;
+    try {
+      data = await api("/api/review/status?job=" + encodeURIComponent(jobId));
+    } catch (e) {
+      retryPoll((e && e.message) || "查询进度失败");
+      return;
+    }
+    if (!data || !data.ok || !data.job) {
+      retryPoll((data && data.error) || "查询进度失败");
+      return;
+    }
+    state.pollFails = 0;
+    state.job = data.job;
+    renderProgress(data.steps || [], state.selected ? state.selected.name : "");
+    if (data.job.status === "running") {
+      // 正常节奏保持 350ms；失败重试才用 1s/2s。
+      schedulePoll(350);
+      return;
+    }
+    if (data.job.status === "done" && data.report) {
+      state.currentReport = data.report;
+      state.currentLog = data.report.review_id;
+      renderReport(data.report);
+      // 跑完就把步骤条收起：结论已经出来了，进度条再占一块只会把裁定往下推
+      const progress = $("#progressCard");
+      if (progress) progress.classList.add("hidden");
+      await loadReports();
+      await loadIntegrity();
+      renderHistory();
+      populateLogSelect();
+      if (state.tab === "logs") loadLogs(state.currentLog);
+      toast(`审查完成：${data.report.review_id} · ${String(data.report.verdict).toUpperCase()}`);
+    } else {
+      toast(`审查失败：${data.job.error || "未知错误"}`, true);
+    }
+    state.job = data.job;
+    updateRunState();
+  } finally {
+    state.pollBusy = false;
+  }
 }
 
 async function runExample() {
@@ -3253,9 +3309,17 @@ async function init() {
     }
   });
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshReports();
+    if (document.hidden) {
+      pausePoll();
+      return;
+    }
+    refreshReports();
+    resumePoll();
   });
   window.addEventListener("focus", () => refreshReports());
+  // 页面卸载 = 轮询链必须断掉，不能留下 setTimeout 继续发请求。
+  window.addEventListener("pagehide", pausePoll);
+  window.addEventListener("beforeunload", pausePoll);
 
   await loadProviders();
   await loadLlmStatus();

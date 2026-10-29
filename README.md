@@ -1,7 +1,7 @@
-# 审查 Agent 项目（Demo v0.9.0）
+# 审查 Agent 项目（Demo v0.9.1）
 
 > 来源定义：`review-agent-framework.md`（已随仓库归档，审查 Agent 框架定义 v0.2，Demo 版）
-> 当前实现：v0.9.0 —— 修正法条分档与中文数字（试用期不再一律按 6 个月放行）、覆盖率如实反映失败块、控制台收紧 Origin/自定义头并堵住 Key 外送；补齐依赖清单、可公开的 `checks/` 与 CI。
+> 当前实现：v0.9.1 —— 控制台长任务可配置超时（默认 1800s）并在重启后恢复/清理任务状态，前端轮询支持退避与后台暂停；新增冻结式真实 holdout 评测器（sha256 清单 + Wilson 置信区间）；金标准比较改为按召回率/误报/用例缺失判回归；分块配置不再静默失效。
 > 定位：个人日常 / Demo。只读、独立裁判、可举证、可迭代。**跑通一次完整审查闭环**即可。
 >
 > 改动流水见 **`CHANGELOG.md`**（逐条登记增删改：文件 / 改了什么 / 为什么 / 怎么验的）。
@@ -187,6 +187,10 @@ python -m unittest discover -s tests -v
 # 公开不变量（随仓库走，CI 跑这套；不含敏感样本）
 python -m unittest discover -s checks -v
 
+# 真实 holdout 验收（自备 30–50 份未参与调参的文档；空目录会退出 2，不伪造 0 分）
+python tools/holdout_eval.py --save-manifest
+python tools/holdout_eval.py --min-recall 0.80 --min-precision 0.90
+
 # 金标准评测（召回/误报不允许低于基线）
 python tools/golden_eval.py
 
@@ -305,8 +309,10 @@ review-agent/
 
 **启动：**
 ```bash
-# 方式一：命令行（可指定端口，缺省 8000）
+# 方式一：命令行（可指定端口，缺省 8000；审查超时缺省 1800s）
 python server.py --port 8000
+python server.py --port 8000 --review-timeout 3600   # 长文 + LLM 可调大（30–86400）
+# 也可用环境变量：set REVIEW_AGENT_REVIEW_TIMEOUT=3600
 
 # 方式二：双击 start-console.bat（纯 ASCII + CRLF，避免 cmd 代码页解析错位）
 start-console.bat 8000              # 启动并打开浏览器

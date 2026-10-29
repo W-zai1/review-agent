@@ -15,6 +15,7 @@ review.py —— 审查 Agent 主流程 S1~S6 (Demo v0.9.0)
     python review.py targets/answer_001.txt --llm      # 强制调用大模型 API
 """
 import importlib.util
+import atexit
 import os
 import sys
 import re
@@ -68,6 +69,23 @@ STATE = ROOT / "state"
 # 知识库缺口日志。None = 自动推断（见 _gap_log_path）：
 # 测试把 OUTPUTS 重定向到临时目录时，缺口也跟着走，不会污染真实 state/。
 GAP_LOG = None
+
+# review_id 锁的兜底清理。正常路径会 unlink；run_one 中间抛异常时，
+# 900 行的函数体没有统一的 finally（P1 拆分时再收），这里用 atexit 兜住
+# 进程退出，避免 server 子进程异常后留下 .R-*.lock 挡住后续分配。
+_ID_LOCKS = set()
+
+
+def _release_id_locks():
+    for lock in list(_ID_LOCKS):
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    _ID_LOCKS.clear()
+
+
+atexit.register(_release_id_locks)
 
 for d in (OUTPUTS, LEDGER, LOGS):
     d.mkdir(exist_ok=True)
@@ -2234,6 +2252,7 @@ def allocate_review_id(date):
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
+            _ID_LOCKS.add(lock)
             return review_id, lock
         except FileExistsError:
             seq += 1
@@ -3053,6 +3072,8 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         integrity.serialize_active_rules(active).encode("utf-8"))
 
     report = {
+        # 报告字段契约的版本：新增/删除顶层字段时改这里，读取方据此兼容。
+        "schema_version": "1.1",
         "review_id": review_id,
         "target_type": s.target_type,
         "target_type_source": "manual" if type_override else "auto",
@@ -3245,6 +3266,7 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         id_lock.unlink()
     except OSError:
         pass
+    _ID_LOCKS.discard(id_lock)
     return report
 
 

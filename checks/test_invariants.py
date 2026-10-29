@@ -11,9 +11,12 @@
 运行：
     python -m unittest discover -s checks -v
 """
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -24,6 +27,7 @@ import llm_client  # noqa: E402
 import review  # noqa: E402
 import server  # noqa: E402
 import version  # noqa: E402
+import golden_eval  # noqa: E402
 
 
 class LawTierInvariants(unittest.TestCase):
@@ -101,9 +105,56 @@ class ConsoleSecurityInvariants(unittest.TestCase):
         self.assertIsNone(server._origin_parts("null"))
 
 
+class LlmConfigMappingInvariants(unittest.TestCase):
+    """yaml/UI 里的分块配置必须真的进 LLMConfig，不能静默失效。"""
+
+    def test_chunk_settings_reach_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "llm.local.json"
+            local.write_text(json.dumps({
+                "chunking": False,
+                "chunk_chars": 1234,
+                "chunk_overlap": 77,
+            }), encoding="utf-8")
+            with mock.patch.object(llm_client, "LOCAL_PATH", local):
+                cfg = llm_client.load_config()
+        self.assertFalse(cfg.chunking)
+        self.assertEqual(cfg.chunk_chars, 1234)
+        self.assertEqual(cfg.chunk_overlap, 77)
+
+
+class GoldenGuardInvariants(unittest.TestCase):
+    """新增用例不能掩盖召回下降，删用例也不能悄悄变绿。"""
+
+    def test_new_case_miss_is_regression(self):
+        baseline = {"recall_pct": 100.0, "fp_total": 0,
+                    "cases": [{"case": "a.txt"}]}
+        res = {"recall_pct": 96.2, "fp_total": 0,
+               "cases": [{"case": "a.txt"}, {"case": "b.txt"}]}
+        worse, reasons = golden_eval.regressed(res, baseline)
+        self.assertTrue(worse)
+        self.assertTrue(any("召回下降" in r for r in reasons), reasons)
+
+    def test_same_metrics_is_not_regression(self):
+        baseline = {"recall_pct": 100.0, "fp_total": 0,
+                    "cases": [{"case": "a.txt"}]}
+        res = {"recall_pct": 100.0, "fp_total": 0,
+               "cases": [{"case": "a.txt"}]}
+        worse, reasons = golden_eval.regressed(res, baseline)
+        self.assertFalse(worse, reasons)
+
+    def test_deleted_case_is_regression(self):
+        baseline = {"recall_pct": 100.0, "fp_total": 0,
+                    "cases": [{"case": "a.txt"}, {"case": "b.txt"}]}
+        res = {"recall_pct": 100.0, "fp_total": 0,
+               "cases": [{"case": "a.txt"}]}
+        worse, reasons = golden_eval.regressed(res, baseline)
+        self.assertTrue(worse)
+        self.assertTrue(any("被删" in r for r in reasons), reasons)
+
+
 class VersionInvariants(unittest.TestCase):
     """版本号只能有一个可写处：根目录 VERSION。"""
-
     def test_version_file_is_readable(self):
         self.assertRegex(version.read_version(), r"^\d+\.\d+\.\d+")
 

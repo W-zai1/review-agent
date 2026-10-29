@@ -44,6 +44,7 @@ import shutil
 import threading
 import subprocess
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, urlsplit
@@ -88,6 +89,54 @@ JOBS_DIR = LOG_DIR / ".jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+# 审查子进程超时：长文 + LLM 远超 5 分钟，写死 300s 等于必然超时。
+# 默认 1800s，允许用环境变量 / 命令行调整，但必须落在 [30, 86400]。
+DEFAULT_REVIEW_TIMEOUT = 1800
+REVIEW_TIMEOUT_MIN = 30
+REVIEW_TIMEOUT_MAX = 86400
+JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60      # 启动时清理 7 天前的 .jobs 进度文件
+
+
+def _clamp_review_timeout(raw, fallback):
+    """把原始值转成整数并夹到合法区间；无法解析时返回 fallback。"""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return fallback
+    return max(REVIEW_TIMEOUT_MIN, min(REVIEW_TIMEOUT_MAX, value))
+
+
+def _review_timeout(environ=None):
+    """读取 REVIEW_AGENT_REVIEW_TIMEOUT，默认 1800s，非法值回落默认。"""
+    env = os.environ if environ is None else environ
+    raw = env.get("REVIEW_AGENT_REVIEW_TIMEOUT")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_REVIEW_TIMEOUT
+    return _clamp_review_timeout(raw, DEFAULT_REVIEW_TIMEOUT)
+
+
+def _parse_review_timeout(argv=None):
+    """解析 --review-timeout：优先级 CLI > 环境变量 > 默认值。
+
+    CLI 值非法时退回环境变量结果（而不是直接抹掉环境配置），
+    两处都对 [30, 86400] 做 clamp。
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    env_value = _review_timeout()
+    for i, arg in enumerate(args):
+        if arg == "--review-timeout":
+            if i + 1 >= len(args):
+                return env_value
+            return _clamp_review_timeout(args[i + 1], env_value)
+        if arg.startswith("--review-timeout="):
+            return _clamp_review_timeout(arg.split("=", 1)[1], env_value)
+    return env_value
+
+
+# 线程内只读；main() 在起 server 前按 CLI > env > 默认覆写一次。
+REVIEW_TIMEOUT = _review_timeout()
+
 
 def resolve_python():
     """定位运行 review.py 的解释器：环境变量 > 项目 .venv > 继承当前解释器。
@@ -1490,7 +1539,12 @@ class Handler(BaseHTTPRequestHandler):
                 "agent": agent_opt,
                 "scenario": scenario_opt,
                 "format_spec": spec_opt,
+                # 本次任务实际使用的超时：/api/review/status 可见，排查
+                # 「为什么跑了很久才失败 / 为什么 300s 就断了」时有据可查。
+                "timeout": REVIEW_TIMEOUT,
             }
+        print(f"[review] 任务 {job_id} 已创建：{file}（超时 {REVIEW_TIMEOUT}s）",
+              flush=True)
         threading.Thread(
             target=_run_review_job,
             args=(job_id, file, llm_opt, progress, type_opt, agent_opt,
@@ -1874,25 +1928,32 @@ class Handler(BaseHTTPRequestHandler):
                         json.dumps(purpose_quality, ensure_ascii=False)])
         before = {p.name for p in OUTPUTS.glob("R-*.json")}
         t0 = time.time()
+        timeout = REVIEW_TIMEOUT
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=300,
+                cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "timeout": timeout,
+                    "elapsed": round(time.time() - t0, 1),
+                    "error": f"审查超时（{timeout}s）"}
         except Exception as e:
-            return {"ok": False, "error": f"运行失败：{e}"}
+            return {"ok": False, "error": f"运行失败：{e}", "timeout": timeout}
         elapsed = round(time.time() - t0, 1)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr or proc.stdout)[-2500:],
-                    "returncode": proc.returncode}
+                    "returncode": proc.returncode, "timeout": timeout,
+                    "elapsed": elapsed}
         after = {p.name for p in OUTPUTS.glob("R-*.json")}
         new = after - before
         if not new:
-            return {"ok": False, "error": "审查完成但未生成报告"}
+            return {"ok": False, "error": "审查完成但未生成报告",
+                    "timeout": timeout, "elapsed": elapsed}
         # 取最新生成的报告
         latest = max(OUTPUTS.glob("R-*.json"), key=lambda p: p.stat().st_mtime)
         report = _read_json(latest)
         return {"ok": True, "report": report, "id": report.get("review_id"),
-                "elapsed": elapsed}
+                "elapsed": elapsed, "timeout": timeout}
 
 
 def _resolve_agent(raw):
@@ -1935,6 +1996,196 @@ def _resolve_format_spec(raw):
     return str(raw), None
 
 
+# ---------------------------------------------------------------------------
+# 服务重启后的任务状态恢复
+#
+# JOBS 只在内存里。服务一重启，正在轮询的前端就永远停在「审查中…」。
+# 启动时扫 logs/.jobs/*.jsonl：有对应报告就恢复成 done，没有就明确报
+# 「任务已中断」，绝不伪造 running（进程句柄已经丢了，没人会再更新它）。
+# ---------------------------------------------------------------------------
+RECOVER_INTERRUPTED_ERROR = "服务重启，任务已中断，请重新审查"
+
+
+def _parse_iso_ts(value):
+    """把 review.py 写的 ISO 时间转成 epoch；解析失败返回 None。"""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_job_events(path):
+    """读取 .jobs/<job>.jsonl，坏行跳过（一行坏掉不该让整个任务消失）。"""
+    events = []
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return events
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def _norm_job_target(value):
+    return str(value or "").strip().replace("\\", "/")
+
+
+def _find_recovered_report(events, outputs_dir, first_ts, last_ts):
+    """按「目标 + 时间窗」找这次任务生成的报告。
+
+    .jobs/*.jsonl 里没有 report_id，只有 S1~S6 进度事件。报告对象里有
+    target_path 和 timestamp：同一目标、时间落在本次任务窗口内的那份就是它。
+    同一时间只允许一个任务运行，所以不需要也不应该按文件 mtime 瞎猜。
+    """
+    target = ""
+    for event in events:
+        detail = event.get("detail")
+        if isinstance(detail, dict):
+            candidate = detail.get("待审对象")
+            if candidate:
+                target = _norm_job_target(candidate)
+                break
+
+    best = None
+    for path in Path(outputs_dir).glob("R-*.json"):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        report_target = _norm_job_target(report.get("target_path"))
+        if target and report_target and target != report_target:
+            continue
+        report_ts = _parse_iso_ts(report.get("timestamp"))
+        if report_ts is None:
+            try:
+                report_ts = path.stat().st_mtime
+            except OSError:
+                continue
+        # 报告 timestamp 在 S6 事件之前几毫秒生成；给 5s 容差，
+        # 后面最多等到超时窗口结束（进程退出后写报告）。
+        if report_ts < first_ts - 5 or report_ts > last_ts + 300:
+            continue
+        distance = abs(report_ts - last_ts)
+        if best is None or distance < best[0]:
+            best = (distance, str(report.get("review_id") or path.stem))
+    return best[1] if best else None
+
+
+def _job_state_from_jsonl(path, timeout, outputs_dir=None, now=None):
+    """把一个 .jobs/*.jsonl 解析成 JOBS 里的任务状态（纯函数，便于单测）。
+
+    - 找得到对应报告 -> done + report_id
+    - 找不到报告    -> error；超过 timeout 的标记 timed_out
+    - 永远不返回 running
+    """
+    path = Path(path)
+    now = time.time() if now is None else float(now)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = now
+    events = _read_job_events(path)
+    first_ts = _parse_iso_ts(events[0].get("ts")) if events else None
+    last_ts = _parse_iso_ts(events[-1].get("ts")) if events else None
+    first_ts = mtime if first_ts is None else first_ts
+    last_ts = mtime if last_ts is None else last_ts
+
+    report_id = None
+    if events:
+        report_id = _find_recovered_report(
+            events, OUTPUTS if outputs_dir is None else outputs_dir,
+            first_ts, last_ts)
+
+    stale = (now - mtime) > max(0, int(timeout))
+    status = "done" if report_id else "error"
+    last_step = None
+    if events and events[-1].get("step"):
+        last_step = str(events[-1].get("step"))
+    target = ""
+    for event in events:
+        detail = event.get("detail")
+        if isinstance(detail, dict) and detail.get("待审对象"):
+            target = _norm_job_target(detail.get("待审对象"))
+            break
+
+    return {
+        "id": path.stem,
+        "file": target,
+        "status": status,
+        "created": first_ts,
+        "finished": last_ts,
+        "report_id": report_id,
+        "error": None if status == "done" else RECOVER_INTERRUPTED_ERROR,
+        "llm": None,
+        "research": None,
+        "type": None,
+        "agent": None,
+        "scenario": None,
+        "format_spec": None,
+        "timeout": int(timeout),
+        "recovered": True,
+        "last_step": last_step,
+        # 没有报告，且进度文件已经超过本次超时窗口：大概率是被超时打断的。
+        # 两个分支都是 error（进程句柄已丢），这里只用于诊断/展示。
+        "timed_out": bool(stale and status == "error"),
+        "recover_reason": ("done" if status == "done"
+                           else "timeout" if stale else "interrupted"),
+    }
+
+
+def _recover_jobs(now=None):
+    """启动时恢复 .jobs 状态，并清理超过 7 天的进度文件。"""
+    now = time.time() if now is None else float(now)
+    recovered = 0
+    pruned = 0
+    try:
+        paths = sorted(JOBS_DIR.glob("*.jsonl"))
+    except OSError:
+        return 0
+    for path in paths:
+        job_id = path.stem
+        with JOBS_LOCK:
+            existing = JOBS.get(job_id)
+        if existing and existing.get("status") == "running":
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime > JOB_RETENTION_SECONDS:
+            try:
+                path.unlink()
+                pruned += 1
+            except OSError:
+                pass
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+            continue
+        try:
+            state = _job_state_from_jsonl(path, REVIEW_TIMEOUT, now=now)
+        except Exception:                                    # noqa: BLE001
+            continue
+        with JOBS_LOCK:
+            JOBS.setdefault(job_id, state)
+        recovered += 1
+    if recovered or pruned:
+        print(f"[recover] 恢复 {recovered} 个任务状态，"
+              f"清理 {pruned} 个超过 7 天的进度文件", flush=True)
+    return recovered
+
+
 def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
                     agent_opt=None, purpose=None, purpose_max=None,
                     purpose_quality=None, scenario_opt=None, format_spec_opt=None,
@@ -1971,12 +2222,14 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
         # 只上传时 toast 一下，用户事后只看到结论、看不到判定标准被认错了
         cmd.extend(["--purpose-notes", json.dumps(purpose_quality, ensure_ascii=False)])
     started = time.time()
+    timeout = REVIEW_TIMEOUT
     status = "done"
     error = None
     report_id = None
+    print(f"[review] 任务 {job_id} 开始：{file}（超时 {timeout}s）", flush=True)
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=300,
+            cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=timeout,
         )
         if proc.returncode != 0:
             status = "error"
@@ -1992,7 +2245,7 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
                     new, key=lambda rid: (OUTPUTS / f"{rid}.json").stat().st_mtime)
     except subprocess.TimeoutExpired:
         status = "error"
-        error = "审查超时（300s）"
+        error = f"审查超时（{timeout}s）"
     except Exception as e:
         status = "error"
         error = str(e)[:2000]
@@ -2005,20 +2258,33 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
                 "report_id": report_id,
                 "finished": time.time(),
                 "elapsed": round(time.time() - started, 1),
+                # 子进程超时可能被调整过；把本任务真实用到的值留在状态里。
+                "timeout": timeout,
             })
+    print(f"[review] 任务 {job_id} {status}："
+          f"{report_id or error or ''}（{round(time.time() - started, 1)}s，"
+          f"超时上限 {timeout}s）", flush=True)
 
 
 def main():
+    global REVIEW_TIMEOUT
+    # 优先级 CLI > 环境变量 > 默认；写一次，起 server 之后线程内只读。
+    REVIEW_TIMEOUT = _parse_review_timeout(sys.argv[1:])
     port = 8000
     if "--port" in sys.argv:
         try:
             port = int(sys.argv[sys.argv.index("--port") + 1])
         except Exception:
             pass
+    # 先按新超时恢复上次进程留下的任务，再开始接请求：
+    # 否则服务重启后旧任务永远停在 running。
+    _recover_jobs()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"审查 Agent 控制台已启动： http://127.0.0.1:{port}")
     print(f"  根目录：{ROOT}")
     print(f"  解释器：{PY}")
+    print(f"  审查超时：{REVIEW_TIMEOUT}s"
+          f"（--review-timeout / REVIEW_AGENT_REVIEW_TIMEOUT）")
     print("  按 Ctrl+C 停止。")
     try:
         httpd.serve_forever()

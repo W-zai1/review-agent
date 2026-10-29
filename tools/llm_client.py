@@ -358,6 +358,9 @@ def load_config(use_llm=None):
         "max_input_chars": _env("REVIEW_AGENT_LLM_MAX_INPUT_CHARS"),
         "cache": _env("REVIEW_AGENT_LLM_CACHE"),
         "max_issues_per_dim": _env("REVIEW_AGENT_LLM_MAX_ISSUES"),
+        "chunking": _env("REVIEW_AGENT_LLM_CHUNKING"),
+        "chunk_chars": _env("REVIEW_AGENT_LLM_CHUNK_CHARS"),
+        "chunk_overlap": _env("REVIEW_AGENT_LLM_CHUNK_OVERLAP"),
     }
     for key, value in env_values.items():
         if value is not None and value != "":
@@ -402,6 +405,11 @@ def load_config(use_llm=None):
         max_tokens=_to(raw.get("max_tokens"), int, 1200),
         max_input_chars=_to(raw.get("max_input_chars"), int, 12000),
         max_issues_per_dim=_to(raw.get("max_issues_per_dim"), int, 5),
+        # 这三项原先只在 yaml/UI 里声明，构造 LLMConfig 时没传，用户改配置
+        # 实际无效且无告警。分块策略必须真的进配置对象。
+        chunking=_as_bool(raw.get("chunking", True), default=True),
+        chunk_chars=_to(raw.get("chunk_chars"), int, 6000),
+        chunk_overlap=_to(raw.get("chunk_overlap"), int, 400),
         headers={str(k): str(v) for k, v in headers.items()},
         source=source,
     )

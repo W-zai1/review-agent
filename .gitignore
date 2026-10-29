@@ -78,3 +78,11 @@ docs/盲测协议.md
 调教报告·*.md
 测试结果面板/
 裁定结果样本/
+
+# 真实 holdout 文档与标注（含真实合同/个人信息）：默认不入库，只保留说明与占位。
+# 需要随仓库走时用 `git add -f` 显式决定，不要让评测集在无意中被公开。
+holdout/cases/*
+holdout/labels/*
+!holdout/cases/.gitkeep
+!holdout/labels/.gitkeep
+holdout/MANIFEST.json
