@@ -187,9 +187,10 @@ class ToolRegistry:
     """工具注册表 + 统一执行管线。
 
     管线顺序（少一步都出过事）：
-        schema 校验 → 权限校验 → 执行 → 结果校验 → 审计
-    权限放在 schema 之后：参数都不合法的调用没必要进入权限判定，
-    否则「被拒绝」的日志里会混进一堆「参数写错」的噪音。
+        存在性 → 权限校验 → schema 校验 → 执行 → 结果校验 → 审计
+    权限放在 schema 之前：无权执行的主体不该拿到「你这个入参写错了」这种
+    关于工具内部形状的反馈。反过来，同一主体的合法调用仍会在执行前被 schema 拦住
+    （`checks/test_tool_registry.py::test_argument_validation_happens_before_execution`）。
     """
 
     def __init__(self, *, on_invoke: Callable[[ToolInvocation], None] | None = None):

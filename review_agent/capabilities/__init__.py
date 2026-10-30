@@ -6,6 +6,12 @@
 """
 from __future__ import annotations
 
+from .builtin_tools import (
+    LogicCheckTool,
+    MathCheckTool,
+    TextCheckArgs,
+    batch1_tools,
+)
 from .semantic_ingest import (  # noqa: F401 - 能力层公共出口
     Candidate,
     IngestContext,
@@ -32,4 +38,5 @@ __all__ = [
     "ToolArgumentError", "ToolContext", "ToolError", "ToolInvocation",
     "ToolPermissionError", "ToolRegistry", "ToolResult", "default_permissions",
     "Candidate", "IngestContext", "IngestResult", "ingest_candidates",
+    "LogicCheckTool", "MathCheckTool", "TextCheckArgs", "batch1_tools",
 ]

@@ -44,6 +44,19 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3 起步：批次 1 工具落地为独立 `BaseTool`（`math.check` / `logic.check`）
+
+- **文件**：`review_agent/capabilities/builtin_tools.py`（新增）、`review_agent/capabilities/__init__.py`、`review_agent/capabilities/tools.py`（管线顺序的 docstring 更正）、`review.py`（`build_capability_registry`）、`checks/test_builtin_tools.py`（新增 17 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `MathCheckTool`（`math.check`）与 `LogicCheckTool`（`logic.check`）实现为 `BaseTool` 子类：`arguments_type = TextCheckArgs{text, rule_ids}`，权限 `ANALYZE`，输出 `{findings, count}` 并标 `untrusted=True`（命中的 quote 逐字来自待审文档）。
+  2. **算法本体不复制**：`capabilities` 层不许 import `tools/`（ARCHITECTURE §3 第 3 条，架构守卫会扫），所以由 `review.build_capability_registry()` 注入 `arith_check.run_all` / `logic_checks.run_all`。同一份实现，两种调用方式。
+  3. `rule_ids` 的三态语义在工具层钉死：`None` = 跑全部、`()` = 一条都不跑、列表 = 只跑这些。把 `[]` 归一成 `None` 会让「本次只启用 0 条规则」变成「跑全量」。
+  4. 空文本返回 `ok=False`：「审了个空文件」不许显示成 `pass`。
+  5.  更正 `ToolRegistry` 的管线 docstring：实际顺序是「存在性 → 权限 → schema → 执行」，旧注释写的是「schema → 权限」，与代码相反。
+- **为什么**：阶段 3 的验收是「注册表里有它、`review.py` 通过注册表调用、`checks/` 有测试」。此前 12 个 builtin 处理器只是被 `_HandlerTool` 统一包了一层——分发走了注册表，但工具本身仍**依赖 Session**，脱离规则流水线就用不了，也不是「不知道谁在调它」的工具。
+- **验证**：`python -m unittest discover -s checks` → **425 项 OK**（新增 17）；`checks.test_builtin_tools` 用真算法跑真文本（分项 360+210+480=1050 对「加总 1080」；30 岁 / 从业 25 年），不 mock。
+- **未做（不装完成）**：批次 1 还有 8 个没迁，逐个理由写进 TOOL_SPECIFICATION §7（`text.lint` 有文件 IO、`rules.pattern` 首参是 Session、`docx.format` / `law.cite` / `matrix.match` 依赖批次 2 的索引与解析）。
+
 ### 2026-10-31 · 新增 · 阶段 2 收尾：TaskService / ReportService
 
 - **文件**：`review_agent/application/tasks.py`（新增）、`review_agent/application/reports.py`（新增）、`review_agent/application/__init__.py`、`review.py`（`make_task_runner` / `make_task_service` / `make_report_service` / `_allocate_task_review_id` / `allocate_review_id` 增加 `state/tasks/` 扫描）、`checks/test_task_service.py`（新增 32 项）、`docs/REFACTOR_PLAN.md`、`docs/ARCHITECTURE.md`、`docs/AGENT_RUNTIME.md`

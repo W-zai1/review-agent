@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""checks/test_builtin_tools.py —— 批次 1 确定性工具的 `BaseTool` 实现（阶段 3）。
+
+阶段 3 的验收标准是「注册表里有它、`review.py` 通过注册表调用、`checks/` 有测试」。
+这里钉住的是工具**作为独立能力**的行为，而不是它在规则流水线里的副作用：
+
+    · 入参出参都是数据：不传 Session、不传运行上下文也能跑
+    · 算法只有一份：工具调用的是 `tools/` 里的同一函数（注入），不复制实现
+    · `rule_ids` 的三态语义：None = 跑全部，() = 一条都不跑，列表 = 只跑这些
+    · 命中的 quote 来自待审文档 → `untrusted=True`（调用方只当数据看）
+    · 空输入是失败，不是「没问题」
+    · 同输入同输出（确定性工具的基本承诺）
+
+用真算法、真文本，不 mock：这两个工具的价值就在于「结论不依赖模型」，
+mock 掉算术层等于把要验证的东西换成自己写的期望值。
+"""
+import asyncio
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import review  # noqa: E402
+from review_agent.capabilities import Permission, ToolContext  # noqa: E402
+from review_agent.capabilities.tools import ToolPermissionError  # noqa: E402
+
+# 分项 360+210+480=1050，文中写 1080 —— arith_check:sum 会命中
+SUM_TEXT = "销售费用 360 万，管理费用 210 万，研发费用 480 万，三项加总 1080 万元。"
+# 30 岁、从业 25 年 —— LOGIC-004 年龄工龄矛盾
+AGE_TEXT = "候选人现年 30 岁，从业 25 年，管理经验丰富。"
+CLEAN_TEXT = "本次会议于上午九点开始，共三项议题。"
+
+
+def context(*, permissions=None, actor="test") -> ToolContext:
+    return ToolContext(
+        review_id="R-20261030-001", run_id="R-20261030-001-RUN01",
+        permissions=frozenset(permissions) if permissions is not None
+        else frozenset({Permission.READ, Permission.ANALYZE}),
+        actor=actor,
+    )
+
+
+def run_tool(registry, name, arguments, ctx=None):
+    return asyncio.run(registry.execute(name, arguments, ctx or context()))
+
+
+class CapabilityRegistryTests(unittest.TestCase):
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def test_batch1_tools_are_registered(self):
+        self.assertEqual(self.registry.names(), ("logic.check", "math.check"))
+
+    def test_describe_exposes_permission_and_arguments(self):
+        described = {item["name"]: item for item in self.registry.describe()}
+        self.assertEqual(described["math.check"]["permission"], "analyze")
+        self.assertEqual(described["logic.check"]["permission"], "analyze")
+        for item in described.values():
+            self.assertTrue(item["description"], "每个工具都必须有可读的说明")
+            self.assertIn("text", item["arguments"])
+
+    def test_read_only_context_cannot_analyze(self):
+        with self.assertRaises(ToolPermissionError):
+            run_tool(self.registry, "math.check", {"text": SUM_TEXT},
+                     context(permissions=[Permission.READ]))
+
+    def test_unknown_argument_is_rejected_before_execution(self):
+        from review_agent.capabilities.tools import ToolArgumentError
+        with self.assertRaises(ToolArgumentError):
+            run_tool(self.registry, "math.check", {"txt": SUM_TEXT})
+
+    def test_invocation_is_audited(self):
+        _result, invocation = run_tool(self.registry, "math.check",
+                                       {"text": SUM_TEXT})
+        self.assertEqual(invocation.tool, "math.check")
+        self.assertEqual(invocation.actor, "test")
+        self.assertTrue(invocation.ok)
+        self.assertEqual(invocation.error_count, 0)
+
+
+class MathCheckToolTests(unittest.TestCase):
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def test_detects_sum_mismatch(self):
+        result, _ = run_tool(self.registry, "math.check", {"text": SUM_TEXT})
+        self.assertTrue(result.ok)
+        rule_ids = {f["rule_id"] for f in result.data["findings"]}
+        self.assertIn("LOGIC-001", rule_ids)
+        self.assertEqual(result.data["count"], len(result.data["findings"]))
+        evidence = " ".join(f["evidence"] for f in result.data["findings"])
+        self.assertIn("1050", evidence)          # 结论可复算，不是模型说的
+
+    def test_clean_text_has_no_findings(self):
+        result, _ = run_tool(self.registry, "math.check", {"text": CLEAN_TEXT})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 0)
+
+    def test_rule_filter_selects(self):
+        result, _ = run_tool(self.registry, "math.check",
+                             {"text": SUM_TEXT, "rule_ids": ["LOGIC-001"]})
+        self.assertEqual(result.data["count"], 1)
+        result, _ = run_tool(self.registry, "math.check",
+                             {"text": SUM_TEXT, "rule_ids": ["LOGIC-999"]})
+        self.assertEqual(result.data["count"], 0)
+
+    def test_empty_rule_list_runs_nothing(self):
+        """[] 与 None 不能混：把「本次只启用 0 条规则」当成「跑全量」会凭空出结论。"""
+        result, _ = run_tool(self.registry, "math.check",
+                             {"text": SUM_TEXT, "rule_ids": []})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 0)
+
+    def test_omitted_rule_ids_runs_everything(self):
+        result, _ = run_tool(self.registry, "math.check", {"text": SUM_TEXT})
+        self.assertGreaterEqual(result.data["count"], 1)
+
+    def test_empty_text_is_a_failure_not_a_pass(self):
+        result, _ = run_tool(self.registry, "math.check", {"text": "   "})
+        self.assertFalse(result.ok)
+        self.assertIn("空", result.errors[0])
+
+
+class LogicCheckToolTests(unittest.TestCase):
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def test_detects_age_tenure_conflict(self):
+        result, _ = run_tool(self.registry, "logic.check", {"text": AGE_TEXT})
+        self.assertTrue(result.ok)
+        self.assertEqual([f["rule_id"] for f in result.data["findings"]],
+                         ["LOGIC-004"])
+
+    def test_clean_text_has_no_findings(self):
+        result, _ = run_tool(self.registry, "logic.check", {"text": CLEAN_TEXT})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 0)
+
+
+class ContractTests(unittest.TestCase):
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def test_findings_are_marked_untrusted(self):
+        result, _ = run_tool(self.registry, "logic.check", {"text": AGE_TEXT})
+        self.assertTrue(result.untrusted,
+                        "命中的 quote 逐字来自待审文档，必须标成不可信输入")
+
+    def test_same_input_same_output(self):
+        first, _ = run_tool(self.registry, "math.check", {"text": SUM_TEXT})
+        second, _ = run_tool(self.registry, "math.check", {"text": SUM_TEXT})
+        self.assertEqual(first.data["findings"], second.data["findings"])
+
+    def test_findings_keep_the_legacy_shape(self):
+        result, _ = run_tool(self.registry, "math.check", {"text": SUM_TEXT})
+        finding = result.data["findings"][0]
+        for key in ("rule_id", "dimension", "quote", "evidence", "suggestion",
+                    "confidence", "tool"):
+            self.assertIn(key, finding, f"工具输出丢了字段 {key}")
+
+    def test_does_not_need_a_session(self):
+        """工具能脱离规则流水线独立调用——这正是「工具从 Agent 中独立」的验收点。"""
+        registry = review.build_capability_registry()
+        result, _ = run_tool(registry, "math.check", {"text": SUM_TEXT})
+        self.assertTrue(result.ok)
+
+
+if __name__ == "__main__":
+    unittest.main()

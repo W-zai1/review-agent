@@ -71,6 +71,7 @@ from review_agent.capabilities import (
     ToolError,
     ToolRegistry,
     ToolResult,
+    batch1_tools,
     ingest_candidates,
 )
 from review_agent.text import sentence_no as text_sentence_no
@@ -1825,6 +1826,25 @@ class _HandlerTool(BaseTool):
 def _tool_name(handler_key: str) -> str:
     """处理器键 → 工具名（`builtin:fact` → `builtin.fact`）。"""
     return str(handler_key).replace(":", ".")
+
+
+def build_capability_registry(*, on_invoke=None):
+    """批次 1 的确定性工具注册表：**脱离 Session** 也能调用。
+
+    与 `build_rule_registry` 的分工（两者共用同一个 `ToolRegistry` 与执行管线）：
+
+        build_rule_registry    按 run 建、绑定 Session、只服务规则流水线，
+                               适配的是 `handler(session, text, rules, ctx)`
+        build_capability_registry  纯数据进出，能单独测、能交给 Agent 按需调用
+
+    算法本体仍来自 `tools/`（注入，不复制）：`arith_check.run_all` /
+    `logic_checks.run_all`。`capabilities` 层不许 import `tools/`，所以注入点在这里。
+    """
+    registry = ToolRegistry(on_invoke=on_invoke)
+    for tool in batch1_tools(math_run_all=arith_check.run_all,
+                             logic_run_all=logic_checks.run_all):
+        registry.register(tool)
+    return registry
 
 
 def build_rule_registry(session, text, active, legacy_ctx, run_id, agent):

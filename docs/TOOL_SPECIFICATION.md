@@ -132,6 +132,26 @@ ToolRegistry
 | `pattern_rules.py` | `rules.pattern` | READ | 声明式规则求值 |
 | `match_matrix.py` | `matrix.match` | ANALYZE | 要求对照矩阵 |
 
+**进度（2026-10-31）**：`math.check`（← `arith_check.run_all`）与 `logic.check`
+（← `logic_checks.run_all`）已实现为**独立 `BaseTool`**：
+`review_agent/capabilities/builtin_tools.py`，由 `review.build_capability_registry()` 装配，
+验收 `checks/test_builtin_tools.py`（17 项：真算法、三态 `rule_ids`、权限、审计、确定性）。
+算法本体不复制——`capabilities` 层不许 import `tools/`（ARCHITECTURE §3 第 3 条），
+所以由 `review.py` 在装配时注入函数。
+
+其余 8 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
+
+| 工具 | 卡在哪 |
+| --- | --- |
+| `text.regex` | `regex_check.py` 只有零散辅助函数，没有单一入口；要先定「一次调用算什么」 |
+| `text.lint` | `lint.run_lint(path)` 收的是**路径**（要读文件、跑 ruff/eslint），属有 IO |
+| `rules.pattern` | `pattern_rules.scan(s, text, rules, ...)` 第一个参数就是 Session |
+| `rules.classify` | 分类函数与规则集状态耦合，要先抽成纯输入 |
+| `docx.format` | 依赖 `docx_extract` 的解析产物，属批次 2 的「先定接口」 |
+| `law.cite` | 依赖法条索引加载（批次 2） |
+| `matrix.match` | 依赖 `config/match_matrix.yaml` 的加载与块标记解析 |
+| `integrity.hash` | 现有实现以文件/目录为入参（IO）；纯字节哈希只有 `sha256_bytes` 一小块 |
+
 ### 批次 2：有 IO / 依赖外部，后迁（接口先定，实现后换）
 
 | 模块 | 工具名 | 注意 |
