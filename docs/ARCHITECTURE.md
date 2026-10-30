@@ -1,8 +1,9 @@
 # Review Agent 架构 v1
 
-> 状态（2026-10-30）：**骨架已落地，旧流程未接管**。
-> `review_agent/` 提供领域模型、运行时协议、工具协议；`review.py` / `server.py` / `tools/`
-> 的行为一行未改。逐段迁移的顺序与验收标准见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)。
+> 状态（2026-10-30，随 `v0.9.2-arch-v1` 更新）：**六层骨架全部落地，旧流程仍是默认路径**。
+> `review_agent/` 已提供领域模型、运行时（六节点 + 编排器 + 检查点）、Application Service、
+> 工具注册表与适配器；但 `--engine` 缺省仍是 `legacy`，`tools/` 的 42 个模块尚未逐个迁移。
+> 逐段迁移的顺序与验收标准见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)。
 
 ## 1. 要解决的是什么
 
@@ -42,10 +43,10 @@
 
 | 层 | 职责 | 允许依赖 | 当前代码 | 状态 |
 | --- | --- | --- | --- | --- |
-| 用户交互层 | Web / API / CLI | Application | `web/index.html`、`server.py`、`review.py` 的 CLI | 旧实现 |
-| Application | 编排一次审查任务（建任务、选 Profile、启动 Run、取报告） | Runtime、Domain | 尚无 | **未建** |
-| Agent Runtime | 阶段推进、节点调度、状态、checkpoint、异常 | Capabilities、Domain | `review_agent/runtime/`（协议 + 单步推进） | 协议已建，调度未建 |
-| 审查能力层 | 规则、LLM、检索、证据、工具 | Domain | `review_agent/capabilities/`（工具协议）；`tools/`（实现） | 协议已建，迁移未开始 |
+| 用户交互层 | Web / API / CLI | Application | `web/index.html`、`server.py`、`review.py` 的 CLI（含 `--engine`） | 旧实现 |
+| Application | 编排一次审查任务（建任务、选 Profile、启动 Run、取报告） | Runtime、Domain | `review_agent/application/`：`ReviewApplication`（组装/执行/落盘/恢复）+ 影子报告 | **已建（v1）**；Task/Report 服务未做 |
+| Agent Runtime | 阶段推进、节点调度、状态、checkpoint、异常 | Capabilities、Domain | `review_agent/runtime/`：协议 + 六节点 + `orchestrator.py` + `serialization.py` | **已建** |
+| 审查能力层 | 规则、LLM、检索、证据、工具 | Domain | `review_agent/capabilities/`（工具协议 + `ToolRegistry`）；`tools/`（实现） | 协议与分发已建，`tools/` 未逐个迁移 |
 | 领域层 | 六个核心对象、状态机、裁定策略、端口 | **无**（仅标准库） | `review_agent/domain/` | **已建** |
 | 基础设施层 | 数据库、文件、模型客户端、审计、日志 | Domain（实现其端口） | `tools/integrity.py`、`tools/llm_client.py`、`ledger/`、`logs/` | 旧实现，未抽象 |
 
@@ -58,7 +59,10 @@
 5. 基础设施通过 `domain/ports.py` 的 Protocol 注入，领域层不反向依赖。
 
 第 1~3 条由测试守着：`checks/test_architecture_guard.py`（扫 AST，发现越界 import 直接失败）。
-第 4~5 条在阶段 2 建 Application 时补测试。
+第 4 条的**反向依赖**（domain / runtime / capabilities 不得 import application）已并入同一张
+`FORBIDDEN` 表，由同一个用例覆盖；正向（application 可 import 三者）无需断言。
+第 5 条（基础设施经端口注入）要等 `review_agent/infrastructure/` 落地才有对象可测，
+在那之前 `domain/ports.py` 只有 Protocol 定义，不假装已经验证。
 
 > 为什么不是「分六个文件夹」：目录只表达位置，不表达方向。上面五条才是可检查的约束。
 
@@ -198,15 +202,15 @@ review_agent/
 
 ## 9. 验收：七个问题
 
-| 问题 | 现状（2026-10-30） | 谁证明 |
+| 问题 | 现状（2026-10-30，`v0.9.2-arch-v1`） | 谁证明 |
 | --- | --- | --- |
-| 能否追踪一次审查的完整生命周期？ | 旧：`steps` + 三份 jsonl；新：`RunState` 阶段链 + `AuditEvent` | `checks/test_domain_v1.py::RuntimeStateTests` |
-| 能否单独替换 LLM？ | 旧：`llm_client` + `llm_review` 两层；新：`ports` 只定义审计/存储，模型端口阶段 2 加 | 未完成 |
-| 能否单独测试每个审查节点？ | 节点尚未实现；协议与推进逻辑已可测 | `RuntimeStateTests` / `WorkflowTests` |
-| 能否在中断后恢复执行？ | 旧：server 侧 `_recover_jobs` 试探；新：`Checkpoint` 对象 + 端口 | 未完成（阶段 2） |
-| 能否追溯每条 Finding 的证据？ | 新：`Evidence` + `verification` + `verified_by` | `checks/test_legacy_adapter.py` |
-| 能否证明最终裁定符合规则？ | 新：`DecisionPolicy` 纯函数 + `consistency_issues` 复算；旧主流程 S6 已改用它 | `checks/test_domain_v1.py::PolicyTests` + A/B 报告对比 |
-| 能否不破坏其他模块地增加 Profile？ | Profile 数据模型已定，解析器未建 | 未完成（阶段 2） |
+| 能否追踪一次审查的完整生命周期？ | 旧：`steps` + 三份 jsonl；新：`RunState` 阶段链 + `AuditEvent` + `state/runs/` 落盘 | `checks/test_domain_v1.py::RuntimeStateTests`、`checks/test_orchestrator.py` |
+| 能否单独替换 LLM？ | **部分**：节点层经 `SemanticExecutor` 端口注入，可换实现；但 `ModelClient` 端口未建，换供应商仍要改 `llm_client` | `checks/test_semantic_node.py`、`checks/test_llm_review_fn.py` |
+| 能否单独测试每个审查节点？ | **是**：六节点各有独立用例（Decision 16 / Evidence 16 / Cross 17 / Rule 17 / Semantic 21 / Document 15），另有 Planner 8、编排器 21 | `checks/test_*_node.py`、`checks/test_planner_node.py` |
+| 能否在中断后恢复执行？ | **状态层是**：`FileRunStore` 落盘 → 读回 → 从断点阶段续跑；「杀进程后自动续跑」仍需入口侧接线 | `checks/test_state_serialization.py`、`checks/test_orchestrator.py::test_resume_does_not_rerun_completed_stages` |
+| 能否追溯每条 Finding 的证据？ | **是**：`Evidence` + `verification` + `verified_by`，报告自 schema 1.2 起带 `evidence[]` | `checks/test_legacy_adapter.py`、`checks/test_report_evidence.py` |
+| 能否证明最终裁定符合规则？ | **是**：`DecisionPolicy` 纯函数 + `consistency_issues` 复算；全量历史重放仅 5 份已登记偏差 | `checks/test_domain_v1.py::PolicyTests`、`checks/test_decision_node.py` |
+| 能否不破坏其他模块地增加 Profile？ | **是**：`ReviewProfile` + `profiles/resolver.py`（四份配置叠加的唯一实现） | `checks/test_profile_resolver.py` |
 
-「未完成」不是遗漏，是**下一阶段的入口**：每条都在 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)
+「部分 / 未做」不是遗漏，是**下一阶段的入口**：每条都在 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)
 里有对应交付物与验收命令。

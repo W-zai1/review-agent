@@ -16,8 +16,8 @@
 | --- | --- | --- | --- | --- |
 | 0 冻结与盘点 | 知道现状、能回归 | 盘点表、六份文档、领域骨架 | `python tools/arch_inventory.py` + `python -m unittest discover -s checks` | **完成**（2026-10-30） |
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
-| 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑已落地；Application Service 与切流未做） |
-| 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | 未开始 |
+| 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application Service 均已落地；剩 Task/Report 服务与在线切流） |
+| 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管，12 个 builtin + `pack:*` 已注册；`tools/` 42 个模块尚未逐个迁成 `BaseTool`，重复实现只标未删） |
 | 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | 未开始 |
 | 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | 未开始 |
 
@@ -184,13 +184,13 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 ## 11. 工作量估计（人日，仅作排期参考）
 
-| 阶段 | 估计 | 主要不确定性 |
-| --- | --- | --- |
-| 1 收口（错误类型统一） | 1~2 | 旧异常散落在 server / review / tools 三处 |
-| 2 执行层（Application + 其余 5 节点 + 双跑） | 12~18 | Semantic Reviewer 的 prompt 与结果稳定性 |
-| 3 能力层（10 个工具 + 分发改造） | 6~10 | 工具间的隐式依赖 |
-| 4 可靠性（checkpoint/retry/审计） | 5~8 | 恢复语义的边界情况 |
-| 5 验证交付 | 4~6 | 评测集建设 |
+| 阶段 | 估计 | 现状（2026-10-30） | 主要不确定性 |
+| --- | --- | --- | --- |
+| 1 收口（错误类型统一） | 1~2 | **已完成** | 旧异常散落在 server / review / tools 三处 |
+| 2 执行层（Application + 其余 5 节点 + 双跑） | 12~18 | 主体完成；剩 Task/Report 服务与在线切流 | Semantic Reviewer 的 prompt 与结果稳定性 |
+| 3 能力层（42 个工具 + 分发改造） | 6~10 | 分发已接管；工具未迁移 | 工具间的隐式依赖 |
+| 4 可靠性（checkpoint/retry/审计） | 5~8 | checkpoint / retry 有骨架；timeout / 幂等 / 审计单流未做 | 恢复语义的边界情况 |
+| 5 验证交付 | 4~6 | **未开始** | 评测集建设 |
 
 估计的前提是「单主题小步提交 + 每阶段验收通过」；并行开发会显著放大双跑比对的成本。
 
@@ -219,7 +219,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 | --- | --- | --- | --- | --- |
 | 1 | §7 技术栈：Pydantic / SQLAlchemy / SQLite→PostgreSQL / FastAPI / structlog | dataclass + pyyaml + `http.server` + 文件存储 | **偏离**（既有 ADR-001 取舍，非本轮引入；本轮沿用未改） | ARCHITECTURE ADR-001 |
 | 2 | §2 六层含 Application（ReviewService / TaskService / ReportService） | **部分**：`ReviewApplication`（组装/执行/落盘/恢复）+ CLI `--engine v1|shadow` 已接；server 走 `REVIEW_ENGINE` 环境变量；Task/Report 服务未做 | **部分完成**（2026-10-30） | §4 行 |
-| 3 | §6 所有工具注册到 Registry，经统一执行器分发 | **已完成**：`review.build_rule_registry()` 把 12 个 builtin + Agent 自带 `pack:*` 处理器注册成工具（`_HandlerTool`，权限 WRITE），分发走 `registry.execute()`：存在性 → 权限 → 执行 → 结果。`run_rule_plan` 已改为 async，可 await 注册表的 async 执行器。旧 `resolve_handler` 无调用点，按迁移规矩保留到阶段 5 | **完成**（2026-10-30） | TOOL_SPECIFICATION §4 |
+| 3 | §6 所有工具注册到 Registry，经统一执行器分发 | **分发管线已完成**：`review.build_rule_registry()` 把 12 个 builtin + Agent 自带 `pack:*` 处理器注册成工具（`_HandlerTool`，权限 WRITE），分发走 `registry.execute()`：存在性 → 权限 → 执行 → 结果。`run_rule_plan` 已改为 async，可 await 注册表的 async 执行器。旧 `resolve_handler` 无调用点，按迁移规矩保留到阶段 5。**但 `tools/` 42 个模块仍被 `_HandlerTool` 统一包装，没有逐个实现 `BaseTool`** | **部分完成**（管线完成，工具迁移未开始，2026-10-30） | TOOL_SPECIFICATION §4 |
 | 4 | §6 外部文档视为不可信输入，不得影响系统行为 | **部分**：`llm_review.build_messages` 改为随机串围栏（`<<<TARGET:<nonce>>>>` … `<<<END:<nonce>>>>`），文档里的 `TARGET>>>` 无法闭合数据区块；原文逐字保留、撞车直接拒绝。其余三项（工具权限不受文档影响、文档里的命令/URL 不执行、联网白名单）仍未做 | **部分完成**（2026-10-30） | TOOL_SPECIFICATION §6 |
 | 5 | §10 五个产品界面（工作台/执行中心/证据中心/裁定中心/审计中心） | 沿用旧控制台；新能力只在报告 JSON 里 | **未做**（未排期） | — |
 | 6 | §4 协议示例 `NodeContext{review_id,run_id,state}`、`NodeResult{success,output,errors,warnings}` | `state` 内含 review_id/run_id；`NodeResult` 增 typed 字段（findings/evidence/disputes/decision）与 `revisions`；`NodeContext` 增 `config` / `dry_run` / `next_finding_seq` | **扩展**（与「state 用明确 Schema、不塞 dict」的意图一致，但形参不同于原文） | AGENT_RUNTIME §4 |

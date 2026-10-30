@@ -4562,9 +4562,9 @@ def main():
               "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）；"
               "--research 对事实库外的数字/日期主张联网检索来源并核验（默认关闭）；"
               "--no-research 强制关闭联网核验；"
-              "--engine legacy|v1|shadow 选择执行引擎（legacy 默认；v1 只跑六节点流水线、"
-              "不写报告只落状态；shadow 出旧报告并双跑比对，差异写 state/double_run/；"
-              "v1/shadow 目前只支持 --no-llm）；"
+              "--engine legacy|v1|shadow 选择执行引擎（legacy 默认；v1 跑六节点流水线、"
+              "写影子报告 outputs/v1/ 并落状态，不改旧报告；shadow 出旧报告并双跑比对，"
+              "差异写 state/double_run/；shadow 需配合 --no-llm，v1 可带 --llm）；"
               "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return
     target_arg = args[0]

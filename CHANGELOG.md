@@ -44,6 +44,20 @@
 
 # 2026-10-30
 
+### 2026-10-30 · 修改 · 修正 6 处过期文档口径（ARCHITECTURE / AGENT_RUNTIME / REFACTOR_PLAN / CLI 帮助）
+
+- **文件**：`docs/ARCHITECTURE.md`（状态行、§3 六层表、§4 约束测试口径、§9 七问）、`docs/AGENT_RUNTIME.md`（§3 引擎开关）、`docs/REFACTOR_PLAN.md`（§1 阶段表、§11 工作量表、§13 偏差 #3）、`review.py`（`--help` 的 `--engine` 说明）
+- **改了什么**：
+  1. `ARCHITECTURE` §3 把 Application「未建」、Runtime「调度未建」、Capabilities「迁移未开始」改为实况（均已落地，仅 `tools/` 未逐个迁移）。
+  2. `ARCHITECTURE` §9 七问从「未完成（阶段 2）」改为「是 / 部分」并逐条给出验收用例名。
+  3. `ARCHITECTURE` §4 说明第 4 条反向依赖已由同一张 `FORBIDDEN` 表覆盖，第 5 条等基础设施层落地再测。
+  4. `AGENT_RUNTIME` §3 修掉「`v1`/`shadow` 强制 `--no-llm`」：实况是 `v1` 可带 `--llm`，只有 `shadow` 要求 `--no-llm`。
+  5. `REFACTOR_PLAN` §1 阶段 2 改「Application Service 与切流未做」→ 已落地、剩 Task/Report 与在线切流；阶段 3 由「未开始」改「进行中」并写清管线已完成、工具未迁移。
+  6. `REFACTOR_PLAN` §11 工作量表加「现状」列；§13 偏差 #3 由「完成」降为「部分完成」。
+  7. `review.py` 的 `--engine` 帮助文案同步（`v1` 写影子报告并可带 `--llm`；`shadow` 需 `--no-llm`）。
+- **为什么**：文档与代码冲突时以代码为准（`docs/README.md` §维护规则），这 6 处已经长期并存，会让下一个接手的人（或 AI）照着过期状态继续做。典型后果：以为 Application 未建而重复实现一遍，或以为 `v1` 不支持 LLM 而绕开它。
+- **验证**：`python -m unittest discover -s checks` → 376 项 OK（改后重跑）；`python tools/changelog_guard.py` → exit 0。
+
 ### 2026-10-30 · 修改 · 版本号升至 0.9.2，归档 Architecture/Runtime/Engine v1
 
 - **文件**：`VERSION`、`README.md`、`.gitignore`、`docs/README.md`、`CHANGELOG.md`

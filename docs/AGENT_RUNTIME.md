@@ -97,9 +97,10 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
   跑一次 rule-only 审查，`review.compare_with_report()` 与旧报告双跑比对。
   四个目标语料上「未解释差异 = 0」。语义审入队仍是 Session 语义，尚未接入。
 * **引擎开关**（2026-10-30）：CLI `--engine legacy|v1|shadow`（也认 `REVIEW_ENGINE`）。
-  `v1` 只跑流水线、只落状态（`state/runs/`），**不写正式报告**；
-  `shadow` 出旧报告 + 双跑差异（`state/double_run/<review_id>.json`）。
-  `v1`/`shadow` 目前强制 `--no-llm`——语义审还没接，开着 LLM 会产出「看起来审了模型」的影子结论。
+  `v1` 跑六节点流水线、落状态（`state/runs/`）并写影子报告（`outputs/v1/`），
+  **不写旧链路的正式报告**；`--llm` 已接真模型（语义审经 `SemanticExecutor` 注入）。
+  `shadow` 出旧报告 + 双跑差异（`state/double_run/<review_id>.json`），**强制 `--no-llm`**——
+  双跑比的是确定性结论，模型波动混进来会让「未解释差异」无从判定。
 
 **LLM 使用边界**（沿用方案原文，并给出代码落点）：
 
