@@ -26,7 +26,14 @@ sys.path.insert(0, str(ROOT / "tools"))
 import integrity  # noqa: E402
 import review  # noqa: E402
 
+# 端到端用例要跑真实审查，依赖本地私有资产（targets/ 样本 + agents/ Agent 定义）；
+# 公开 clone 不含这两者（见 .gitignore），缺失时整类跳过，本地带资产时照常运行。
+PRIVATE_OK = (ROOT / "targets" / "contract_001.md").exists() and (ROOT / "agents").is_dir()
 
+
+@unittest.skipUnless(PRIVATE_OK,
+                     "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
+                     "跳过 v1 完整性端到端用例")
 class V1ChainTests(unittest.TestCase):
     def setUp(self):
         self._saved = {name: getattr(review, name)

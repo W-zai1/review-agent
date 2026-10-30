@@ -28,6 +28,10 @@ from review_agent.runtime.nodes import evidence_to_report  # noqa: E402
 
 TARGET = "targets/adversarial_meeting_001.txt"
 
+# 端到端用例要跑真实审查，依赖本地私有资产（targets/ 样本 + agents/ Agent 定义）；
+# 公开 clone 不含这两者（见 .gitignore），缺失时整类跳过，本地带资产时照常运行。
+PRIVATE_OK = (ROOT / TARGET).exists() and (ROOT / "agents").is_dir()
+
 
 class EvidenceReportShapeTests(unittest.TestCase):
     def test_each_evidence_points_at_its_finding(self):
@@ -58,6 +62,9 @@ class EvidenceReportShapeTests(unittest.TestCase):
              "verification", "verified_by"])
 
 
+@unittest.skipUnless(PRIVATE_OK,
+                     "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
+                     "跳过报告证据端到端用例")
 class ReportEvidenceEndToEndTests(unittest.TestCase):
     """跑一次真实审查（进程内、临时目录），检查报告里的证据段。"""
 

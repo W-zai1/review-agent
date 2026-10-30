@@ -28,6 +28,10 @@ from review_agent.runtime.nodes import RuleStep  # noqa: E402
 REVIEW_ID = "R-20261030-001"
 RUN_ID = f"{REVIEW_ID}-RUN01"
 
+# 真实注册表用例要按 agent 定义解析目标，依赖本地私有资产（targets/ 样本 + agents/）；
+# 公开 clone 不含这两者（见 .gitignore），缺失时跳过本用例，本地带资产时照常运行。
+PRIVATE_OK = (ROOT / "targets" / "contract_001.md").exists() and (ROOT / "agents").is_dir()
+
 ISSUE = {
     "issue_id": "ISS-0001", "dimension": "fact", "severity": "major",
     "quote": "截止目前，项目已完成 20 个里程碑节点", "location": "第 1 句",
@@ -132,6 +136,9 @@ class RegistryExecutorTests(unittest.TestCase):
         with self.assertRaises(ToolError):
             asyncio.run(registry.execute("builtin.fake", {}, context_without_write))
 
+    @unittest.skipUnless(PRIVATE_OK,
+                         "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
+                         "跳过真实注册表用例")
     def test_real_registry_contains_every_builtin_handler(self):
         agent, _ = review.agent_spec.resolve(
             ROOT / "targets" / "contract_001.md", "合同正文")

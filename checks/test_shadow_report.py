@@ -41,6 +41,10 @@ from review_agent.runtime import RunState  # noqa: E402
 
 RUN_ID = "R-20261030-001-RUN01"
 
+# CLI 端到端用例要跑真实审查，依赖本地私有资产（targets/ 样本 + agents/ Agent 定义）；
+# 公开 clone 不含这两者（见 .gitignore），缺失时跳过本用例，本地带资产时照常运行。
+PRIVATE_OK = (ROOT / "targets" / "contract_001.md").exists() and (ROOT / "agents").is_dir()
+
 
 def finding(seq, *, rule_id="FACT-001", quote="原文一句话", severity=Severity.MINOR,
             origin=FindingOrigin.RULE):
@@ -197,6 +201,9 @@ class RenderTests(unittest.TestCase):
 class EngineShadowReportTests(unittest.TestCase):
     """v1 在 CLI 上必须真的写出 `outputs/v1/` 两份文件。"""
 
+    @unittest.skipUnless(PRIVATE_OK,
+                         "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
+                         "跳过 CLI 影子报告端到端用例")
     def test_v1_writes_shadow_report(self):
         import io
         from contextlib import redirect_stdout

@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 修改 · CI 修复：公开 clone 无私有资产时优雅跳过（26 用例 + golden + tests 步骤）
+
+- **文件**：`checks/test_engine_switch.py`、`checks/test_v1_integrity.py`、`checks/test_pipeline_parity.py`、`checks/test_llm_review_fn.py`、`checks/test_report_evidence.py`、`checks/test_rule_dispatch.py`、`checks/test_shadow_report.py`、`checks/test_holdout.py`（8 个文件共 26 个用例加守卫）、`tools/golden_eval.py`、`.github/workflows/ci.yml`
+- **改了什么**：
+  1. 26 个依赖私有资产的端到端用例加 `skipUnless` 守卫：`targets/` 样本或 `agents/` Agent 定义缺失时优雅跳过（措辞与 `test_failure_injection.py` 既有 `HAS_AGENTS` 约定一致），本地带资产时照常运行。
+  2. `tools/golden_eval.py`：`agents/` 缺失时输出「跳过金标准评测」并以 0 退出，不再因 `未知 Agent：doc-review` 崩溃。
+  3. `ci.yml` Full regression 步骤：判断条件由 `Test-Path tests` 改为「存在 `test*.py` 才跑」——`tests/` 目录会因金标准数据随仓库走而在场，但公开 checkout 里没有测试实现，`unittest discover -s tests` 无测试时在 Python 3.12+ 以退出码 5 失败。
+- **为什么**：GitHub Actions CI 两个 job（3.12 / 3.13）全部失败（各 21s、2 条 annotation）——`checks/` 里 26 个用例依赖被 `.gitignore` 排除的私有资产（`targets/` 对抗样本 127 个文件、`agents/` Agent 定义、`state/` 链状态），干净 clone 报「未知 Agent：doc-review；可选：(无)」「找不到待审文件 targets/contract_001.md」；golden 评测同因崩溃；tests 步骤误触发 exit 5。`ci.yml` 注释本意是「checks/ 是可公开的最小不变量集，必须绿」，但无数据环境从未实现优雅跳过，等于守门从未在 CI 上真正生效。
+- **验证**：本地（有资产）`python -m unittest discover -s checks` → **471 项 OK**（26 用例照常运行，无误跳过）；干净 clone 模拟 CI 全链路 → **checks 471 项 OK（skipped=37）**、golden 步骤 exit 0、tests 步骤明确输出跳过、changelog 守门在干净树通过。
+- **未做**：`targets/`、`agents/` 仍按「不公开」规则只留本地，不随仓库走；跳过不等于在这些环境失去保护——本地跑全量回归的强度不变。
+
 ### 2026-10-31 · 新增 · 阶段 4：统一审计事件流（`events.jsonl` + 旧格式投影）
 
 - **文件**：`review_agent/application/audit.py`（新增）、`checks/test_audit_stream.py`（新增 14 项）、`review.py`（`_write_v1_logs` 改走事件流）、`review_agent/application/__init__.py`（导出 `build_audit_stream` / `load_audit_stream` / `audit_to_legacy` / `write_audit_stream`）

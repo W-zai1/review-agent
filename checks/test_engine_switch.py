@@ -29,6 +29,10 @@ import review  # noqa: E402
 
 TARGET = "targets/contract_001.md"
 
+# 端到端用例要跑真实审查，依赖本地私有资产（targets/ 样本 + agents/ Agent 定义）；
+# 公开 clone 不含这两者（见 .gitignore），缺失时整类跳过，本地带资产时照常运行。
+PRIVATE_OK = (ROOT / TARGET).exists() and (ROOT / "agents").is_dir()
+
 
 class EngineParseTests(unittest.TestCase):
     def test_flag_forms(self):
@@ -63,6 +67,9 @@ class EngineParseTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
 
+@unittest.skipUnless(PRIVATE_OK,
+                     "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
+                     "跳过引擎端到端用例")
 class EngineRunTests(unittest.TestCase):
     """进程内跑 main()：确认三条语义真的成立。"""
 

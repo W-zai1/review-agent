@@ -36,6 +36,12 @@ CLEAN_TEXT = (
     "本周项目进展：后端接口联调完成 8/10，前端页面进入内测。"
     "当前无阻塞项，风险可控。\n"
 )
+
+# 真实审查用例要按 agent 定义跑 review.run_one；agents/ 是本地私有资产
+# （公开 clone 不含，见 .gitignore），缺失时跳过这些用例，其余 CLI 行为用例照常。
+HAS_AGENTS = (ROOT / "agents").is_dir()
+needs_agent = unittest.skipUnless(
+    HAS_AGENTS, "agents/ 不在仓库（公开 clone 不含 Agent 定义），跳过真实审查用例")
 DEFAULT_HOLDOUT = holdout_eval.HOLDOUT
 DEFAULT_OUT = holdout_eval.OUT_DIR
 
@@ -163,6 +169,7 @@ class HoldoutCliTests(HoldoutTestBase):
         self.assertIn("缺少冻结清单", out)
         self.assertIn("--save-manifest", out)
 
+    @needs_agent
     def test_save_manifest_then_run_passes(self):
         self.write_case("clean.txt")
         self.write_labels("clean.labels.json", [{
@@ -223,6 +230,7 @@ class HoldoutCliTests(HoldoutTestBase):
         self.assertIn("清单外多出文件", out)
         self.assertIn("cases/sneaked_in.txt", out)
 
+    @needs_agent
     def test_clean_case_without_label_is_clean_not_false_positive(self):
         self.write_case("clean.txt")
         self.freeze()
@@ -241,6 +249,7 @@ class HoldoutCliTests(HoldoutTestBase):
         self.assertIsNone(payload["metrics"]["recall"]["pct"])
         self.assertEqual(payload["metrics"]["recall"]["ci95_pct"], [0.0, 0.0])
 
+    @needs_agent
     def test_default_output_path_is_under_injected_out_dir(self):
         self.write_case("clean.txt")
         self.freeze()
@@ -250,6 +259,7 @@ class HoldoutCliTests(HoldoutTestBase):
         self.assertEqual(len(written), 1, out)
         self.assertIn("结果 JSON", out)
 
+    @needs_agent
     def test_below_threshold_exits_1(self):
         self.write_case("clean.txt")
         self.write_labels("clean.labels.json", [{

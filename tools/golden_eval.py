@@ -134,6 +134,12 @@ def main():
             print(f"{kind:8} {c.name}")
         return
 
+    # 评测走完整 run_one，需要 Agent 定义（doc-review）；agents/ 是本地私有资产，
+    # 公开 clone 不含（见 .gitignore）。缺失时明确跳过，不伪装成"跑过了"。
+    if not (ROOT / "agents").is_dir():
+        print("agents/ 不在仓库（公开 clone 不含 Agent 定义），跳过金标准评测")
+        return
+
     baseline = None
     if BASELINE.exists():
         baseline = json.loads(BASELINE.read_text(encoding="utf-8"))

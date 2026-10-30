@@ -26,18 +26,22 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       # tests/ 在本仓库被 .gitignore 排除（对抗样本不公开），clone 出来没有
-      # 那 600 多项回归测试。checks/ 是可公开的最小不变量集，必须绿。
+      # 那 600 多项回归测试；公开 checkout 里 tests/ 只有金标准数据（无 test*.py）。
+      # 所以按"有没有测试文件"判断，而不是目录是否在场：
+      # `unittest discover -s tests` 在无测试时会以退出码 5 失败（Python 3.12+），
+      # 目录里只有数据文件时不能让它当真跑。
       - name: Public invariants
         run: python -m unittest discover -s checks -v
 
-      # 本地/私有镜像若带 tests/，就顺带跑全量；没有则跳过，不伪装成"跑过了"。
+      # 本地/私有镜像若带 tests/ 测试实现，就顺带跑全量；没有则跳过，不伪装成"跑过了"。
       - name: Full regression (when tests/ is present)
         shell: pwsh
         run: |
-          if (Test-Path tests) {
+          $testFiles = @(Get-ChildItem tests -Recurse -Filter test*.py -File -ErrorAction SilentlyContinue)
+          if ($testFiles.Count -gt 0) {
             python -m unittest discover -s tests -v
           } else {
-            Write-Host "tests/ not present in this checkout - skipped (see checks/)"
+            Write-Host "tests/ has no test files in this checkout - skipped (see checks/)"
           }
 
       - name: Golden suite (recall / false positives must not regress)

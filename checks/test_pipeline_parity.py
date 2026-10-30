@@ -34,6 +34,10 @@ TARGETS = (
     "targets/code_001.py",
 )
 
+# 双跑比对要在真实样本上跑，依赖本地私有资产（targets/ 样本 + agents/ Agent 定义）；
+# 公开 clone 不含这两者（见 .gitignore），缺失时跳过本用例，本地带资产时照常运行。
+PRIVATE_OK = all((ROOT / t).exists() for t in TARGETS) and (ROOT / "agents").is_dir()
+
 
 class DoubleRunTests(unittest.TestCase):
     def setUp(self):
@@ -53,6 +57,9 @@ class DoubleRunTests(unittest.TestCase):
             setattr(review, name, value)
         self.tmp.cleanup()
 
+    @unittest.skipUnless(PRIVATE_OK,
+                         "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
+                         "跳过双跑比对")
     def test_six_node_pipeline_matches_legacy(self):
         rules = review.load_rules()
         for index, target in enumerate(TARGETS, start=1):
