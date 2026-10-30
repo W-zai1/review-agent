@@ -61,10 +61,13 @@ class ReviewApplication:
     """组装 + 执行 + 保存 + 恢复。"""
 
     def __init__(self, *, store: FileRunStore | None = None,
-                 checkpoints=None, max_attempts: int = 1) -> None:
+                 checkpoints=None, max_attempts: int = 1,
+                 node_timeout: float | None = None) -> None:
         self.store = store
         self.checkpoints = checkpoints
         self.max_attempts = max(1, int(max_attempts))
+        # 单节点上限；None = 不限制（默认不改变既有行为，由入口显式打开）
+        self.node_timeout = node_timeout
 
     # ---- 组装 ----
     def workflow(self, ports: PipelinePorts) -> Workflow:
@@ -108,6 +111,7 @@ class ReviewApplication:
         outcome = await Orchestrator(
             workflow, checkpoints=self.checkpoints,
             max_attempts=self.max_attempts, config=config or {},
+            timeout=self.node_timeout,
         ).run(state)
         self._save(outcome.state)
         return outcome

@@ -360,5 +360,83 @@ class StateHashTests(unittest.TestCase):
         self.assertNotEqual(state_hash(base), state_hash(changed))
 
 
+class SlowNode:
+    """会拖时间的节点：用来验证单节点超时。"""
+
+    def __init__(self, name, stage, produces=(), *, delay=0.2):
+        self.name = name
+        self.stage = stage
+        self.produces = frozenset(produces)
+        self.delay = delay
+        self.calls = 0
+
+    async def run(self, ctx: NodeContext) -> NodeResult:
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        return NodeResult.ok(output={key: "x" for key in self.produces})
+
+
+def slow_workflow(delay=0.2, *, fast_rest=True):
+    """第一个节点拖时间，其余节点正常——超时必须停在第一个节点。"""
+    nodes = [SlowNode("intake", Stage.INTAKE, {"target_hash"}, delay=delay)]
+    if fast_rest:
+        nodes.append(FakeNode("ingest", Stage.INGESTION,
+                              {"target_text", "target_meta"},
+                              build=lambda ctx: {"output": {"target_text": TEXT,
+                                                            "target_meta": {}}}))
+    return Workflow(tuple(nodes)), nodes
+
+
+class NodeTimeoutTests(unittest.TestCase):
+    """单节点超时（阶段 4）。默认关闭，打开后：超时=可重试失败，且能指出卡在哪个节点。"""
+
+    def test_slow_node_times_out(self):
+        workflow, nodes = slow_workflow(delay=0.2)
+        outcome = asyncio.run(
+            Orchestrator(workflow, timeout=0.05).run(initial_state()))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("超时", outcome.errors[0])
+        self.assertIn("intake", outcome.errors[0])
+
+    def test_timeout_is_retried(self):
+        workflow, nodes = slow_workflow(delay=0.2)
+        outcome = asyncio.run(
+            Orchestrator(workflow, timeout=0.05, max_attempts=2)
+            .run(initial_state()))
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(nodes[0].calls, 2, "超时是可重试失败，应该跑满次数")
+        self.assertEqual([e.attempt for e in outcome.events], [1, 2])
+        self.assertEqual([e.ok for e in outcome.events], [False, False])
+
+    def test_no_timeout_by_default(self):
+        workflow, nodes = slow_workflow(delay=0.05, fast_rest=False)
+        outcome = asyncio.run(Orchestrator(workflow).run(initial_state()))
+        # 没配超时时不会因为「慢」被判失败；这里是因为 workflow 没覆盖后续阶段
+        self.assertNotIn("超时", " ".join(outcome.errors))
+        self.assertEqual(nodes[0].calls, 1)
+
+    def test_fast_nodes_are_unaffected(self):
+        workflow, _ = full_workflow()
+        outcome = asyncio.run(
+            Orchestrator(workflow, timeout=5.0).run(initial_state()))
+        self.assertEqual(outcome.status, "completed")
+
+    def test_timeout_does_not_make_deterministic_failures_retryable(self):
+        workflow, nodes = full_workflow(evidence_error="证据锚定失败")
+        outcome = asyncio.run(
+            Orchestrator(workflow, timeout=5.0, max_attempts=3)
+            .run(initial_state()))
+        self.assertEqual(outcome.status, "failed")
+        evidence_node = next(n for n in nodes if n.stage is Stage.EVIDENCE)
+        self.assertEqual(evidence_node.calls, 1,
+                         "不可重试的失败不该因为开了超时就被重试")
+
+    def test_invalid_timeout_is_rejected(self):
+        workflow, _ = slow_workflow()
+        for bad in (0, -1.0):
+            with self.assertRaises(ValueError):
+                Orchestrator(workflow, timeout=bad)
+
+
 if __name__ == "__main__":
     unittest.main()

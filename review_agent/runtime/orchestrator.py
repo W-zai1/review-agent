@@ -20,9 +20,17 @@
     `run(state)` 总是从 `state.stage` 继续，不重跑已完成阶段。
     幂等由调用方保证：同一份 state 跑两次得到同样的状态（节点本身必须确定性；
     语义审节点例外，它的幂等靠模型缓存，见 AGENT_RUNTIME §7）。
+
+超时（阶段 4）：
+    `timeout` 是**单节点**上限，不是整次审查的上限。理由：整次超时只能告诉你
+    「跑太久了」，单节点超时能告诉你「卡在哪个节点的第几次尝试」。
+    超时被记为 `retryable=True` 的失败——模型慢、IO 抖动都是可重试的；
+    而节点自己报出的确定性错误（入参不对、状态机拒绝）不可重试。
+    默认 `None`（不限制）：迁移期先不改变既有行为，由入口显式打开。
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hashlib
 import json
@@ -203,10 +211,13 @@ class Orchestrator:
     checkpoints: CheckpointStore | None = None
     max_attempts: int = 1
     config: Mapping[str, Any] = field(default_factory=dict)
+    timeout: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError("max_attempts 从 1 开始")
+        if self.timeout is not None and self.timeout <= 0:
+            raise ValueError(f"timeout 必须为正数（秒），实际 {self.timeout!r}")
 
     async def run(self, state: RunState) -> RunOutcome:
         events: list[NodeEvent] = []
@@ -248,8 +259,17 @@ class Orchestrator:
         for attempt in range(1, self.max_attempts + 1):
             started = time.perf_counter()
             try:
-                result = await node.run(NodeContext(
+                call = node.run(NodeContext(
                     state=state, config=self.config, next_finding_seq=next_seq))
+                if self.timeout is None:
+                    result = await call
+                else:
+                    result = await asyncio.wait_for(call, timeout=self.timeout)
+            except TimeoutError:
+                # 3.11+ 的内建 TimeoutError 就是 asyncio.TimeoutError
+                result = NodeResult.fail(
+                    f"{node.name} 超时（超过 {self.timeout:g}s 未返回）",
+                    retryable=True)
             except Exception as e:                      # noqa: BLE001 - 编排边界
                 result = NodeResult.fail(
                     f"{node.name} 抛异常：{type(e).__name__}: {e}")

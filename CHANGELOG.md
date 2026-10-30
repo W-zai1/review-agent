@@ -44,6 +44,19 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 4 起步：单节点超时（`Orchestrator(timeout=...)`）
+
+- **文件**：`review_agent/runtime/orchestrator.py`、`review_agent/application/service.py`、`checks/test_orchestrator.py`（+6 项）、`docs/AGENT_RUNTIME.md` §7、`docs/REFACTOR_PLAN.md` §1/§6
+- **改了什么**：
+  1. `Orchestrator` 增加 `timeout: float | None`：每个节点的一次尝试用 `asyncio.wait_for` 包住，超时记为 `NodeResult.fail(retryable=True)`——**模型慢 / IO 抖动可重试**。
+  2. 默认 `None`（不限制），由入口显式打开：迁移期不改变既有行为（既有 21 项编排器用例仍按原样通过）。
+  3. `ReviewApplication(node_timeout=...)` 透传到编排器。
+  4. `timeout <= 0` 在构造期直接 `ValueError`，不留到运行时变成「每个节点都立刻超时」。
+- **为什么**：阶段 4 的六项目前只有 Retry/Checkpoint 有骨架。整次审查超时（server 的 `--review-timeout`）只能回答「跑太久了」，节点级超时才能回答「卡在哪个节点的第几次尝试」——恢复与排障靠的都是后者。
+- **为什么不顺手把默认值打开**：AGENT_RUNTIME §7 的建议值（ingestion 60s / analysis 单块 120s…）还没用真实 `logs/*/cost.json` 校准。先有旋钮、再有数据、最后定默认，顺序反了就会变成「凭感觉设一个数字，然后把正常慢请求判成失败」。
+- **验证**：`python -m unittest discover -s checks` → **431 项 OK**（新增 6）；超时用例覆盖「超时即失败并指出节点名」「超时会重试到 max_attempts」「默认不限制」「快节点不受影响」「开了超时不会让确定性失败变成可重试」「非法值构造期报错」。
+- **已知边界**：超时只能打断 `await` 得住的节点。节点内部若做同步阻塞调用（同步读大文件），`asyncio.wait_for` 抢占不了——那类慢只能靠进程级超时兜底，已写进 AGENT_RUNTIME §7。
+
 ### 2026-10-31 · 新增 · 阶段 3 起步：批次 1 工具落地为独立 `BaseTool`（`math.check` / `logic.check`）
 
 - **文件**：`review_agent/capabilities/builtin_tools.py`（新增）、`review_agent/capabilities/__init__.py`、`review_agent/capabilities/tools.py`（管线顺序的 docstring 更正）、`review.py`（`build_capability_registry`）、`checks/test_builtin_tools.py`（新增 17 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

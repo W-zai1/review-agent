@@ -18,7 +18,7 @@
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
 | 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application / Task / Report 服务均已落地；剩在线切流） |
 | 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管，12 个 builtin + `pack:*` 已注册；批次 1 已迁 `math.check` / `logic.check` 两个独立工具；其余 8 个与 `tools/` 42 模块的逐条理由见 TOOL_SPECIFICATION §7） |
-| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | 未开始 |
+| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **进行中**（Retry ✅；Checkpoint ✅；**单节点超时 ✅ 2026-10-31**；幂等 / 统一 AuditEvent 流 / 故障注入未做） |
 | 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | 未开始 |
 
 ## 2. 阶段 0：冻结与盘点（已完成）
@@ -129,12 +129,12 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 | 项 | 现状 | 目标 |
 | --- | --- | --- |
-| Checkpoint | 无（server 侧 `_recover_jobs` 试探修复） | 阶段边界落盘 + `state_hash` 校验 |
-| Retry | 分散在各调用点 | 由 Orchestrator 统一策略（见 AGENT_RUNTIME §7） |
-| Timeout | server 层整体超时（`--review-timeout`） | 节点级超时 + 整体兜底 |
-| 幂等 | `allocate_review_id` 用锁文件 | `(run_id, stage)` 幂等键；重复执行不产生第二份报告 |
-| 审计 | `task.json` + `tools.jsonl` + `decisions.jsonl` 三套 | 统一 `AuditEvent` 流，旧文件由事件流生成 |
-| 失败注入 | 无 | 故障注入测试：模型超时、写盘失败、进程被杀 |
+| Checkpoint | ✅ `FileRunStore` + `MemoryCheckpointStore` + `state_hash`（阶段 2 已落地） | 阶段边界落盘 + `state_hash` 校验 |
+| Retry | ✅ 由 `Orchestrator(max_attempts)` 统一；只有 `retryable=True` 才重试 | 由 Orchestrator 统一策略（见 AGENT_RUNTIME §7） |
+| Timeout | ✅ **2026-10-31 已加单节点超时**（`Orchestrator(timeout=...)`，超时=可重试失败）；整体兜底仍是 server 的 `--review-timeout` | 节点级超时 + 整体兜底 |
+| 幂等 | 部分：`allocate_review_id` 用锁文件，并已扫描 `state/tasks/`；**没有 `(run_id, stage)` 幂等键** | `(run_id, stage)` 幂等键；重复执行不产生第二份报告 |
+| 审计 | 未做：仍是 `task.json` + `tools.jsonl` + `decisions.jsonl` 三套 | 统一 `AuditEvent` 流，旧文件由事件流生成 |
+| 失败注入 | 未做（超时已有用例，模型不可用/写盘失败/杀进程没有） | 故障注入测试：模型超时、写盘失败、进程被杀 |
 
 验收：三类故障（模型不可用、磁盘只读、进程中断）都能给出明确错误或恢复，不允许「静默半成品」。
 
