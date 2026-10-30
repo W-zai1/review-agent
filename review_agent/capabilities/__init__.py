@@ -7,8 +7,13 @@
 from __future__ import annotations
 
 from .builtin_tools import (
+    IntegrityHashTool,
     LogicCheckTool,
     MathCheckTool,
+    PatternScanTool,
+    PatternScanArgs,
+    RuleClassifyArgs,
+    RuleClassifyTool,
     TextCheckArgs,
     batch1_tools,
 )
@@ -38,5 +43,7 @@ __all__ = [
     "ToolArgumentError", "ToolContext", "ToolError", "ToolInvocation",
     "ToolPermissionError", "ToolRegistry", "ToolResult", "default_permissions",
     "Candidate", "IngestContext", "IngestResult", "ingest_candidates",
-    "LogicCheckTool", "MathCheckTool", "TextCheckArgs", "batch1_tools",
+    "IntegrityHashTool", "LogicCheckTool", "MathCheckTool", "PatternScanTool",
+    "PatternScanArgs", "RuleClassifyArgs", "RuleClassifyTool", "TextCheckArgs",
+    "batch1_tools",
 ]

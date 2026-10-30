@@ -132,27 +132,38 @@ ToolRegistry
 | `pattern_rules.py` | `rules.pattern` | READ | 声明式规则求值 |
 | `match_matrix.py` | `matrix.match` | ANALYZE | 要求对照矩阵 |
 
-**进度（2026-10-31）**：批次 1 已迁 **4 个**为独立 `BaseTool`：
+**进度（2026-10-31）**：批次 1 已迁 **5 个**为独立 `BaseTool`：
 `math.check`（← `arith_check.run_all`）、`logic.check`（← `logic_checks.run_all`）、
-`rules.classify`（← `rule_exec.summarize` / `counts`）、`integrity.hash`（← `integrity.sha256_bytes`）。
+`rules.classify`（← `rule_exec.summarize` / `counts`）、`integrity.hash`（← `integrity.sha256_bytes`）、
+`rules.pattern`（← 新增纯核心 `pattern_rules.scan_hits`，旧的 `scan()` 改为委托）。
 实现在 `review_agent/capabilities/builtin_tools.py`，由 `review.build_capability_registry()` 装配，
-验收 `checks/test_builtin_tools.py`（28 项：真算法、三态 `rule_ids`、权限分级、审计、确定性）。
+验收 `checks/test_builtin_tools.py`（36 项：真算法、三态 `rule_ids`、权限分级、审计、
+确定性，以及 `rules.pattern` 与旧 `scan()` 的**差分一致性**）。
 算法本体不复制——`capabilities` 层不许 import `tools/`（ARCHITECTURE §3 第 3 条），
 所以由 `review.py` 在装配时注入函数。
 
-其余 6 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
+`rules.pattern` 的抽法值得单独记一句：`scan(s, ...)` 的第一个参数是 Session，
+工具不该造一个假 Session 来跑。做法是把匹配语义抽成纯核心 `scan_hits(text, rules, ...)`
+返回 `(参与匹配的规则数, [命中])`，`scan()` 只负责把命中写进 Session。
+判定条件（pattern / require / guard / unless / 注释去噪 / 文档字符串去噪）仍然只有一份。
+
+其余 5 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
 
 | 工具 | 卡在哪 |
 | --- | --- |
 | `text.regex` | `regex_check.strip_invisible` 只返回清洗后文本，没有「清洗后位置 → 原文位置」映射；工具要在原文坐标上给证据，得先给旧实现加一个带映射的版本（属改旧代码，单独评） |
 | `text.lint` | `lint.run_lint(path)` 收的是**路径**（要读文件、跑 ruff/eslint），属有 IO |
-| `rules.pattern` | `pattern_rules.scan(s, text, rules, ...)` 第一个参数就是 Session；要先抽出纯核心 `iter_hits()` 再让旧函数委托 |
 | `docx.format` | `run_all(info, ridset, spec)` 本身是纯的，但入参要 docx 解析产物（批次 2 的接口） |
 | `law.cite` | `check()` 内部 `law_index.load_all()`，要先改成索引注入 |
 | `matrix.match` | `build(..., cfg)` 可注入配置，但 `load_config()` 仍是文件 IO；需明确「谁负责读配置」 |
 
 `rules.classify` 与 `integrity.hash` 的权限是 **READ**——它们只查表/只算哈希，不读材料，
 不该要求 `ANALYZE`。权限收紧比放宽难，先按最小权限给。
+
+> 实测补充：当前 `rules/` 里的 33 条规则**没有一条**自带 `pattern`（全部走 `method`
+> + 内置执行器）。所以 `rules.pattern` 在真实规则集上会明确返回「没有带 pattern 的规则」，
+> 而不是假装扫过一遍——这条由 `checks/test_builtin_tools.py::test_real_ruleset_is_handled_honestly`
+> 钉住；将来规则集加了声明式规则，这条用例会变成正向断言。
 
 ### 批次 2：有 IO / 依赖外部，后迁（接口先定，实现后换）
 

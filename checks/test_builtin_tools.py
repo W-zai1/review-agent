@@ -54,7 +54,7 @@ class CapabilityRegistryTests(unittest.TestCase):
     def test_batch1_tools_are_registered(self):
         self.assertEqual(self.registry.names(),
                          ("integrity.hash", "logic.check", "math.check",
-                          "rules.classify"))
+                          "rules.classify", "rules.pattern"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
@@ -261,6 +261,121 @@ class IntegrityHashToolTests(unittest.TestCase):
                              {"text": "abc"},
                              context(permissions=[Permission.READ]))
         self.assertTrue(result.ok)
+
+
+PATTERN_RULES = [
+    {"rule_id": "TEST-001", "dimension": "custom", "desc": "禁止 os.system",
+     "pattern": r"os\.system\s*\(", "confidence": 0.9,
+     "suggestion": "改用 subprocess"},
+    {"rule_id": "TEST-002", "dimension": "custom", "desc": "shell=True 需 subprocess",
+     "pattern": r"shell\s*=\s*True", "require": r"subprocess"},
+    {"rule_id": "TEST-003", "dimension": "custom", "desc": "禁止 TODO",
+     "pattern": r"TODO"},
+]
+
+PATTERN_TEXT = (
+    "import os\n"
+    "os.system('ls')\n"
+    "# TODO 这只是注释\n"
+    "x = run(cmd, shell=True)\n"
+    "y = subprocess.run(cmd, shell=True)\n"
+)
+
+
+class _FakeSession:
+    """只实现 `scan()` 用到的那几个方法：用来做「工具 vs 旧函数」的差分。"""
+
+    def __init__(self):
+        self.issues = []
+        self.tool_logs = []
+
+    def make_issue(self, **kwargs):
+        return kwargs
+
+    def add_issue(self, issue):
+        key = (issue.get("rule_id"), issue.get("quote"))
+        if any((i.get("rule_id"), i.get("quote")) == key for i in self.issues):
+            return False
+        self.issues.append(issue)
+        return True
+
+    def tool(self, *args, **kwargs):
+        self.tool_logs.append((args, kwargs))
+
+
+class PatternScanToolTests(unittest.TestCase):
+    """声明式规则：工具与旧 `scan()` 必须给出**同一批**命中。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def _run(self, **over):
+        args = {"text": PATTERN_TEXT, "rules": PATTERN_RULES}
+        args.update(over)
+        return run_tool(self.registry, "rules.pattern", args)
+
+    def test_require_and_comment_semantics(self):
+        result, _ = self._run()
+        self.assertTrue(result.ok)
+        rule_ids = [f["rule_id"] for f in result.data["findings"]]
+        self.assertEqual(rule_ids, ["TEST-001", "TEST-002"],
+                         "注释行不该命中；require 不满足的第一行 shell=True 也不该命中")
+
+    def test_matches_the_legacy_scan_exactly(self):
+        """差分：同一份文本、同一批规则，工具与 `pattern_rules.scan()` 命中一致。"""
+        import pattern_rules
+
+        result, _ = self._run()
+        own = [(f["rule_id"], f["quote"], f["location"], f["evidence"])
+               for f in result.data["findings"]]
+
+        session = _FakeSession()
+        pattern_rules.scan(session, PATTERN_TEXT, PATTERN_RULES)
+        legacy = [(i["rule_id"], i["quote"], i["location"], i["evidence"])
+                  for i in session.issues]
+        self.assertEqual(own, legacy)
+
+    def test_rules_examined_counts_only_pattern_rules(self):
+        result, _ = self._run()
+        self.assertEqual(result.data["rules_examined"], 3)
+
+    def test_dimension_filter(self):
+        result, _ = self._run(dimension="other")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 0)
+        self.assertEqual(result.data["rules_examined"], 0)
+
+    def test_findings_are_untrusted(self):
+        result, _ = self._run()
+        self.assertTrue(result.untrusted)
+
+    def test_rules_without_pattern_are_rejected(self):
+        result, _ = self._run(rules=[{"rule_id": "X-1", "dimension": "custom"}])
+        self.assertFalse(result.ok)
+        self.assertIn("pattern", result.errors[0])
+
+    def test_rule_missing_dimension_is_rejected(self):
+        result, _ = self._run(rules=[{"rule_id": "X-2", "pattern": r"foo"}])
+        self.assertFalse(result.ok)
+        self.assertIn("dimension", result.errors[0])
+
+    def test_real_ruleset_is_handled_honestly(self):
+        """真实规则集当前**没有**声明式规则：工具必须明说，而不是假装扫过。
+
+        这条用例盯的是「能力边界要暴露」——如果哪天规则集加了 pattern 规则，
+        它会变成正向用例；在此之前，它证明工具不会把「没规则可跑」当成 success。
+        """
+        real = [dict(r) for r in review.load_rules()]
+        self.assertTrue(real, "规则集不该为空")
+        declarative = [r for r in real if r.get("pattern")]
+        result, _ = run_tool(self.registry, "rules.pattern",
+                             {"text": "任意一段待审文本", "rules": real})
+        if declarative:
+            self.assertTrue(result.ok)
+            self.assertEqual(result.data["rules_examined"], len(declarative))
+        else:
+            self.assertFalse(result.ok)
+            self.assertIn("pattern", result.errors[0])
 
 
 if __name__ == "__main__":

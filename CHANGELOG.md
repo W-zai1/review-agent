@@ -44,6 +44,18 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`rules.pattern` 工具 + `pattern_rules.scan_hits` 纯核心（批次 1 达 5/10）
+
+- **文件**：`tools/pattern_rules.py`（新增 `scan_hits`，`scan` 改为委托）、`review_agent/capabilities/builtin_tools.py`（`PatternScanTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `pattern_rules.scan_hits`）、`checks/test_builtin_tools.py`（+8 项 → 36 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `pattern_rules.scan_hits(text, rules, ...)`：把匹配语义（pattern / require / guard / unless / 注释行去噪 / 文档字符串去噪 / 维度筛选）抽成**纯核心**，返回 `(参与匹配的规则数, [命中])`。
+  2. 旧 `pattern_rules.scan(s, ...)` 改为委托 `scan_hits()`，只负责把命中写进 Session。**判定条件仍然只有一份**——两处一旦分叉，「流水线说有命中、工具说没有」就没法解释。
+  3. `rules.pattern`（权限 ANALYZE）工具：入参 `{text, rules, dimension?, skip_comments?, target_suffix?}`，出参 `{findings, count, rules_examined}`，标 `untrusted=True`。
+  4. 工具边界校验：没有带 `pattern` 的规则 → 失败；带 pattern 但缺 `rule_id` / `dimension` → 失败（否则 `scan_hits` 会在写 issue 时 `KeyError`）。
+- **为什么**：`scan()` 的第一个参数是 Session，工具不该造一个假 Session 去跑真实逻辑——那等于让「独立工具」继续依赖旧流程的内部形状。
+- **验证**：`checks` → **450 项 OK**（+8）；其中 `test_matches_the_legacy_scan_exactly` 是**差分用例**：同一份文本、同一批规则，工具结果与 `pattern_rules.scan()` 写进假 Session 的 issue 逐字段一致（rule_id / quote / location / evidence）。`tests/` 642 项 OK。
+- **实测发现**：当前 `rules/` 的 33 条规则**没有一条**自带 `pattern`，所以这个工具在真实规则集上会明确报「没有带 pattern 的规则」。用例 `test_real_ruleset_is_handled_honestly` 按这个现状写，规则集将来加了声明式规则它就自动变成正向断言。
+
 ### 2026-10-31 · 新增 · 阶段 3：`rules.classify` / `integrity.hash` 两个独立工具（批次 1 达 4/10）
 
 - **文件**：`review_agent/capabilities/builtin_tools.py`、`review.py`（`build_capability_registry` 注入 `rule_exec` / `integrity`）、`checks/test_builtin_tools.py`（+11 项 → 28 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

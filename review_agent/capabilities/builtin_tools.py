@@ -166,9 +166,77 @@ class IntegrityHashTool(BaseTool):
         })
 
 
+@dataclass(frozen=True, slots=True)
+class PatternScanArgs:
+    """声明式规则扫描：判定条件全在规则里，工具只做通用匹配。"""
+
+    text: str
+    rules: tuple[dict[str, Any], ...]
+    dimension: str | None = None
+    skip_comments: bool = True
+    target_suffix: str = ""
+
+
+class PatternScanTool(BaseTool):
+    """执行带 `pattern` 的声明式规则（`require` / `guard` / `unless` 组合判断）。
+
+    与旧 `pattern_rules.scan()` 共用同一个纯核心 `scan_hits()`：工具不造假 Session，
+    但匹配语义必须完全一致——否则「流水线说有命中、工具说没有」无法解释。
+    """
+
+    name = "rules.pattern"
+    description = ("按规则自带的 pattern 扫描文本，支持 require（同行必须同时出现）、"
+                   "guard / unless（出现即放弃）与注释行去噪。"
+                   "判定条件来自规则定义，工具本身不含业务规则。")
+    permission = Permission.ANALYZE
+    arguments_type = PatternScanArgs
+
+    def __init__(self, *, scan_hits: Callable[..., tuple[int, list]]) -> None:
+        self._scan_hits = scan_hits
+
+    async def execute(self, arguments: PatternScanArgs,
+                      context: ToolContext) -> ToolResult:
+        text = arguments.text or ""
+        if not text.strip():
+            return ToolResult.failure("text 为空：没有可扫描的内容（空输入不等于无问题）")
+        rules = tuple(arguments.rules or ())
+        if not rules:
+            return ToolResult.failure("rules 为空：没有可执行的规则")
+        with_pattern = [r for r in rules if isinstance(r, Mapping) and r.get("pattern")]
+        if not with_pattern:
+            return ToolResult.failure(
+                "rules 里没有任何带 pattern 的规则：本工具只执行声明式规则")
+        bad = [r for r in with_pattern
+               if not r.get("rule_id") or not r.get("dimension")]
+        if bad:
+            return ToolResult.failure(
+                "带 pattern 的规则必须同时声明 rule_id 与 dimension，"
+                f"缺失 {len(bad)} 条（否则结论无法归属到规则/维度）")
+
+        total, hits = self._scan_hits(
+            text, rules, dimension=arguments.dimension,
+            skip_comments=bool(arguments.skip_comments),
+            target_suffix=arguments.target_suffix or "")
+        findings = tuple({
+            "rule_id": hit["rule"]["rule_id"],
+            "dimension": hit["rule"]["dimension"],
+            "quote": hit["quote"],
+            "location": f"第 {hit['lineno']} 行",
+            "evidence": f"{hit['rule'].get('desc', '')}｜命中「{hit['matched']}」",
+            "suggestion": hit["suggestion"],
+            "confidence": hit["confidence"],
+            "tool": "pattern_rule",
+        } for hit in hits)
+        return ToolResult.success(
+            data={"findings": findings, "count": len(findings),
+                  "rules_examined": total},
+            untrusted=True,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
-                 rule_summarize, rule_counts,
-                 sha256_bytes) -> tuple[BaseTool, ...]:
+                 rule_summarize, rule_counts, sha256_bytes,
+                 pattern_scan_hits: Callable[..., tuple[int, list]]) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
     为什么集中成一个函数：注册表怎么装配是入口的事，工具清单是能力层的事。
@@ -179,4 +247,5 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         LogicCheckTool(logic_run_all),
         RuleClassifyTool(summarize=rule_summarize, counts=rule_counts),
         IntegrityHashTool(sha256_bytes=sha256_bytes),
+        PatternScanTool(scan_hits=pattern_scan_hits),
     )

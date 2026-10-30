@@ -1846,7 +1846,8 @@ def build_capability_registry(*, on_invoke=None):
             logic_run_all=logic_checks.run_all,
             rule_summarize=rule_exec.summarize,
             rule_counts=rule_exec.counts,
-            sha256_bytes=integrity.sha256_bytes):
+            sha256_bytes=integrity.sha256_bytes,
+            pattern_scan_hits=pattern_rules.scan_hits):
         registry.register(tool)
     return registry
 

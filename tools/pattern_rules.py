@@ -82,14 +82,18 @@ def string_lines(text):
     return out
 
 
-def scan(s, text, rules, dimension=None, tool="pattern_rule", skip_comments=True,
-         target_suffix=""):
-    """执行所有带 `pattern` 的规则，返回 session。
+def scan_hits(text, rules, dimension=None, skip_comments=True, target_suffix=""):
+    """纯核心：返回 (参与匹配的规则数, [命中])，不碰 Session。
 
-    dimension 为 None 时不筛维度（由调用方保证 rules 已按维度裁剪）。
+    为什么单独抽出来：`rules.pattern` 工具要用**同一套**判定语义（pattern /
+    require / guard / unless 四件套），但工具不该造一个假 Session 去调 `scan`。
+    判定条件只在这里实现一次，`scan` 与工具都调它；两处行为一旦分叉，
+    「同一份文本，流水线说有命中、工具说没有」这种矛盾就没法解释。
+
+    命中的元素是 dict：rule / lineno / quote / matched / confidence / suggestion。
     """
     str_lines = string_lines(text) if target_suffix.lower() in _CODE_SUFFIX else set()
-    hits = total = 0
+    total, hits = 0, []
     for rule in rules:
         if not rule.get("pattern"):
             continue
@@ -116,16 +120,41 @@ def scan(s, text, rules, dimension=None, tool="pattern_rule", skip_comments=True
                 continue
             if unless and unless.search(line):
                 continue
-            if s.add_issue(s.make_issue(
-                    dim=rule["dimension"],
-                    rule_id=rule["rule_id"],
-                    quote=stripped,
-                    location=f"第 {lineno} 行",
-                    evidence=f"{rule.get('desc', '')}｜命中「{m.group(0).strip()[:60]}」",
-                    tool=tool,
-                    confidence=conf,
-                    suggestion=rule.get("suggestion") or "按规则要求整改后复核。")):
-                hits += 1
+            hits.append({
+                "rule": rule,
+                "lineno": lineno,
+                "quote": stripped,
+                "matched": (m.group(0) or "").strip()[:60],
+                "confidence": conf,
+                "suggestion": (rule.get("suggestion")
+                               or "按规则要求整改后复核。"),
+            })
+    return total, hits
+
+
+def scan(s, text, rules, dimension=None, tool="pattern_rule", skip_comments=True,
+         target_suffix=""):
+    """执行所有带 `pattern` 的规则，返回 session。
+
+    dimension 为 None 时不筛维度（由调用方保证 rules 已按维度裁剪）。
+    实现委托 `scan_hits()`：匹配语义只有一份，这里只负责把命中写进 Session。
+    """
+    total, hits = scan_hits(text, rules, dimension=dimension,
+                            skip_comments=skip_comments,
+                            target_suffix=target_suffix)
+    added = 0
+    for hit in hits:
+        rule = hit["rule"]
+        if s.add_issue(s.make_issue(
+                dim=rule["dimension"],
+                rule_id=rule["rule_id"],
+                quote=hit["quote"],
+                location=f"第 {hit['lineno']} 行",
+                evidence=f"{rule.get('desc', '')}｜命中「{hit['matched']}」",
+                tool=tool,
+                confidence=hit["confidence"],
+                suggestion=hit["suggestion"])):
+            added += 1
     s.tool(tool, f"{dimension or '全部'}｜声明式规则 {total} 条",
-           f"命中 {hits} 条", 0, status="success" if total else "skipped")
+           f"命中 {added} 条", 0, status="success" if total else "skipped")
     return s
