@@ -42,9 +42,356 @@
 
 ---
 
+# 2026-10-30
+
+### 2026-10-30 · 修改 · 版本号升至 0.9.2，归档 Architecture/Runtime/Engine v1
+
+- **文件**：`VERSION`、`README.md`、`.gitignore`、`docs/README.md`、`CHANGELOG.md`
+- **改了什么**：
+  1. `VERSION` 0.9.1 → 0.9.2，README 标题与「当前实现」同步（`checks/test_invariants.py` 要求标题含版本号，漏改即红）。
+  2. `.gitignore` 新增 `docs/系统诊断报告*.md`：该文含 P0/P1 缺陷清单与漏洞细节，按本仓库「测试/漏洞报告不公开」的既定规则只留本地。
+  3. `docs/README.md` 注明该诊断报告不在公开仓库，属预期而非链接失效。
+- **为什么**：阶段 0「冻结与盘点」要求固定当前版本和 Git Tag。此前 0.9.0/0.9.1 两个 tag 与 3 个提交都只在本地，远端 `origin/main` 停在 `0f1cbaa`（10-27）。不升版本直接打 tag，会出现「tag 叫 0.9.2、VERSION 写 0.9.1」的自相矛盾，违反 `tools/version.py` 的「版本号唯一事实源」约定。诊断报告本身也把「公开仓库仍跟踪内部报告」列为 P0-3，这次一并执行。
+- **验证**：`python -m unittest discover -s checks` → 376 项 OK；`python -m unittest discover -s tests` → 642 项 OK（221s）；`python tools/golden_eval.py` → 召回 100% / 误报 0；`python tools/changelog_guard.py` → exit 0。
+- **影响面**：报告 `model_version` 由 `v0.9.1-demo` 变为 `v0.9.2-demo`；历史报告的 `report_hash` 自包含 `model_version`，**复算仍通过**，不需要重算。
+
+### 2026-10-30 · 新增 · 影子报告接入目的比对（`purpose`）
+
+- **文件**：`review.py`（`_attach_purpose`、`_run_v1` / `_run_shadow` 传 `purpose_info`）、`review_agent/application/shadow_report.py`（`purpose` 字段、Markdown 目标段、`unsupported_blocks` 减到 2 项）、`checks/test_shadow_report.py`
+- **改了什么**：
+  1. 影子报告新增 `purpose`：复用 `purpose_mod.analyze()`（同一套意图词典、同一套证据定位规则），带 `intents` / `goals`（含 `question` / `status` / `evidence_ids`）/ `evidence` / `matrix` / `judge`。
+  2. `judge=None`：v1 暂不做模型语义裁决（要额外一次调用），但确定性部分完整——目标定位、覆盖、未找到说明。
+  3. 未找到的目标写进 limitations（**未找到 ≠ 不存在**），Markdown 增加「审查目的比对」段。
+  4. `unsupported_blocks` 从 3 项减到 **2 项**（law_library / research）。
+- **为什么**：`--purpose` 是产品的核心入口之一（"按你的目的，看到了什么"）。旧报告把目的比对放在 S5.5、依赖 Session；v1 一直缺这块，用户填了目的也看不到对照结果。
+- **验证**：
+  - `python -m unittest discover -s checks` → **376 项 OK**（新增 2）
+  - 端到端：`--purpose "这是给客户的合同，找出对我方不利的条款"` → 报告 `purpose.goals` 两条（要件齐全 found、违约责任对等 not_found），4 条原文证据
+  - `python -m unittest discover -s tests` → **642 项 OK / 262s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+
+### 2026-10-30 · 新增 · 影子报告接入整改单（`action_plan`）
+
+- **文件**：`review.py`（`_attach_action_plan`、写入前挂载）、`review_agent/application/shadow_report.py`（`action_plan` 字段、Markdown 整改段、`unsupported_blocks` 减到 3 项）、`checks/test_shadow_report.py`
+- **改了什么**：
+  1. 影子报告新增 `action_plan`：复用 `remediation.attach()`（同一套规则表与改写模板，避免两套口径），每条发现挂 `fix`（`action` / `where` / `from` / `to` / `how` / `consequence` / `has_rewrite`），计划只列 blocker/major 并给出 `concrete` / `manual` / `headline`。
+  2. **挂在 `report_hash` 之前**：完整性哈希必须覆盖整改建议本身，否则"改了改写建议再重算结论"就无从发现。
+  3. Markdown 增加「整改建议」段：怎么改 + 不改会怎样。
+  4. `unsupported_blocks` 从 4 项减到 **3 项**（purpose / law_library / research）。
+- **为什么**：只给"建议"的报告把改写工作留给用户。整改单回答的是「改哪一句 / 改成什么 / 不改会怎样」——这是审查工具从"指出问题"到"可执行"的分界。
+- **验证**：
+  - `python -m unittest discover -s checks` → **374 项 OK**（新增 3：整改单形状 / Markdown 渲染 / v1 报告含 fix）
+  - 端到端：`contract_001.md` 的 v1 报告 `action_plan.total=1, concrete=1`，`headline="1 条可直接改，0 条需人工改写"`，issue 带完整 `fix`
+  - `python -m unittest discover -s tests` → **642 项 OK / 249s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+
+### 2026-10-30 · 修复 · Windows 并发审查偶发 `PermissionError: .chain.lock`
+
+- **文件**：`review.py`（`_acquire_ledger_lock` 增加 PermissionError 分支、抽出 `_wait_for_ledger_lock`）
+- **改了什么**：拿台账写锁时，除了 `FileExistsError` 也捕获 `PermissionError`——Windows 上「锁文件已存在且被另一进程打开」时，`os.open(..., O_EXCL)` 抛的是 `PermissionError`（实测 6 路并发必现）。原实现直接把它抛给调用方，整次审查失败。两处细节：① 抽出 `_wait_for_ledger_lock()`（清超龄锁 / 等 10ms / 超时报可操作错误），两条分支共用；② **不要**先判断「锁文件还在不在」再决定是否重试——持有者可能在两次系统调用之间就删了锁，这个检查会误判成「目录不可写」而直接抛错（第一版就这么写的，8 次压测里复现 1 次）。
+- **为什么**：这是 `tests/test_bruteforce_regressions.py::test_chain_survives_six_concurrent_reviews` 在全量回归里偶发失败的原因（6 路并发 + 系统负载）。锁争用是**正常现象**，不该表现为异常；链完整性由台账校验兜底，锁只需要保证「同一时刻只有一个写者」。
+- **验证**：`LedgerConcurrencyTests` 连跑 **10 次 0 失败**（修复前约 1/8 失败）；`python -m unittest discover -s checks` → **372 项 OK**；全量回归见下条。
+
+### 2026-10-30 · 新增 · v1 日志与限制口径：`logs_hash` 补齐 + limitations 规范化
+
+- **文件**：`review.py`（`_write_v1_logs`、`_write_shadow_report` 接收 `session`、`_run_v1`/`_run_shadow` 接线）、`review_agent/application/shadow_report.py`（`review_mode`、limitations 分类、`integrity` 块内置）、`checks/test_v1_integrity.py`、`checks/test_shadow_report.py`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. **v1 日志**：写 `logs/v1/<review_id>/{decisions.jsonl, tools.jsonl, task.json}`，并对目录取哈希进 `integrity.logs_hash`。之前报告只能证明"结论没被改过"，不能证明"过程也没被改过"。
+  2. **limitations 规范化**：按固定顺序给——未支持块 → 模式边界（纯规则审）→ 文本覆盖（语义审覆盖率 / 失败块）→ 证据丢弃条数 → 日志缺失（仅当没写）→ 节点告警。旧实现是散在 `run_one` 里按场景拼，读者很难判断"边界到底在哪"。合并完成后 `unsupported_blocks` 从 5 项减到 4 项（`coverage.limitations` 已退出清单）。
+  3. 影子报告新增 `review_mode`（rule-only / rule+llm），`integrity` 块改由 builder 统一生成（`_write_shadow_report` 只负责补 `prev_report_hash` 与 `report_hash`）。
+- **为什么**：完整性链如果只覆盖结论、不覆盖过程，等于"可以改过程再重算结论哈希"——审计价值减半。limitations 同理：写得散，读者就只看到结论、看不到"没查什么"。
+- **验证**：
+  - `python -m unittest discover -s checks` → **372 项 OK**（新增 1；完整性用例扩到 6 项）
+  - 新用例：`logs_hash` 非空且等于目录哈希、**改 `task.json` 后目录哈希变化**（过程可校验）、三件日志文件都存在
+  - `python -m unittest discover -s tests` → **642 项 OK / 233s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+
+### 2026-10-30 · 新增 · v1 影子报告接入完整性链（`report_hash` + `ledger/v1-chain.log`）
+
+- **文件**：`review.py`（`_integrity_inputs`、`_write_shadow_report` 印章与链、`run_typed_pipeline` 增 `integrity_out`、`_run_v1` / `_run_shadow` 接线）、`review_agent/application/shadow_report.py`（移除 `integrity.chain` 未支持项，补 `logs_hash` 说明）、`review_agent/application/__init__.py`、`checks/test_v1_integrity.py`（新增）、`checks/test_shadow_report.py`
+- **改了什么**：
+  1. 影子报告带完整指纹：`target_hash` / `ruleset_hash` / `rules_dir_hash` / `rules_version` / `agent_dir_hash` / `agent_version` / `knowledge_hash` / `knowledge_version`，与旧报告同一批 `integrity.*` 函数（同一口径）。
+  2. `report_hash` 用同一套 `compute_report_hash` 计算，可由报告文件本身复算；改任何一个字段都会对不上。
+  3. **独立成链** `ledger/v1-chain.log`：序号连续、`prev_hash` 相接、`verify_ledger` 通过；不写官方 `ledger/chain.log`（v1 报告在 `outputs/v1/`，混进官方链会让 `integrity verify` 找不到对应报告）。
+  4. `unsupported_blocks` 从 6 项减为 5 项（哈希链已接入）；`logs_hash` 为空单独写进 limitations——v1 还没写决策/工具日志。
+- **为什么**：报告是交付物，"结论可被篡改而无人察觉"比"缺 purpose 块"严重得多。这是切流清单里优先级最高的一项。
+- **验证**：
+  - `python -m unittest discover -s checks` → **371 项 OK**（新增 6：完整性 5 + 报告块 1）
+  - 用例覆盖：`report_hash` 可复算、**篡改 verdict 后哈希失配**（可证伪）、两次 v1 后链 seq=1/2 且 prev 接得上、官方 `chain.log` 未被创建、指纹字段齐全且 `logs_hash` 为空
+  - `python -m unittest discover -s tests` → **642 项 OK / 233s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - 手工冒烟：`--engine v1 --no-llm` → `outputs/v1/R-20261030-024.json`；`integrity.verify_ledger('ledger/v1-chain.log')` → 校验通过，1 条记录
+
+### 2026-10-30 · 新增 · 影子报告：v1 的交付物（`outputs/v1/`）
+
+- **文件**：`review_agent/application/shadow_report.py`（新增）、`review_agent/application/__init__.py`、`review.py`（`_FinalizeNode` 改用 `build_shadow_report`、`_write_shadow_report`、`_run_v1`/`_run_shadow` 落盘）、`checks/test_shadow_report.py`（新增）、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. 新增影子报告 `schema_version=1.0-v1-shadow`：`engine` / `target` / `verdict` / `decision` / `stats` / `by_origin` / `issues` / `evidence` / `disputes` / `coverage` / `limitations` / `unsupported_blocks` / `audit`（节点事件 + 检查点 + 阶段）。
+  2. **`unsupported_blocks` 显式列出旧报告有、v1 还没有的 6 项**：purpose、law_library、research、action_plan、integrity.chain、limitations 合并口径。这张清单就是切流验收单——清零之前 v1 不能替代 legacy。
+  3. 落 `outputs/v1/<review_id>.json/.md`，**不占正式报告命名空间**；`--engine v1` 与 `--engine shadow` 都会写（双跑时差异能对着「新链路自己怎么说」看）。
+  4. Markdown 渲染刻意「先讲边界、再列条目」：读者先知道这份报告没做什么，再看发现了什么。
+- **为什么**：v1 到上一轮为止有完整结论却没有交付物。直接照抄旧报告格式等于伪造没算过的块（目的 / 法条 / 库外核验 / 整改单 / 哈希链）——"没算就不写、但要明说"是唯一诚实的做法。
+- **验证**：
+  - `python -m unittest discover -s checks` → **365 项 OK**（新增 10）
+  - 影子报告用例覆盖：形状与身份、`unsupported_blocks` 与常量一致、limitations 含未支持项与节点告警、**被丢弃的发现不混进 issues**、证据与发现对得上、审计带事件/检查点、target_meta 透传、Markdown 含裁定/边界/条目、空结果如实说明
+  - CLI 用例：`--engine v1` 写出 `outputs/v1/` 的 json+md，且 `outputs/` 下**没有**正式报告
+  - `python -m unittest discover -s tests` → **642 项 OK / 241s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - 手工冒烟：`--engine v1 --no-llm` → `outputs/v1/R-20261030-022.json`（6 项未支持块、7 条节点事件、7 个检查点）
+
+### 2026-10-30 · 新增 · 语义审接真模型：`--engine v1 --llm` 跑通
+
+- **文件**：`review.py`（`make_llm_review_fn`、`run_typed_pipeline` 增 `use_llm` / `llm_meta_out` / `purpose_info`、`_run_v1` 降级提示、`allocate_review_id` 纳入 `state/runs`）、`checks/test_llm_review_fn.py`（新增）、`checks/test_engine_switch.py`（更新 + 新增 1 项）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. **接线**：`make_llm_review_fn()` 把 `load_config` / `LLMClient` / `llm_review.review_dimension` 接起来，口径与旧 `semantic_review` 一致——按维度取生效规则、任务书并入用户目的、事实库进 prompt、quote 对**全文**校验。
+  2. **三态语义**：`use_llm=False` 纯规则；`None` 能配就配、配不上降级并**打印原因**；`True` 配不上直接抛 `ConfigError`。显式要求过模型却静默降级，是这次特意堵掉的口子。
+  3. **CLI**：`--engine v1 --llm` 可跑；`--engine shadow` 仍只允许 `--no-llm`（模型有波动，双跑比对无法判定差异性质）。
+  4. **修一个真实 bug**：`allocate_review_id` 原来只看 `outputs/` + ledger，v1 不写报告 → 第二次 v1 会拿到同一个 R-id 并覆盖上一份状态。现在把 `state/runs/*.state.json` 也算进已用 ID，并有用例钉住「两次 v1 产生两份状态」。
+- **为什么**：语义审的执行器、入库规则、节点都就位了，只差"一次真实调用"这根线。接上之后 `v1` 才是完整流水线（规则 + 模型），也才有资格谈切流。
+- **验证**：
+  - `python -m unittest discover -s checks` → **355 项 OK**（新增 8：接线 6 + 引擎 2）
+  - 真机一次：`--engine v1 --llm` → `model=deepseek-chat（ui）`，流水线 `completed`，2 条发现（1 规则 + 1 模型）
+  - mock 用例覆盖：配置不可用返回原因、配置加载异常不吞、可用时按维度传规则且 `full_text` 传全文、`use_llm=True` 不可用抛 `ConfigError`、`None` 降级但回填 meta、可用时 `semantic_stats` 进入 analysis 产物
+  - `python -m unittest discover -s tests` → **642 项 OK / 240s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **注意**：真机运行会消耗模型 token；`checks/test_engine_switch.py` 已把 LLM 配置显式 mock 成不可用，避免测试误发请求。
+
+### 2026-10-30 · 新增 · 语义审入队：候选入库规则脱离 Session
+
+- **文件**：`review_agent/text.py`（新增：文本工具上移）、`review_agent/runtime/nodes/text.py`（改为转发）、`review_agent/capabilities/semantic_ingest.py`（新增）、`review_agent/capabilities/__init__.py`、`review.py`（`sentence_no` 委托、`make_semantic_executor`、`run_typed_pipeline` 增 `semantic_review_fn`）、`checks/test_semantic_ingest.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. **文本工具上移**：`normalize_quote` / `quote_overlap` / `same_clause` / `sentence_no` / `sentence_key` 移到包根 `review_agent/text.py`。原因很实际：能力层（入库去重）也要用，但架构约束禁止 capabilities → runtime，放在任何一层都会逼着另一层反向依赖。
+  2. **入库规则**：`ingest_candidates()` 把模型候选变成 `Finding`，四条判断逐条与旧实现等价——去重（同规则 + 重合 ≥0.8 或首句指纹相同）、语境豁免（确定性判据优先，进 `excluded` 不静默丢）、严重度下调（blocker/major + 置信度 <0.7 降一级并记 `severity_note`）、编号（从调用方给的序号起）。
+  3. **适配层**：`review.make_semantic_executor()` 把「一次模型调用」接到入库规则上，模型调用经 `review_fn` 注入——离线可测，不需要网络与 Key；`run_typed_pipeline(..., semantic_review_fn=…)` 即可把语义审挂进 analysis 阶段。
+- **为什么**：语义审一直卡在两处 Session 耦合（`make_issue`、`context_exempt`）。把入库判断抽成纯函数后，「模型给什么、最后进报告什么」第一次可以离线钉住；这也让 analysis 阶段的第二个节点真正可插。
+- **验证**：
+  - `python -m unittest discover -s checks` → **347 项 OK**（新增 17：去重 4 / 豁免 2 / 降级 4 / 形状 4 / 适配层 3）
+  - 端到端（离线）：`contract_001.md` + 假 `review_fn` → 流水线产出 1 条规则发现 + 1 条模型发现（`ISS-0002`，origin=model），全流程 `completed`
+  - `python -m unittest discover -s tests` → **642 项 OK / 370s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **未做**：真实 `llm_review.review_dimension` 的客户端接线（分块 / 缓存 / 配置）与 `--engine v1 --llm`。`shadow` 仍需等模型差异分类方案，不能直接比。
+
+### 2026-10-30 · 新增 · 引擎开关（`--engine legacy|v1|shadow`）：CLI 接入 Application
+
+- **文件**：`review.py`（`_take_engine` / `_run_v1` / `_run_shadow`、usage 文案、main 接入）、`checks/test_engine_switch.py`（新增）、`docs/REFACTOR_PLAN.md`、`docs/AGENT_RUNTIME.md`
+- **改了什么**：
+  1. `--engine` 命令行开关 + `REVIEW_ENGINE` 环境变量（server 拉起子进程时自动继承），缺省 `legacy`；**非法值直接报错退出**，不静默回退——用户以为跑了新引擎、实际还是旧链路是最坏的结果。
+  2. `--engine v1`：只跑六节点流水线，状态落到 `state/runs/`，**不写正式报告**（还没接语义审与报告写出，写一份同名报告等于给用户看「看起来一样、实际少一半」的东西）。
+  3. `--engine shadow`：旧链路照出正式报告，同时跑一遍新流水线，差异写到 `state/double_run/<review_id>.json`（含 `ok` / `unexplained` / `missing` / 折叠条目）。
+  4. `v1` / `shadow` 强制要求 `--no-llm`：语义审未接入，开着 LLM 会产出「看起来审了模型」的影子结论，宁可拒绝。
+- **为什么**：切流前需要「能在真实使用里持续跑双跑」的能力。之前双跑只活在测试里（`compare_with_report`），参数、落点、失败语义都没有出口；现在它是 CLI 上的一等公民，且不会污染正式报告。
+- **验证**：
+  - `python -m unittest discover -s checks` → **330 项 OK**（新增 9：开关解析 6 + 三种模式 3）
+  - 进程内跑三种模式：`v1` 无报告、有状态文件；`shadow` 有报告 + 差异文件且 `diff.ok=True`；不带 `--no-llm` 的 `v1` 退出码 2 且不产出报告
+  - `python -m unittest discover -s tests` → **642 项 OK / 282s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - 手工冒烟：`--engine shadow` 在 `contract_001.md` 上输出「双跑一致：verdict=warn，提及折叠 0 条」，差异文件 `state/double_run/R-20261030-017.json`
+
+### 2026-10-30 · 修改 · 偏差清单 #3：规则分发改由 Tool Registry 接管
+
+- **文件**：`review_agent/runtime/nodes/rules.py`（`run_rule_plan` 改 async）、`review.py`（`_HandlerTool` / `build_rule_registry` / `rule_executor_from` / `_tool_name`；`run_agent_steps` 与 `run_typed_pipeline` 改走注册表）、`checks/test_rule_dispatch.py`（新增）、`checks/test_rule_analyzer_node.py`（改用例异步化 + 新增 awaitable 用例）、`docs/TOOL_SPECIFICATION.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. **接口契约**：`run_rule_plan` 从同步改为 async，执行器允许返回 awaitable——否则注册表（async 的 `BaseTool.execute`）永远接不进来，只能另开一条同步通道。
+  2. **注册与分发**：`_HandlerTool` 把 12 个 `builtin:*` 处理器与 Agent 自带 `pack:*` 包成工具（权限 WRITE），`rule_executor_from` 把一步计划变成一次 `registry.execute()`：存在性 → 权限 → 执行 → 结果。处理器键的冒号在工具名里换成点（`builtin:fact` → `builtin.fact`）。
+  3. **权限语义**：调用方传 `actor="pipeline"` 并显式授予 WRITE——审查流程自己在写发现，不是「模型能自己开写权限」。
+  4. **错误映射**：注册表抛 `ToolError`（未注册 / 缺权限）→ `agent_spec.AgentError`，保持旧语义（配置问题走退出码 2，而不是运行时崩溃）。
+  5. 旧 `resolve_handler` 已无调用点，按 AGENT_RUNTIME §10.3 的迁移规矩**保留到阶段 5**，并在 docstring 里写明「已被注册表取代、不删的原因」。
+- **为什么**：旧分发直接 `resolve_handler(key)(...)`，绕过了工具层的存在性校验、权限判定与执行管线；md §6 要求「所有工具注册到 Registry，经统一执行器分发」。上一轮判断的卡点是对的：不先改 async/sync 契约，只能做半截接管。
+- **验证**：
+  - `python -m unittest discover -s checks` → **321 项 OK**（新增 9：分发 8 + async 执行器 1）
+  - 分发用例覆盖：工具名合法且权限 WRITE、维度上下文透传、incodable issue 不进 findings 但写决策日志、未知处理器 → AgentError、缺 WRITE 拒绝执行、注册表包含全部 builtin
+  - `python -m unittest discover -s tests` → **642 项 OK / 266s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - 双路径冒烟：`adversarial_meeting_001.txt` 旧链路 → fail / 9 条；新链路 → completed / 10 条（多出的一条仍是被旧流程折叠的 FACT-004）；双跑比对 4 目标未解释差异 0
+
+### 2026-10-30 · 新增 · 偏差清单 #2/#4：Application Service + 不可信输入围栏
+
+- **文件**：`review_agent/application/__init__.py` + `service.py`（新增）、`review.py`（`run_typed_pipeline` 改调 Application、新增 `store` 参数）、`tools/llm_review.py`（随机围栏、`PROMPT_VERSION` 升版）、`checks/test_application_service.py`（新增）、`checks/test_untrusted_fence.py`（新增）、`docs/TOOL_SPECIFICATION.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. **Application 层**（偏差清单 #2）：`ReviewApplication` 承担组装（六节点 + 可选语义节点）、执行（Orchestrator）、落盘（`FileRunStore`）、恢复（`resume(run_id)` 从断点阶段继续）；`run_typed_pipeline()` 改为调用它并支持 `store=` 落盘。此前这段逻辑散在 `review.py` 里，CLI/server/测试各接一遍就会各写一份恢复语义。
+  2. **不可信输入围栏**（偏差清单 #4）：`llm_review.build_messages` 用**带随机串**的围栏包住原文（`<<<TARGET:<nonce>>>>` … `<<<END:<nonce>>>>`）。旧实现是固定 `<<<TARGET … TARGET>>>`，文档里写一行 `TARGET>>>` 就能提前闭合数据区块、把后续文字顶进提示词语境。新实现：原文**逐字保留**（quote 仍能回查原文）、围栏串与原文撞车直接拒绝、`PROMPT_VERSION` 升到 `2026-10-30a` 让旧缓存失效。
+- **为什么**：这两项是 §13 偏差清单里「原文明确要求但没做」的条目。Application 是「入口统一」的前提（否则每加一个入口复制一遍保存/恢复逻辑）；随机围栏是「材料作者不得通过审查系统反向影响结论」的最低实现——不做的话，一句 `TARGET>>>` 就能越过数据边界。
+- **验证**：
+  - `python -m unittest discover -s checks` → **312 项 OK**（新增 18：Application 9 + 围栏 9）
+  - Application 用例覆盖：节点顺序、语义节点可插拔、初始状态在 intake 之后、跑完落盘且可读回、**失败后按 run_id 恢复并跑完**、已完成的 run 再次 resume 不重跑
+  - 围栏用例覆盖：prompt 里只有一对围栏、原文逐字在围栏内、文档里写 `TARGET>>>`/`<<<TARGET` 不增加围栏、每次 nonce 不同、显式 nonce 可用、nonce 撞车拒绝、系统提示词已说明随机围栏、既有提示词约束未丢
+  - `python -m unittest discover -s tests` → **642 项 OK / 302s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - 端到端：`run_typed_pipeline(..., store=tmp)` 落盘 `R-20261030-950-RUN01.state.json`，状态可读回
+- **本轮未做**：偏差清单 #3（Tool Registry 接管分发）。卡点是 `BaseTool.execute` 为 async、规则执行器为 sync；真正接管要先改 `RuleExecutor` 契约为可 await，否则只能做「查表 + 权限」半截改造。已写进 §12 第 2 条。
+
+### 2026-10-30 · 修改 · 复盘：与方案原文的偏差清单 + 修正过期验收数字
+
+- **文件**：`docs/REFACTOR_PLAN.md`（新增 §13 偏差清单、修正 §4/§10 的用例数与状态）、`docs/AGENT_RUNTIME.md`（19→21 项、207 份→全量历史）、`docs/DOMAIN_MODEL.md`（207/1015→全量历史语料）
+- **改了什么**：
+  1. 新增 §13「与方案原文的偏差清单」：11 条逐项列出（技术栈未按原文、Application 层未建、Tool Registry 未接管分发、不可信输入未做、五界面未做、节点协议形参不同、多出 Planner/Finalize、领域模型改了 3 处、报告 schema 1.2、实施顺序调整、双跑未达「连续一周」）。
+  2. 修正过期数字：六节点用例数按 `unittest` 实际计数改为 16/16/17/17/21/15（另有 Planner 8、编排器 21）；「报告 `evidence` 段待落地」改为已落地（schema 1.2）；「能否单独替换 LLM」从「未开始」改为「部分（节点层可注入执行器）」。
+  3. 明确两件容易被误读的事：删重复实现不是删功能（都是委托 + 差分用例）；`.trash` 归档报告也在比对语料内，所以「全量历史」比文档常说的 202 份更大。
+- **为什么**：验收矩阵里的数字是给人判断进度用的，写死就会过期；过期数字比没有数字更糟。复盘同时把 3 项「原文要求但没做」的事显式挂出来，避免下一轮再把它们当成已完成。
+- **验证**：逐模块 `python -m unittest checks.<module>` 计数（decision 16 / evidence 16 / cross 17 / rule 17 / semantic 21 / document 15 / planner 8 / orchestrator 21 / serialization 9 / parity 2）；`python -m unittest discover -s checks` → **294 项 OK**。
+
+### 2026-10-30 · 新增 · 阶段 2 第八块：Planner 节点 + 影子流水线（六节点双跑）
+
+- **文件**：`review_agent/runtime/nodes/planner.py`（新增）、`review_agent/runtime/node.py`（`surviving_findings`）、`review_agent/runtime/nodes/cross_review.py` / `decision.py`（改用 `surviving_findings`）、`review_agent/runtime/__init__.py`、`review.py`（`run_typed_pipeline` / `compare_with_report` / `_FinalizeNode`）、`checks/test_planner_node.py`（新增）、`checks/test_pipeline_parity.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. **Planner 节点**：planning 阶段把「这次承诺审什么」落成 `plan` 产物（`dimensions` / `handlers` / `checks` / `local_checks`）。没有维度直接失败；没有任何本地检查时给警告（纯规则模式下等于没审）。
+  2. **`surviving_findings()`**：evidence 阶段判为不可回溯的发现（`evidence_dropped`）不再参与交叉复核、裁定与报告骨架。状态只增（发现不可变），所以「移出报告」表现为后续阶段按清单排除，而不是从 `state.findings` 删掉。
+  3. **影子流水线** `run_typed_pipeline()`：Document → Planner → Rule → Evidence → Cross → Decision → Finalize 七节点串起来跑一次 rule-only 审查，返回 `(RunState, RunOutcome, Session)`；读失败抛 `UnreadableTargetError`，与 `run_one` 同语义。语义审不在其中——硬接会改变行为。
+  4. **双跑比对** `compare_with_report()`：新链路保留下来的每条发现必须对上旧报告的 `issues` 或 `suppressed`；旧报告的每条 issue 必须在新链路里存在；verdict 必须一致。
+- **为什么**：节点齐了、编排器也能跑，但缺一份「装配起来跑一次、并证明与旧链路同结论」的证据。双跑是 REFACTOR_PLAN 阶段 2 的硬判据，也是切流前的唯一刹车。顺带补上 Planner——旧实现没有「计划」这个东西，审什么维度全靠现算，事后无法核对「当时承诺审什么」。
+- **验证**：
+  - `python -m unittest discover -s checks` → **294 项 OK**（新增 10 项：Planner 8 + 双跑 2，双跑覆盖 4 个目标语料）
+  - 双跑结果：`answer_001.txt` / `contract_001.md` / `adversarial_meeting_001.txt` / `code_001.py` 四个目标，未解释差异 **0**；唯一差异是 FACT-004 被旧流程折叠进 `suppressed`（比对器把它算作「已解释」）
+  - `python -m unittest discover -s tests` → **642 项 OK / 285s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **边界**：影子流水线只跑 rule-only；语义审（去重、语境豁免、`make_issue`）仍是 Session 语义，接进新链路是阶段 3 的第一件事。报告写出（哈希链、ledger、Markdown）仍由 `run_one` 负责，`_FinalizeNode` 只产报告骨架。
+
+### 2026-10-30 · 新增 · 阶段 2 第七块：Document Analyzer 节点 + RunState 序列化
+
+- **文件**：`review_agent/runtime/nodes/document.py`（新增）、`review_agent/runtime/serialization.py`（新增）、`review_agent/runtime/nodes/__init__.py`、`review_agent/runtime/__init__.py`、`review.py`（`detect_type_detail` 改为委托、删掉重复的 `CONTRACT_MARKERS` 与判定实现）、`checks/test_document_node.py`（新增）、`checks/test_state_serialization.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. `DocumentAnalyzerNode`：读文本 + 判类型 + 记元数据（`target_text` / `target_meta`），读文件经 `reader` 端口注入。类型判定 `classify_target()` 成为唯一实现——旧流程的 `detect_type_detail` 改为委托，`CONTRACT_MARKERS` 与那段 40 行判定删除（不再两份）。
+  2. `state_to_dict()` / `state_from_dict()` / `FileRunStore`：RunState 全量往返（六个对象 + 产物 + 警告 + attempt）。约定写死：枚举存 `.value`、时间存 ISO、tuple↔list、`artifacts` 必须可 JSON 化（混进 `Path` 直接报错，不许写出读不回来的状态）；`FileRunStore.save()` 用临时文件 + `replace` 原子写。
+  3. `checks/test_state_serialization.py` 覆盖「存盘 → 进程重启 → 读回 → 从断点阶段继续」，前置阶段节点零重跑。
+- **为什么**：`Document Analyzer` 是六节点的最后一块，且类型判定直接决定「用哪套判定标准」，猜错一次就换掉整份报告的口径——这种规则必须只有一份实现、有边界用例。状态序列化则是「中断后恢复执行」从「能演示」到「能交付」的分水岭：检查点只记阶段与哈希，进程一重启状态就没了。
+- **验证**：
+  - `python -m unittest discover -s checks` → **284 项 OK**（新增 24 项：文档节点 15 + 序列化 9）
+  - `python -m unittest discover -s tests` → **642 项 OK / 256s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - 端到端冒烟：`targets/contract_001.md` 走旧链路出报告，裁定与异议数不变（warn / 1 条）
+- **仍未接入 `run_one`**：六节点齐了，但旧主流程还在跑 S1~S6。接入点是 Application Service（下一步）。
+
+### 2026-10-30 · 新增 · 阶段 2 第六块：Semantic Reviewer 节点 + Run 级编号分配器
+
+- **文件**：`review_agent/runtime/nodes/semantic.py`（新增）、`review_agent/runtime/node.py`（`NodeContext.next_finding_seq`）、`review_agent/runtime/orchestrator.py`（编号发放 `next_finding_seq()`）、`review_agent/runtime/nodes/__init__.py`、`review_agent/domain/transitions.py`（analysis 白名单增 `semantic_stats`）、`review.py`（`covered_chars` / `coverage_from_llm_meta` 改为委托）、`checks/test_semantic_node.py`（新增）、`checks/test_orchestrator.py`、`checks/test_rule_analyzer_node.py`、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. 新增 `SemanticReviewerNode`：维度×块执行计划（`plan_semantic_steps`，顺序固定）、成功块区间并集覆盖率（`build_meta` + `coverage_from_meta`）、失败块记账；模型调用经 `SemanticExecutor` 端口注入（参数是 step + 起始编号），prompt 与去重/Dedupe 仍留在能力层。
+  2. **Run 级编号分配器**：`NodeContext.next_finding_seq`；编排器按「已有最大号 + 1」发放并在同阶段逐节点接续。规则审与语义审同处 analysis，以前各从 ISS-0001 起号会被 `merge_results()` 直接拦下——现在不会了。
+  3. 覆盖率推导去重：`review.coverage_from_llm_meta` / `covered_chars` 改为委托节点实现（`review_agent.runtime.nodes.semantic`），节点与旧流程用同一份算法，不会出现「节点说审了 80%、报告说 100%」。
+  4. `STAGE_ARTIFACTS[analysis]` 白名单增加 `semantic_stats`；`advance(required=)` 已按「本阶段节点 produces 并集」判定必需产物，所以只挂规则审的编排不会被要求提供语义审产物（既有用例已改为显式传 `required`）。
+- **为什么**：语义审是六节点里唯一必须用 LLM 的，直接接管整个函数风险最高。但它里面真正容易出错、又完全可测的三件事——跑哪些维度×块、覆盖了多少字、哪些块失败了——可以现在就接管。旧实现把失败块 `continue` 掉后仍报「全覆盖」，202 份历史报告里 `complete=False` 一次都没出现过，就是这三件事没被单独测试的代价。
+- **验证**：
+  - `python -m unittest discover -s checks` → **260 项 OK**（新增 23 项：语义节点 21 + 编号 2）
+  - `python -m unittest discover -s tests` → **642 项 OK / 226s**
+  - 覆盖率回归：同一目标 `targets/adversarial_meeting_001.txt` 改造前后 `text_coverage_pct` / `chars_reviewed` / `complete` / `chunks_*` 全部一致（100 / 1780 / True / 0 / 0），9 条异议与裁定不变
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **未接入 `run_one`**：语义审的入队（去重、语境豁免、`make_issue`）仍是旧实现里的 Session 语义，等阶段 3 的能力层整理与 Application Service 一起搬。节点负责的那三件事已经可以被未来链路复用。
+
+### 2026-10-30 · 新增 · 阶段 2 第五块：Orchestrator（一阶段多节点 + 检查点）
+
+- **文件**：`review_agent/runtime/orchestrator.py`（新增）、`review_agent/runtime/node.py`（`Workflow` 多节点、`merge_results`、`stage_requirements`、`advance(required=)`）、`review_agent/runtime/__init__.py`、`checks/test_orchestrator.py`（新增）、`checks/test_domain_v1.py`（契约更新）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. `Workflow` 允许同一阶段挂多个节点（必须连续出现、名字唯一、阶段只能前进）。`stages` 改为「按出现顺序去重」——原来的实现会把同阶段节点的阶段名重复列出。
+  2. `merge_results()`：把同阶段多个节点的结果合成一个 `NodeResult` 再推进。三条硬约束：产物键唯一（两个节点都写 `analysis_stats` 直接失败，不许「谁覆盖谁看声明顺序」）、发现编号唯一、一个阶段最多一个裁定。
+  3. `advance(..., required=)`：必需产物从「`STAGE_ARTIFACTS` 全集」改为「本阶段节点 `produces` 的并集」。否则只挂 Rule Analyzer 的 analysis 阶段会被要求提供语义审才有的产物。`STAGE_ARTIFACTS` 仍是**允许写入**的白名单，不因部分编排放宽。
+  4. `Orchestrator`：按阶段推进、同阶段多节点顺序执行、失败停在原地、只有 `retryable` 才重试、未编排的阶段返回 `incomplete` 而不是悄悄跳过；每推进一个阶段写一条 `Checkpoint`（`MemoryCheckpointStore` / `FileCheckpointStore`），`state_hash` 只摘「会让结论变化」的字段。
+  5. 契约测试同步更新：`test_workflow_rejects_duplicate_stage_and_wrong_order` → `test_workflow_allows_many_nodes_per_stage_but_rejects_wrong_order`（同一阶段多节点从「非法」变为「合法且有顺序」）。
+- **为什么**：节点写完了却没有装配线，等于零件摊在地上；而且 analysis 天然是两件事——规则审（确定性）与语义审（模型），合并成一个节点后「哪一半没跑成」就说不清。编排器把「谁先跑、失败停不停、从哪恢复、检查点写了什么」变成可测的代码，而不是散在一个 900 行函数里。
+- **验证**：
+  - `python -m unittest discover -s checks` → **237 项 OK**（新增 19 项）
+  - 覆盖：完整八阶段流水线、同阶段两节点按序执行且只推进一次、失败停在阶段入口（检查点数 = 已完成阶段数）、可重试失败重试 2 次、不可重试不重试、未覆盖阶段报 incomplete、从中断的 `RunState` 继续跑不重跑已完成阶段、`FileCheckpointStore` 往返与坏行跳过、`state_hash` 可复现且随发现变化
+  - `python -m unittest discover -s tests` → **642 项 OK / 223s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **未接入 `run_one`**：编排器目前只被测试使用，旧主流程仍是 S1~S6。接入的前置是 Application Service 与剩余两个节点（Semantic Reviewer / Document Analyzer），以及 **Run 级发现编号分配器**——规则审与语义审同处 analysis，两个节点各从 ISS-0001 起号会被 `merge_results()` 直接拦住（已登记为 AGENT_RUNTIME §11 开放问题）。
+
+### 2026-10-30 · 新增 · 报告新增 evidence[] 段（schema_version 1.2）
+
+- **文件**：`review_agent/runtime/nodes/evidence.py`（`evidence_to_report`）、`review_agent/runtime/nodes/__init__.py`、`review.py`（S4 保留节点产出、报告顶层 `evidence`、`schema_version` 1.1→1.2）、`checks/test_report_evidence.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. 报告顶层新增 `evidence[]`，每条 `{"evidence_id", "issue_id", "kind", "quote", "location", "verification", "verified_by"}`。`verification` 只会是 `anchored`（逐字命中原文）或 `placeholder`（占位式引用，缺失型问题）——不可回溯的条目在 S4 就被移出报告，所以这一段不会出现 `unanchored`。
+  2. `schema_version` 1.1 → 1.2（按报告契约：新增顶层字段必须改版本号）。既有字段一个没动，`issues[]` 结构不变。
+  3. 证据来自 S4 节点产出（`_anchor.evidence`），被丢弃的条目不在其中，所以不会出现指向已删结论的悬空证据。
+- **为什么**：`issues[].quote` 只回答「我引了哪一句」，不回答「这句核过没有」。产品定位是「证据驱动」，报告里必须有可核对的 `verification`——这正是「能否追溯每条 Finding 的证据」从领域对象走到用户眼前的一步。
+- **验证**：
+  - `python -m unittest discover -s checks` → **218 项 OK**（新增 5 项：证据段形状 + 一次真实审查的端到端核对）
+  - 端到端：`targets/adversarial_meeting_001.txt` 跑出 9 条异议 ↔ 9 条证据，全部 `anchored` 且 `quote` 能在 `target_text` 里回查到；`issue_id` 与 `issues[].issue_id` 一一对应
+  - `python -m unittest discover -s tests` → **642 项 OK / 223s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+
+### 2026-10-30 · 新增 · 阶段 1 收口：错误分类（kind / http_status）+ CLI→server 结构化错误行
+
+- **文件**：`review_agent/domain/errors.py`、`review_agent/domain/__init__.py`、`review.py`（`UnreadableTargetError` 改继承、`_emit_error` / `_emit_domain_error`、main 四个失败出口）、`server.py`（`_parse_review_error` / `_strip_error_marker`、任务载荷增 `error_kind`）、`checks/test_error_taxonomy.py`（新增）、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. `DomainError` 增加三个类属性：`kind`（input / config / system）、`http_status`（400 / 404 / 500）、`retryable`；新增 `InputError`（继承 ValueError，兼容旧 catch）、`NotFoundError`、`ConfigError`。
+  2. `UnreadableTargetError` 从裸 `ValueError` 改为 `InputError`：仍能被 `except ValueError` 捕获，但上层能看出「这是用户输入问题」。
+  3. CLI 失败时向 stderr 多打一行 `REVIEW_ERROR {"kind":…,"http_status":…,"message":…}`；人类可读的提示与退出码**一个没改**。
+  4. server 解析这一行：任务载荷与同步返回里多 `error_kind` / `error_status`，展示给用户的错误文本会把这行机器可读 JSON 剔除。
+- **为什么**：以前 server 只能把子进程 stderr 原样贴给前端，用户分不清「我把路径写错了」还是「你们服务坏了」；日志里也只剩一段文本，没法按错误类型统计。分类放在领域层，CLI 与 server 共用同一套口径。
+- **验证**：
+  - `python -m unittest discover -s checks` → **213 项 OK**（新增 13 项，含两个真实子进程用例：文件不存在 → kind=input/404、docx 损坏 → kind=input）
+  - `python -m unittest discover -s tests` → **642 项 OK**（错误文本与退出码未变，既有断言全过）
+  - `python tools/golden_eval.py` → 38 用例 / 召回 100% / 误报 0
+
+### 2026-10-30 · 新增 · 阶段 2 第四块：Rule Analyzer 节点接管 S3 调度
+
+- **文件**：`review_agent/runtime/nodes/rules.py`（新增）、`review_agent/runtime/nodes/__init__.py`、`review_agent/domain/transitions.py`（`STAGE_ARTIFACTS[analysis]` 增 `analysis_stats`）、`review.py`（`run_agent_steps` 改走计划）、`checks/test_rule_analyzer_node.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. 调度（跑哪些检查、按什么顺序）从 `run_agent_steps` 搬进 `plan_rule_steps()`：先按 manifest 维度声明顺序跑维度绑定处理器，再跑附加检查；附加检查沿用「最后一个维度」的上下文——旧实现就是这么传的，改成「无维度」会改变只认 `ctx["dimension"]` 的处理器行为。
+  2. 执行压成 `RuleStepOutcome`：每步记录处理器、维度、命中条数、失败原因。`run_rule_plan()` 提供两种失败语义：`raise`（旧主流程口径，检查炸了立刻暴露）与 `record`（节点口径，单维度失败继续、全失败判失败）。
+  3. 检查函数仍在能力层（`_h_*` / Agent 自带 `checks.py`），节点通过 `RuleExecutor` 端口调用——处理器改纯函数留给阶段 3 的 Tool Registry，不在这一步推倒重来。
+  4. `analysis` 阶段产物新增 `analysis_stats`：哪台处理器跑了、命中多少条。旧实现只把「执行的检查」写进一条日志，漏跑时报告依然看着正常。
+- **为什么**：六节点里 Rule Analyzer 的"规则"最少、但"调度"最容易出错——漏跑一类检查不会报错，只会让报告少报问题（假绿灯）。把调度变成可单独测试的纯函数 + 每步留痕的产物，才能回答「这次到底审了什么」。
+- **验证**：
+  - `python -m unittest discover -s checks` → **200 项 OK**（新增 17 项）
+  - 差分：同一目标（`targets/adversarial_meeting_001.txt`）改造前后 rule-only 跑出**完全相同的 9 条异议**（规则号 / 严重度 / 引用 / 置信度逐字段一致），stats 也一致
+  - `python -m unittest discover -s tests` → **642 项 OK / 220s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **未纳入本次**：语义审（Semantic Reviewer）仍是旧实现单独一段，analysis 阶段目前只有规则这一半进节点；一个阶段挂多个节点的编排能力还没做（`Workflow` 目前一个阶段一个节点），是 Orchestrator 的活。
+
+### 2026-10-30 · 新增 · 阶段 2 第三块：Cross Reviewer 节点接管 S5（含显式 revisions）
+
+- **文件**：`review_agent/runtime/nodes/cross_review.py`（新增）、`review_agent/runtime/nodes/text.py`（新增：`quote_overlap` 唯一实现）、`review_agent/runtime/node.py`（`NodeResult.revisions` + `advance()` 的应用与校验）、`review_agent/runtime/nodes/__init__.py`、`review.py`（S5 改调节点；`_quote_overlap` / `_norm_quote` 改为委托）、`checks/test_cross_review_node.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. 交叉复核规则搬进 `review_findings()`：只查两对配置视角（fact×safety、compliance×style）、quote 相似度 ≥ 0.6、至少一方到 major、冲突双方各降 0.05（下限 0.5、保留两位小数）。同一对发现反复命中时从**已降过的值**继续降——与旧实现就地改 dict 的口径逐字一致。
+  2. **运行期新增 `NodeResult.revisions`**：发现不可变，所以「降权」不再就地改上游对象，而是由节点交出同 id 的新版本、`advance()` 按下标替换。校验三条：只能修订本阶段之前存在的发现；同一阶段既新增又修订同一 id 直接拒；`run_id` 必须一致。
+  3. 同片段判定（去标点包含 / 二元组 Jaccard）抽成 `runtime/nodes/text.py` 的唯一实现，`review.py` 的 `_quote_overlap` / `_norm_quote` 改为委托——否则「折叠判为同句、复核判为不同句」只是时间问题。
+  4. 争议回写报告走 `dispute_to_report_dict()`，键序固定为 between / point / resolution_hint / issue_ids，报告字节与旧版一致。
+  5. 编不出领域对象时退回旧 `cross_review(s)` 并写决策日志（阶段 5 前旧函数不删）；旧实现自己会写决策条目，不重复记。
+- **为什么**：S5 是「不让互相矛盾的结论蒙混过关」那道门，但旧实现把规则、降权、日志揉在一起，且用**就地改 dict** 的方式降权，改完只剩最终值——报告里看不出「这条为什么从 0.75 变成 0.70」。接管时必须先给运行时一个表达「修订」的正式通道，否则只能继续偷改或干脆不降权（后者会让 `to_confirm` 名单变化，等于悄悄改了产品行为）。
+- **验证**：
+  - `python -m unittest discover -s checks` → **183 项 OK**（新增 17 项）
+  - 差分（关键）：全量历史语料（outputs/ 含 .trash 归档，当前 271 份 / 1162 条 issue / 3 处冲突）——节点产出的争议与降权后的置信度与旧实现**逐字段一致**
+  - `python -m unittest discover -s tests` → **642 项 OK / 223s**
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+- **未纳入本次**：`aggregate_repeats`（长文同类聚合）、`drop_covered_comp004` / `collapse_rule_overlap`（同片段归口折叠）仍留在 S6。它们依赖 suppressed/folded 记账，运行时还缺对应的产物通道，单列为下一步。
+
+### 2026-10-30 · 新增 · 阶段 2 第二块：Evidence Analyzer 节点接管 S4
+
+- **文件**：`review_agent/runtime/nodes/evidence.py`（新增）、`review_agent/runtime/nodes/__init__.py`、`review_agent/domain/models.py`（`Evidence.finding_ids`）、`review_agent/runtime/node.py`（悬空证据校验）、`review_agent/adapters/legacy_report.py`、`review.py`（S4 改调节点、`run_id` 上移）、`checks/test_evidence_node.py`（新增）、`docs/AGENT_RUNTIME.md`、`docs/DOMAIN_MODEL.md`、`docs/REFACTOR_PLAN.md`
+- **改了什么**：
+  1. `verify_quote(quote, text)` 把「引用校验」四类归一：空 → `NOT_CHECKED`、逐字命中 → `ANCHORED`、占位式 → `PLACEHOLDER`、其余 → `UNANCHORED`（应丢弃）。`anchor_findings()` 用它产出 `Evidence` 与被丢弃/缺失的发现；`EvidenceAnalyzerNode` 校验阶段与 `artifacts["target_text"]`，把丢弃清单写进 `evidence_dropped` 产物。
+  2. `Evidence` 增加 `finding_ids`：证据在分析之后才产出，晚到的证据无法回填不可变的 `Finding.evidence_ids`；同一句原文常同时支撑多条发现，一对多关系天然属于证据这一侧。
+  3. `runtime.advance()` 校验证据指向的发现必须在本 Run 里真实存在（悬空引用比没有引用更难查）。
+  4. `review.py` S4 的清单过滤改按节点结论执行；编不出领域对象时退回 `verify_quote` 的逐条入口并写决策日志；`run_id` 从 S6 上移到 Session 创建之后，S4/S6 共用同一个归属。
+- **为什么**：S4 是报告可信度的安全线（不可回溯的引用不能进报告），但规则和统计混在 `run_one` 里，没法单独测、也没法在节点接管后复用。挪进节点后同一条规则有了逐条入口（旧 dict）与批量入口（领域对象）两个调用方式，口径只有一份；顺带补上了「证据指不到发现」这个此前无人校验的悬空引用。
+- **验证**：
+  - `python -m unittest discover -s checks` → **166 项 OK**（新增 16 项，上一轮 150）
+  - 历史等价：全量历史（271 份 / 1162 条 quote）按新规则算出的丢弃集合与旧 S4 实现逐条一致
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0
+  - `python -m unittest discover -s tests` → **642 项 OK / 220s**
+
+### 2026-10-30 · 新增 · 阶段 1 收口（issue 编解码闸门）+ 阶段 2 第一块（Decision Engine 节点）
+
+- **文件**：
+  - 新增：`review_agent/adapters/issue_codec.py`、`review_agent/runtime/nodes/decision.py`、`review_agent/runtime/nodes/__init__.py`、`checks/test_issue_codec.py`、`checks/test_decision_node.py`
+  - 修改：`review.py`（S6 裁定改调节点、issue/suppressed 出口回写、`Session.decision()` 支持附加字段）、`docs/REFACTOR_PLAN.md`、`docs/AGENT_RUNTIME.md`
+  - 同时登记同日上一轮未入账的 Architecture v1 骨架：`review_agent/domain/*`、`review_agent/profiles/resolver.py`、`review_agent/capabilities/tools.py`、`review_agent/adapters/legacy_report.py`、`review_agent/runtime/node.py`、`docs/` 六份约束文档 + `docs/PHASE0_INVENTORY.md`、`checks/test_domain_v1.py`、`checks/test_legacy_adapter.py`、`checks/test_profile_resolver.py`、`checks/test_tool_registry.py`、`checks/test_architecture_guard.py`、`checks/fixtures/legacy_report_min.json`、`tools/arch_inventory.py`
+- **改了什么**：
+  1. `issue_codec`：`encode_issue()` 把 issue dict 编成 `Finding`；领域装不下的键（`fix`/`consequence`/`aggregated_count`/`folded_into`…）进 `extras`；标量类型原样保住（`1` 不变 `1.0`、`null` 不变 `false`、缺键不补键）。`export_issues()` 在 S6 出口把最终 `issues` / `suppressed` 换成由领域对象回写的 dict，逐键校验，不一致抛 `CodecMismatch`。
+  2. `DecisionEngineNode` + `build_decision()`：Decision 阶段唯一裁定入口。节点校验阶段匹配、缺上游产物、`decision.run_id` 归属，并在返回前用 `consistency_issues()` 复算自检——算不回来的裁定不许落状态。
+  3. `review.py` S6：verdict 由 `build_decision` 算出；`DEFAULT_POLICY.decide_from_counts` 只在编解码失败时作兜底并留痕。`Session.decision()` 增加 `**extra`，决策日志新增 `risk_level` / `requires_human_review` / `policy` / `reasons` 四个字段（既有字段一字未改）。编解码失败写进 `limitations`，不静默。
+  4. 账本格式修正（顺带）：`2026-10-29 · 新增/修复` 的复合类型不符合词表——`tests/test_api_contract.py::ChangelogContractTests` 只认「新增/修改/删除/修复」四种，这一条在 HEAD 上就已经让全量回归红着。改为「新增」，标题与正文未动。
+- **为什么**：阶段 1 要求「结论不再用裸 dict 表达」，但 issue 在 S3~S5 是边跑边改的（追加、折叠、整改补字段），直接改二十多个调用点等于让旧流程停机一个迭代。改成在出口装闸门：用**可逆性**证明领域模型能表达旧报告的每条结论，且报告字节不变（哈希链不漂）。同时把裁定从 900 行的 `run_one` 里挪进节点——为 Evidence / Cross Review 用同样方式接管留出坐位。
+- **验证**：
+  - `python -m unittest discover -s checks` → **150 项 OK**（新增 31 项，基线 119）
+  - 历史语料可逆性：全量 outputs/（含 .trash 归档，当前 271 份）的 issue 与 suppressed `encode→decode` 逐键相等，0 例外
+  - 裁定重放：全量历史报告重放 `build_decision`，与报告 verdict 差异仅 5 份（`R-20261028-045/046/047/055/071`，即旧版本「库外事实未核完仍给 pass」的已登记缺陷）
+  - `python tools/golden_eval.py` → 38 用例 / 26 标注 / 召回 100% / 误报 0（与基线一致）
+  - `python -m unittest discover -s tests` → **642 项 OK / 219s**（修账本类型前，全量回归红 1 项；该项在 HEAD 上已红，见「改了什么」第 4 条）
+
 # 2026-10-29
 
-### 2026-10-29 · 新增/修复 · 控制台长任务、冻结式 holdout、金标准防假绿灯、配置静默失效（v0.9.1）
+### 2026-10-29 · 新增 · 控制台长任务、冻结式 holdout、金标准防假绿灯、配置静默失效（v0.9.1）
 
 - **文件**：`server.py`、`web/app.js`、`tools/holdout_eval.py`（新增）、`checks/test_console_reliability.py`（新增）、`checks/test_holdout.py`（新增）、`holdout/README.md` + `holdout/cases/.gitkeep` + `holdout/labels/.gitkeep`（新增）、`tools/golden_eval.py`、`tools/llm_client.py`、`review.py`、`checks/test_invariants.py`、`.gitignore`、`VERSION`、`README.md`、`docs/API接口对照表.md`；`docs/盲测协议.md` 增补（该文件被 gitignore，仅本地）
 - **改了什么**：

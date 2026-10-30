@@ -15,6 +15,7 @@ review.py —— 审查 Agent 主流程 S1~S6 (Demo v0.9.0)
     python review.py targets/answer_001.txt --llm      # 强制调用大模型 API
 """
 import importlib.util
+import asyncio
 import atexit
 import os
 import sys
@@ -48,6 +49,69 @@ import llm_review
 import remediation
 import research
 import version
+# Architecture v1：裁定规则只有一份实现（领域策略）。旧流程调用它，不再自己复制一套。
+from review_agent.domain import ids as domain_ids
+from review_agent.domain import ReviewProfile, Stage
+from review_agent.domain.enums import Verification
+from review_agent.domain.errors import ConfigError, DomainError, InputError, NotFoundError
+from review_agent.domain.policy import DEFAULT_POLICY
+from review_agent.adapters.issue_codec import (
+    CodecMismatch,
+    EncodedIssue,
+    decode_issue,
+    encode_issues,
+    export_issues,
+)
+from review_agent.capabilities import (
+    BaseTool,
+    Candidate,
+    IngestContext,
+    Permission,
+    ToolContext,
+    ToolError,
+    ToolRegistry,
+    ToolResult,
+    ingest_candidates,
+)
+from review_agent.text import sentence_no as text_sentence_no
+from review_agent.application import (
+    PipelinePorts,
+    ReviewApplication,
+    build_shadow_report,
+    render_shadow_md,
+)
+from review_agent.runtime import (
+    FileRunStore,
+    MemoryCheckpointStore,
+    NodeResult,
+    Orchestrator,
+    RunState,
+    Workflow,
+    state_to_dict,
+    surviving_findings,
+)
+from review_agent.runtime.nodes import (
+    CrossReviewerNode,
+    DecisionEngineNode,
+    DocumentAnalyzerNode,
+    EvidenceAnalyzerNode,
+    PlannerNode,
+    RuleAnalyzerNode,
+    SemanticStepOutcome,
+    anchor_findings,
+    build_decision,
+    classify_target,
+    coverage_from_meta as semantic_coverage_from_meta,
+    covered_chars as semantic_covered_chars,
+    dispute_to_report_dict,
+    evidence_to_report,
+    normalize_quote,
+    plan_rule_steps,
+    quote_overlap,
+    review_findings as review_cross,
+    run_rule_plan,
+    verify_quote,
+)
 
 try:
     import yaml
@@ -94,6 +158,28 @@ SEV_ORDER = {"blocker": 0, "major": 1, "minor": 2, "nit": 3}
 # 版本号唯一事实源：根目录 VERSION（tools/version.py 读取）。
 REPORT_MODEL_VERSION = version.report_version()
 UNIT_FACTOR = {"亿": 1e8, "万": 1e4, "%": 0.01, "倍": 1.0, "": 1.0}
+
+# ---- 结构化错误行（CLI → server 的错误分类通道）----
+# 人类可读的错误照旧打在 stdout（既有输出与退出码都不变）；这一行打到 stderr，
+# 让 server 不必再靠「猜 stderr 里那句话是什么意思」来区分输入问题与系统故障。
+ERROR_MARKER = "REVIEW_ERROR "
+
+
+def _emit_error(message, *, kind, http_status, retryable=False):
+    try:
+        payload = {"kind": kind, "http_status": http_status,
+                   "retryable": bool(retryable), "message": str(message)[:500]}
+        print(ERROR_MARKER + json.dumps(payload, ensure_ascii=False),
+              file=sys.stderr, flush=True)
+    except (OSError, TypeError, ValueError):
+        # 错误上报失败不能覆盖原始错误
+        pass
+
+
+def _emit_domain_error(exc: DomainError):
+    """按领域错误自带的分类上报（kind / http_status / retryable）。"""
+    _emit_error(str(exc), kind=exc.kind, http_status=exc.http_status,
+                retryable=exc.retryable)
 
 # 事实审的确定性启发式（FACT-002/003/004）
 SOURCE_CLAIM_RE = re.compile(
@@ -245,51 +331,14 @@ def rule_index(rules):
     return {r["rule_id"]: r for r in rules}
 
 
-CONTRACT_MARKERS = ("甲方", "乙方", "本合同", "本协议", "签署", "盖章", "生效",
-                    "有效期", "违约责任", "争议解决", "仲裁", "诉讼", "附件")
-
-
 def detect_type_detail(path: Path, text: str):
     """类型判定 + 置信度 + 依据。
 
-    旧实现只要全文任意位置出现「合同/协议/甲方…」任一关键词就判 contract：
-    水段里一句「验收标准与合同附件一致」就让整篇会议纪要变成合同，
-    于是 ①合同要件检查报 3 条无意义缺失 ②审查任务书变成「合同/协议文本」
-    ③数据披露检查被关掉——**一次猜测改了整个判定标准**。
-
-    新规则：标题与开头加权，正文里"提到合同"不算合同。
+    实现只有一份，在文档分析节点里（`review_agent.runtime.nodes.document.classify_target`）：
+    「标题与开头加权、正文里提到合同不算合同」这套规则必须两边一致，
+    否则同一个文件在旧流程与新链路里会被判成两种类型，判定标准跟着变。
     """
-    ext = path.suffix.lower()
-    if ext in (".docx", ".docm"):
-        return {"type": "docx", "confidence": 0.9, "reason": f"Word 文档扩展名 {ext}"}
-    code_exts = (".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".java", ".cpp", ".c")
-    if ext in code_exts:
-        return {"type": "code", "confidence": 0.9, "reason": f"源码扩展名 {ext}"}
-    if ext == ".json":
-        if re.search(r"(def |function |import |=>)", text):
-            return {"type": "code", "confidence": 0.8, "reason": "JSON 内含代码特征"}
-        return {"type": "llm_response", "confidence": 0.7, "reason": "JSON 数据文件"}
-    if ext not in (".md", ".txt", ".markdown", ".csv", ".log", ".xml", ""):
-        return {"type": "llm_response", "confidence": 0.6, "reason": f"未识别扩展名 {ext}"}
-
-    head = text[:600]
-    first_line = next((ln for ln in text.strip().splitlines() if ln.strip()), "")
-    title_contract = bool(re.search(r"(合同|协议|契约)", first_line))
-    head_hits = [k for k in CONTRACT_MARKERS if k in head]
-    all_hits = [k for k in CONTRACT_MARKERS if k in text]
-
-    if (title_contract and len(head_hits) >= 2) or len(head_hits) >= 4:
-        return {"type": "contract", "confidence": 0.92,
-                "reason": f"标题/开头出现合同要件词：{'、'.join(head_hits[:6])}"}
-    if title_contract and len(head_hits) >= 1:
-        return {"type": "contract", "confidence": 0.75,
-                "reason": f"标题含合同字样，开头要件词较少：{'、'.join(head_hits[:4])}"}
-    if len(all_hits) >= 4:
-        return {"type": "llm_response", "confidence": 0.55,
-                "reason": (f"全文出现 {len(all_hits)} 个合同/协议字样，但集中在正文而非开头"
-                           "——判为普通文本（疑似「提及」合同，不是合同本体）")}
-    return {"type": "llm_response", "confidence": 0.85,
-            "reason": "未出现合同要件特征"}
+    return classify_target(path, text)
 
 
 def detect_type(path: Path, text: str):
@@ -343,9 +392,8 @@ def _sent_end(text, idx):
 
 
 def sentence_no(text, idx):
-    seg = text[:idx]
-    sents = [s for s in re.split(r"[。！？\n]", seg) if s.strip()]
-    return len(sents) + 1
+    """第几句（1 起算）。实现已上移到 review_agent.text。"""
+    return text_sentence_no(text, idx)
 
 
 def doc_anchor(text):
@@ -529,12 +577,14 @@ class Session:
             "open_discovery": bool(open_discovery),
         }
 
-    def decision(self, decision, rule_id, rationale, alternatives, why_not):
+    def decision(self, decision, rule_id, rationale, alternatives, why_not, **extra):
         item = {
             "ts": now_iso(), "decision": decision, "rule_id": rule_id,
             "rationale": rationale, "alternatives": alternatives,
             "why_not_alternative": why_not,
         }
+        # 新增字段只增不改：历史 decisions.jsonl 的键集合不能变。
+        item.update(extra)
         self.decisions.append(item)
         self._append_log("decisions.jsonl", item)
 
@@ -1158,22 +1208,10 @@ def static_scan(s: Session, target_path: Path, text, rules, target_type, force=F
     return s
 
 
-def _norm_quote(q):
-    return re.sub(r"[\s\u3000，。！？、；：\"'“”‘’（）()\[\]【】《》〈〉…—\-·]+", "", q or "")
-
-
-def _quote_overlap(a, b):
-    """同片段判定：去标点后互相包含，或字符二元组 Jaccard ≥ 0.6。"""
-    a, b = _norm_quote(a), _norm_quote(b)
-    if not a or not b:
-        return 0.0
-    if a in b or b in a:
-        return 1.0
-    bigrams = lambda s: {s[i:i + 2] for i in range(len(s) - 1)}
-    ga, gb = bigrams(a), bigrams(b)
-    if not ga or not gb:
-        return 0.0
-    return len(ga & gb) / len(ga | gb)
+# 同片段判定：实现只有一份（review_agent.runtime.nodes.text），这里保留旧名字，
+# 避免二十多处调用点跟着改；两处各写一份就会出现「折叠判为同句、复核判为不同句」。
+_norm_quote = normalize_quote
+_quote_overlap = quote_overlap
 
 
 CROSS_PAIRS = [
@@ -1460,22 +1498,12 @@ def plan_chunks(text, limit, overlap=400):
 
 
 def covered_chars(spans):
-    """求若干 [start, end) 区间的并集长度（块间重叠只算一次）。"""
-    total = 0
-    cur_start = cur_end = None
-    for start, end in sorted(spans):
-        if end <= start:
-            continue
-        if cur_start is None:
-            cur_start, cur_end = start, end
-        elif start <= cur_end:
-            cur_end = max(cur_end, end)
-        else:
-            total += cur_end - cur_start
-            cur_start, cur_end = start, end
-    if cur_start is not None:
-        total += cur_end - cur_start
-    return total
+    """求若干 [start, end) 区间的并集长度（块间重叠只算一次）。
+
+    实现只有一份，在语义审节点里（`review_agent.runtime.nodes.semantic`）：
+    否则「节点算的覆盖」与「报告算的覆盖」迟早各说各话。
+    """
+    return semantic_covered_chars(spans)
 
 
 def _span_label(start, end):
@@ -1743,6 +1771,106 @@ BUILTIN_HANDLERS = {
 _PACK_MODULES = {}
 
 
+class _HandlerTool(BaseTool):
+    """把旧规则处理器包成工具（迁移期适配器）。
+
+    为什么要包：规则处理器今天都是 `handler(session, text, rules, ctx)`，
+    副作用写进 Session。直接改成纯函数等于停掉主流程一个迭代；包成工具后，
+    分发走注册表（存在性 / 权限 / 入参 / 审计一条管线），实现先不动。
+
+    权限是 `WRITE`：处理器会往 Session 里追加发现——按权限表属于「修改审查数据」。
+    但这是**审查流程自己**在写，所以调用方传 `actor="pipeline"` 并显式授予 WRITE；
+    不是「模型可以自己开写权限」。
+    """
+
+    permission = Permission.WRITE
+    arguments_type = None          # 入参由调用方负责：只有可选的 dimension
+
+    def __init__(self, key, handler, *, session, text, active, legacy_ctx, run_id):
+        self.key = key
+        # 工具名规则只允许小写字母/数字/点/下划线：旧键里的冒号换成点，
+        # 对外仍是同一个处理器（`builtin:fact` ⇄ `builtin.fact`）。
+        self.name = _tool_name(key)
+        self.description = f"旧规则处理器 {key}（Architecture v1 迁移期适配器）"
+        self._handler = handler
+        self._session = session
+        self._text = text
+        self._active = active
+        self._ctx = legacy_ctx
+        self._run_id = run_id
+
+    async def execute(self, arguments, context):
+        before = len(self._session.issues)
+        dimension = (arguments or {}).get("dimension")
+        if dimension is not None:
+            self._ctx["dimension"] = dimension
+        self._handler(self._session, self._text, self._active, self._ctx)
+        added = self._session.issues[before:]
+        try:
+            findings = tuple(e.finding for e in encode_issues(added, run_id=self._run_id))
+        except CodecMismatch as e:
+            # 编不出领域对象不影响报告（报告仍用 Session.issues），但这类结论
+            # 进不了 RunState。留痕比吞掉强。
+            self._session.decision(
+                "规则命中未能编成领域对象", self.key, str(e)[:150],
+                ["丢弃该批结论"], "报告照出，但运行态少了一批发现，必须留痕")
+            return ToolResult.success(data={"findings": (), "unencoded": len(added)})
+        return ToolResult.success(data={"findings": findings, "added": len(added)})
+
+
+def _tool_name(handler_key: str) -> str:
+    """处理器键 → 工具名（`builtin:fact` → `builtin.fact`）。"""
+    return str(handler_key).replace(":", ".")
+
+
+def build_rule_registry(session, text, active, legacy_ctx, run_id, agent):
+    """把本次要用的规则处理器注册进 ToolRegistry。
+
+    注册表按 run 建：处理器绑定了 Session（迁移期必然如此），跨 run 复用会串数据。
+    """
+    registry = ToolRegistry()
+
+    def _add(key, handler):
+        registry.register(_HandlerTool(
+            key, handler, session=session, text=text, active=active,
+            legacy_ctx=legacy_ctx, run_id=run_id))
+
+    for key, handler in BUILTIN_HANDLERS.items():
+        _add(key, handler)
+    try:
+        pack = pack_handlers(agent)
+    except agent_spec.AgentError:
+        # 规则包坏了不能吞：装配阶段就该失败（resolve_handler 也会报同样错）
+        raise
+    for name, handler in pack.items():
+        _add(f"pack:{name}", handler)
+    return registry
+
+
+def rule_executor_from(registry, review_id, run_id):
+    """注册表 → 计划执行器（async）：一步 = 一次工具调用。"""
+    context = ToolContext(
+        review_id=review_id, run_id=run_id, actor="pipeline",
+        permissions=frozenset({Permission.READ, Permission.ANALYZE,
+                               Permission.WRITE}),
+    )
+
+    async def execute(step):
+        try:
+            result, _invocation = await registry.execute(
+                _tool_name(step.handler), {"dimension": step.dimension}, context)
+        except ToolError as e:
+            # 保持旧语义：配置里写了不存在的处理器 = Agent 配置错误，
+            # 由 main() 归到「配置问题」退出码，而不是当成运行时崩溃。
+            raise agent_spec.AgentError(str(e)) from e
+        if not result.ok:
+            raise agent_spec.AgentError(
+                f"{step.handler} 执行失败：{'；'.join(result.errors)}")
+        return result.data.get("findings", ())
+
+    return execute
+
+
 def pack_handlers(agent):
     """加载 agents/<id>/checks.py 里的 CHECKERS（按 mtime 缓存）。"""
     path = agent.dir / "checks.py"
@@ -1769,6 +1897,11 @@ def resolve_handler(key, agent):
     """把 manifest 里的处理器名解析成可调用对象；解析不到必须报错。
 
     静默跳过是最坏的结果：报告看起来一切正常，实际少跑了整整一类检查。
+
+    **已被 Tool Registry 分发取代**（见 `build_rule_registry` / `rule_executor_from`）：
+    现在不再有调用点。按 AGENT_RUNTIME §10.3 的迁移规矩保留到阶段 5——
+    处理器实现在 `_h_*` 里，删掉解析器等于提前宣布迁移完成，而实现还没纯化。
+    两者读的是同一份 `BUILTIN_HANDLERS` / `pack_handlers`，不会各说各话。
     """
     if key in BUILTIN_HANDLERS:
         return BUILTIN_HANDLERS[key]
@@ -1822,22 +1955,29 @@ def run_agent_steps(s, agent, text, active, target_path, format_spec=None):
     """按 manifest 执行：先维度处理器（声明顺序），再附加检查。
 
     返回执过的处理器名列表，写进 S3 日志——用户要能看到"这次到底跑了哪些检查"。
+
+    **分发已由 Tool Registry 接管**：处理器先注册成工具（`_HandlerTool`），
+    再经 `registry.execute()` 走「存在性 → 权限 → 执行 → 结果」同一条管线。
+    注册表按 run 建（处理器绑定了 Session），所以不存在跨 run 串数据。
+
+    调度顺序由 `plan_rule_steps` 生成（维度绑定 → 附加检查），
+    执行由 `run_rule_plan` 压成每步一条 `RuleStepOutcome`。
+
     format_spec：格式规格的 check 块（只有 format 维用得上），随 ctx 传给处理器。
     """
     ctx = {"target_path": target_path, "target_type": s.target_type, "agent": agent,
            "format_spec": format_spec}
-    executed = []
-    for dim in agent.dims_for(s.target_type):
-        key = agent.handler_for(dim)
-        if not key:
-            continue        # 无本地处理器 = 只由语义审负责（如 logic）
-        ctx["dimension"] = dim      # 通用规则引擎靠它筛出自己维度的规则
-        s = resolve_handler(key, agent)(s, text, active, ctx)
-        executed.append(key)
-    for key in agent.checks:
-        s = resolve_handler(key, agent)(s, text, active, ctx)
-        executed.append(key)
-    return s, executed
+    dims = agent.dims_for(s.target_type)
+    plan = plan_rule_steps(
+        dims,
+        {dim: (agent.handler_for(dim) or "") for dim in dims},
+        agent.checks,
+    )
+    run_id = domain_ids.format_run_id(s.review_id, 1)
+    registry = build_rule_registry(s, text, active, ctx, run_id, agent)
+    execute = rule_executor_from(registry, s.review_id, run_id)
+    result = asyncio.run(run_rule_plan(plan, execute))   # on_error="raise"：与改造前一致
+    return s, list(result.executed)
 
 
 def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=None,
@@ -2107,68 +2247,14 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
 
 
 def coverage_from_llm_meta(llm_meta, chars_total):
-    """由语义审 meta 推导真实文本覆盖与「是否完整」（纯函数，便于单测）。
+    """由语义审 meta 推导真实文本覆盖与「是否完整」。
 
-    complete 旧口径只看输入/输出截断，块级调用失败被 `continue` 掉后仍报
-    「全覆盖」——202 份历史报告里 complete=False 一次没出现过，根因就在这里。
-    现在多一个硬条件：任何 (dimension, chunk) 失败都使 complete=False。
+    实现只有一份，在 `review_agent.runtime.nodes.semantic.coverage_from_meta`：
+    节点与旧流程必须用同一份推导，否则「节点说审了 80%」「报告说审了 100%」
+    会同时存在，而用户只会看到后者。
     """
-    meta = llm_meta or {}
-    try:
-        chars_total = max(0, int(chars_total or 0))
-    except (TypeError, ValueError):
-        chars_total = 0
+    return semantic_coverage_from_meta(llm_meta, chars_total)
 
-    in_trunc = list(meta.get("input_truncated_dimensions") or [])
-    out_trunc = list(meta.get("output_truncated_dimensions") or [])
-    failed = []
-    for item in meta.get("failed_chunks") or []:
-        if not isinstance(item, dict):
-            continue
-        failed.append({
-            "dim": item.get("dim"),
-            "chunk": item.get("chunk"),
-            "start": item.get("start"),
-            "end": item.get("end"),
-        })
-
-    # 兼容纯规则模式 / 旧 meta：没有 chars_reviewed 时按整篇算——没有调用模型
-    # 不算"失败"。但不能用 `or chars_total`：全块失败时 0 是有效值，
-    # falsy 回退会把 0 变成全文，正是这次要修的假全覆盖。
-    if meta.get("chars_reviewed") is None:
-        reviewed = 0 if failed else chars_total
-    else:
-        try:
-            reviewed = int(meta.get("chars_reviewed"))
-        except (TypeError, ValueError):
-            reviewed = 0
-    reviewed = max(0, min(reviewed, chars_total))
-
-    try:
-        attempted = max(0, int(meta.get("chunks_attempted") or 0))
-    except (TypeError, ValueError):
-        attempted = 0
-    try:
-        succeeded = max(0, int(meta.get("chunks_succeeded") or 0))
-    except (TypeError, ValueError):
-        succeeded = 0
-
-    complete = not in_trunc and not out_trunc and not failed
-    # 防御：定位/切分异常导致实际覆盖不足时也不能称"全覆盖"。
-    if reviewed < chars_total:
-        complete = False
-    return {
-        "chars_total": chars_total,
-        "chars_reviewed": reviewed,
-        "text_coverage_pct": (round(reviewed / chars_total * 100)
-                              if chars_total else 100),
-        "chunks_attempted": attempted,
-        "chunks_succeeded": succeeded,
-        "failed_chunks": failed,
-        "input_truncated_dimensions": in_trunc,
-        "output_truncated_dimensions": out_trunc,
-        "complete": complete,
-    }
 
 
 # ----------------------------------------------------------------------------
@@ -2193,19 +2279,30 @@ def _acquire_ledger_lock(timeout=30.0):
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
             return lock
+        except PermissionError:
+            # Windows 上「锁文件已存在且被别的进程打开」时，O_EXCL 抛的可能是
+            # PermissionError 而不是 FileExistsError（实测 6 路并发必现）。
+            # 这里不能先判断「锁文件还在不在」：持有者可能在两次系统调用之间就删了锁，
+            # 检查会误判成「目录不可写」而直接抛错。统一按争用处理，靠超时兜底。
+            _wait_for_ledger_lock(lock, deadline, timeout)
         except FileExistsError:
             # 进程被强杀会留下锁文件：超龄（60s）视为陈旧，直接清掉，不能永久堵死
-            try:
-                if time.time() - lock.stat().st_mtime > 60:
-                    lock.unlink()
-                    continue
-            except OSError:
-                pass
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"等待台账写锁超时（{timeout:.0f}s）：{lock}；"
-                    "如确认没有审查在跑，可手工删除该锁文件")
-            time.sleep(0.01)
+            _wait_for_ledger_lock(lock, deadline, timeout)
+
+
+def _wait_for_ledger_lock(lock, deadline, timeout):
+    """锁被别人持有：清超龄锁、等一小会、超时给出可操作报错。"""
+    try:
+        if time.time() - lock.stat().st_mtime > 60:
+            lock.unlink()
+            return
+    except OSError:
+        pass
+    if time.time() > deadline:
+        raise TimeoutError(
+            f"等待台账写锁超时（{timeout:.0f}s）：{lock}；"
+            "如确认没有审查在跑，可手工删除该锁文件")
+    time.sleep(0.01)
 
 
 def _release_ledger_lock(lock):
@@ -2216,8 +2313,17 @@ def _release_ledger_lock(lock):
 
 
 def allocate_review_id(date):
-    """从 outputs/ + ledger 已用 ID 中取下一个，并用 O_EXCL 锁文件防并发覆盖。"""
+    """从 outputs/ + ledger + 新引擎状态目录 已用 ID 中取下一个，并用 O_EXCL 锁文件防并发覆盖。"""
     used = {p.stem for p in OUTPUTS.glob(f"R-{date}-*.json")}
+    # 新引擎（--engine v1）只落状态、不写报告：不把它的 ID 算进来，
+    # 第二次 v1 会拿到同一个 R-id 并覆盖上一份状态。
+    runs_dir = STATE / "runs"
+    if runs_dir.is_dir():
+        for path in runs_dir.glob("R-*.state.json"):
+            stem = path.name.split(".state.json", 1)[0]
+            review_id = stem.split("-RUN", 1)[0]
+            if review_id:
+                used.add(review_id)
     ledger = LEDGER / "chain.log"
     if ledger.exists():
         try:
@@ -2261,8 +2367,13 @@ def allocate_review_id(date):
 TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "gb18030", "utf-16", "utf-16-le", "utf-16-be")
 
 
-class UnreadableTargetError(ValueError):
-    """待审目标不可读（docx 损坏/缺失/非文档）。CLI 与 server 捕获后给出明确错误。"""
+class UnreadableTargetError(InputError):
+    """待审目标不可读（docx 损坏/缺失/非文档）。CLI 与 server 捕获后给出明确错误。
+
+    归到领域错误家族（`InputError`，kind=input / 400）而不是裸 ValueError：
+    上层要能区分「用户路径写错了」与「我们服务坏了」。它仍然继承 ValueError，
+    所以既有 `except ValueError` 的调用点行为不变。
+    """
 
 
 def read_target_text(path: Path):
@@ -2357,6 +2468,9 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
                 progress_path=progress_path, log_dir=log_dir)
     # 人工指定类型 = 满置信；自动推断则沿用推断置信度
     s.type_confidence = 1.0 if type_override else float(type_info.get("confidence") or 0.6)
+    # 本次执行的 run_id：旧流程没有「多次执行」概念，第一次执行就是 RUN01。
+    # S4（证据锚定）与 S6（裁定）都要它——证据与裁定必须能归属到同一次执行。
+    run_id = domain_ids.format_run_id(review_id, 1)
 
     if scenario_info:
         _ids = [x["rule_id"] for x in scenario_info["skipped"]]
@@ -2516,23 +2630,27 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
 
     # ---- S4 证据锚定（已在各 reviewer 内绑定 quote/rule/evidence/tool/confidence）----
     t = time.perf_counter()
-    # 日志一直写「quote 必须逐字出现，否则丢弃」，但旧实现只统计不丢弃。
-    # 这里把安全线补成真动作：非空 quote 无法逐字回查原文的条目移出报告；
-    # 缺失型问题（quote 为空）是「原文没有某条款」，不是伪造证据，保留。
-    dropped_unanchored = []
-    kept_issues = []
-    for i in s.issues:
-        q = i.get("quote")
-        # 占位式 quote（如空文档格式检查的「（文档首段）」）没有可回查的原文，
-        # 属于缺失型问题，保留；只丢「声称引了原文、却回查不到」的条目。
-        placeholder = (isinstance(q, str) and q.startswith("（")
-                       and q.endswith("）"))
-        if q and q not in text and not placeholder:
-            dropped_unanchored.append(i)
-        else:
-            kept_issues.append(i)
+    # 校验规则只有一份实现（review_agent.runtime.nodes.evidence.verify_quote）：
+    # 非空 quote 无法逐字回查原文的条目移出报告；缺失型问题（quote 为空）保留。
+    # 节点接管后的做法：把 issue 编成领域对象交给证据节点，按节点结论过滤报告条目；
+    # 编不出对象时退回同一函数的逐条入口，并把降级写进决策日志（不假装锚定过）。
+    _anchor = None
+    try:
+        _anchor = anchor_findings(
+            [e.finding for e in encode_issues(s.issues, run_id=run_id)],
+            text, run_id=run_id)
+        _dropped_ids = set(_anchor.dropped_ids)
+        dropped_unanchored = [i for i in s.issues if i["issue_id"] in _dropped_ids]
+    except CodecMismatch as e:
+        dropped_unanchored = [
+            i for i in s.issues
+            if verify_quote(i.get("quote", ""), text) is Verification.UNANCHORED]
+        s.decision("S4 证据锚定降级", "OVERALL-004",
+                   f"issue 未能编成领域对象，按逐条规则校验：{e}"[:200],
+                   ["放弃锚定"], "旧链路必须能跑完；降级本身要留痕")
     if dropped_unanchored:
-        s.issues = kept_issues
+        _dropped_ids = {i["issue_id"] for i in dropped_unanchored}
+        s.issues = [i for i in s.issues if i["issue_id"] not in _dropped_ids]
         _sample = "、".join(
             f"{i.get('issue_id')}/{i.get('rule_id')}"
             for i in dropped_unanchored[:5])
@@ -2544,7 +2662,11 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             "OVERALL-004", f"示例：{_sample}"[:150],
             ["保留并在报告标注不可回溯"],
             "quote 无法逐字回查原文 = 结论不可审计，不能进入报告")
-    traceable = sum(1 for i in s.issues if i.get("quote") and i["quote"] in text)
+    traceable = sum(1 for i in s.issues
+                    if verify_quote(i.get("quote", ""), text) is Verification.ANCHORED)
+    # 证据段落：由节点产出的 Evidence 回写（新增顶层字段，不改既有格式）。
+    # 被丢弃的条目不在 _anchor.evidence 里，所以不会出现指向已删结论的悬空证据。
+    evidence_block = evidence_to_report(_anchor.evidence) if _anchor else []
     dim_count = {}
     for i in s.issues:
         dim_count[DIM_FULL_NAME.get(i["dimension"], i["dimension"])] = \
@@ -2559,7 +2681,39 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # ---- S5 交叉复核 ----
     t = time.perf_counter()
     before_cross = len(s.issues)
-    s = cross_review(s)
+    # 规则实现已挪进节点（review_agent.runtime.nodes.cross_review）：
+    # 同片段跨维度冲突 → disputes + 双方各降 0.05（下限 0.5）。
+    # 发现不可变，所以降权走修订（revisions）而不是就地改 dict——旧实现改完
+    # 只剩最终值，「为什么从 0.75 变成 0.70」在报告里查不出来。
+    try:
+        _cross = review_cross(
+            [e.finding for e in encode_issues(s.issues, run_id=run_id)],
+            run_id=run_id)
+        _adjusted = {f.id: f.confidence for f in _cross.revisions}
+        for _it in s.issues:
+            if _it["issue_id"] in _adjusted:
+                _it["confidence"] = _adjusted[_it["issue_id"]]
+        # 回写报告用的 disputes（形状与旧格式一致，见 dispute_to_report_dict）
+        s.disputes.extend(dispute_to_report_dict(d) for d in _cross.disputes)
+        _via_node = True
+    except CodecMismatch:
+        # 编不出领域对象时退回旧实现（阶段 5 前旧函数不删）：行为与改造前一致，
+        # 且旧实现自己会写决策日志，这里只记一笔降级。
+        s = cross_review(s)
+        _via_node = False
+        s.decision("S5 交叉复核降级", "OVERALL-002",
+                   "issue 未能编成领域对象，退回旧实现复核",
+                   ["跳过复核"], "旧链路必须能跑完：带着未复核的结论出报告是假绿灯")
+    if _via_node:
+        if _cross.disputes:
+            s.decision(f"交叉复核发现 {len(_cross.disputes)} 处跨维度冲突",
+                       "OVERALL-002",
+                       "同一原文片段被两个维度分别标记且定级不一致",
+                       ["维持原判", "直接取最高严重度"],
+                       "冲突需人工裁定，同时下调相关 issue 置信度")
+        else:
+            s.decision("交叉复核：四维结论无冲突", "OVERALL-002",
+                       "事实/安全/合规/风格 无互斥结论", ["有冲突"], "样本无重叠冲突点")
     s.step("S5", "交叉复核", latency_ms=(time.perf_counter() - t) * 1000, detail={
         "争议": f"{len(s.disputes)} 处待人工裁定",
         "复核前后异议数": f"{before_cross} → {len(s.issues)}",
@@ -2668,19 +2822,54 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # 归口折叠的条目（同片段让位给结论级规则 / 内部进度豁免）也要落到报告里：
     # 折叠 ≠ 删除，每条都带 folded_into + fold_reason，可在 JSON 里回查。
     suppressed.extend(getattr(s, "folded", []) or [])
-    if stats["blocker"] > 0:
-        verdict = "fail"
-    elif stats["major"] > 0:
-        verdict = "warn"
-    elif research_block and (research_block.get("unverified")
-                             or research_block.get("needs_confirm")):
-        # 有库外事实没核完，或只有单一来源反驳：不能给 pass。
-        verdict = "warn"
+    # 裁定交给 Decision Engine（review_agent.runtime.nodes.decision）：
+    # blocker→fail、仅 major→warn、库外未核完不得 pass。规则只在 domain.policy
+    # 一处实现——历史报告回放、单测、线上走的都是同一个函数。
+    research_unverified = bool(research_block and (
+        research_block.get("unverified") or research_block.get("needs_confirm")))
+    codec_problem = ""
+    try:
+        findings = [e.finding for e in encode_issues(issues_sorted, run_id=run_id)]
+    except CodecMismatch as e:
+        # 装不下就降级到计数口径（与旧实现等价），而不是让审查崩在 S6。
+        # 降级本身留痕：决策日志 + limitations 各写一条。
+        findings = []
+        codec_problem = f"issue 未能编成领域对象，裁定降级为计数口径：{e}"
+        s.decision("裁定口径降级", "OVERALL-003", codec_problem[:300],
+                   ["领域对象裁定"], "旧链路必须能跑完：降级不等于差异可以不留痕")
+    if codec_problem:
+        _draft = DEFAULT_POLICY.decide_from_counts(
+            blocker=stats["blocker"], major=stats["major"],
+            external_unverified=research_unverified,
+            total=sum(stats.values()),
+        )
+        verdict, _risk, _human = _draft.verdict.value, _draft.risk_level.value, \
+            _draft.requires_human_review
+        _reasons, _policy = list(_draft.reasons), _draft.policy_id
     else:
-        verdict = "pass"
+        _decision = build_decision(findings, run_id=run_id,
+                                   external_unverified=research_unverified)
+        verdict, _risk, _human = _decision.verdict.value, _decision.risk_level.value, \
+            _decision.requires_human_review
+        _reasons, _policy = list(_decision.reasons), _decision.policy_id
+    # 决策日志的既有字段一字未改（历史 logs 要能并排比对），新增字段只增不改。
     s.decision(f"verdict={verdict}", "OVERALL-003",
                f"blocker={stats['blocker']}, major={stats['major']}",
-               ["pass", "warn", "fail"], "存在 blocker→fail；仅 major→warn；否则 pass")
+               ["pass", "warn", "fail"], "存在 blocker→fail；仅 major→warn；否则 pass",
+               risk_level=_risk, requires_human_review=_human,
+               policy=_policy, reasons=_reasons)
+
+    # 阶段 1 收口：报告里的 issues / suppressed 由领域对象回写（编码→解码→逐键校验）。
+    # 校验不过不静默：保留原 dict 照常出报告，但差异进决策日志与 limitations。
+    # 编解码前面已经失败过就不再试：同一份输入不可能第二次通过，重复报错只会淹没真因。
+    if not codec_problem:
+        try:
+            issues_sorted = export_issues(issues_sorted, run_id=run_id)
+            suppressed = export_issues(suppressed, run_id=run_id)
+        except CodecMismatch as e:
+            codec_problem = f"issue 回写校验未通过，报告保留旧 dict：{e}"
+            s.decision("issue 未由领域对象回写", "OVERALL-003", str(e)[:300],
+                       ["保留旧 dict"], "报告照出，但差异必须留痕，不能悄悄放过")
 
     to_confirm = [i for i in issues_sorted if i["confidence"] < 0.7]
     to_fix = [i for i in issues_sorted if i["severity"] in ("blocker", "major")]
@@ -2803,6 +2992,12 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             "数值/日期矛盾不在本次检查范围内（如需请以文本方式单独审查）")
 
     limitations = []
+    # 引擎自身的表达力缺口（见 review_agent/adapters/issue_codec.py）：
+    # 报告照出，但必须自报「这次有结论没能走领域对象回写」。
+    if codec_problem:
+        limitations.append(
+            f"本次报告有条目未能由领域模型回写（{codec_problem[:160]}）："
+            "结论按旧格式输出，相关字段口径未经验证。")
     # 情境说明紧跟"未审范围"类信息：它解释的是"这一整类问题本次不问"，
     # 比"某条断言未命中"更影响结论解读，所以要排在前面。
     # 后面的编码告警与输入截断会 insert(0)，仍排在它之前（那两种更严重）。
@@ -3073,7 +3268,8 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
 
     report = {
         # 报告字段契约的版本：新增/删除顶层字段时改这里，读取方据此兼容。
-        "schema_version": "1.1",
+        # 1.2：新增顶层 evidence[]（逐条结论的引用校验结论），既有字段未动。
+        "schema_version": "1.2",
         "review_id": review_id,
         "target_type": s.target_type,
         "target_type_source": "manual" if type_override else "auto",
@@ -3160,6 +3356,9 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         "action_plan": action_plan,
         "limitations": limitations,
         "issues": issues_sorted,
+        # 证据段落：每条结论的引用核过没有（anchored / placeholder / …）。
+        # issues[].quote 只说「引了哪句」，这里回答「这句能不能回查原文」。
+        "evidence": evidence_block,
         # 模型自否的条目：不进 to_fix / 统计，但保留下来（模型曾怀疑过也是信息）
         "excluded": list((llm_meta or {}).get("excluded") or []),
         # 规则清单外发现（OPEN-*）：单独列一份，标明来源=模型。
@@ -3268,6 +3467,234 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         pass
     _ID_LOCKS.discard(id_lock)
     return report
+
+
+# ----------------------------------------------------------------------------
+# 影子流水线（Architecture v1）：六节点 + 编排器
+# ----------------------------------------------------------------------------
+# 这不是 run_one 的替代，是**并行跑的对照实现**：同一份输入，旧 S1~S6 与新的
+# 六节点流水线各跑一遍，比 stats / findings 集合 / verdict。差异必须先解释，
+# 才允许把默认链路切过去（REFACTOR_PLAN 阶段 2 的硬判据）。
+#
+# 目前只接 rule-only：语义审的入队（去重、语境豁免、make_issue）还是 Session 语义，
+# 硬接会改变行为，留到能力层整理之后。所以这个函数在 `use_llm is not False` 时
+# 直接抛错，而不是假装审了模型。
+
+class _FinalizeNode:
+    """finalize 阶段：把状态收敛成影子报告。
+
+    不是旧报告：`purpose` / `law_library` / `research` / `action_plan` / 哈希链
+    这几块新流水线还没算，报告里显式列进 `unsupported_blocks`。
+    「没算就不写」比「写个空块」诚实，也是切流的验收单。
+    """
+
+    name = "finalize"
+    stage = Stage.FINALIZE
+    produces = frozenset({"report", "audit_export"})
+
+    def __init__(self, review_id: str) -> None:
+        self.review_id = review_id
+
+    async def run(self, ctx):
+        report = build_shadow_report(
+            ctx.state, target_meta=ctx.state.artifacts.get("target_meta"))
+        return NodeResult.ok(output={
+            "report": report,
+            "audit_export": {"report_id": self.review_id,
+                             "schema_version": report["schema_version"]},
+        })
+
+
+def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
+                       agent_id=None, type_override=None, store=None,
+                       semantic_review_fn=None, use_llm=False,
+                       llm_meta_out=None, purpose_info=None,
+                       integrity_out=None):
+    """用新的六节点流水线跑一次审查，返回 (RunState, RunOutcome, Session)。
+
+    失败时抛 UnreadableTargetError（与 run_one 同语义），调用方不必区分两套异常。
+
+    `store`：给一个目录就落盘状态（`FileRunStore`），进程重启后可以按 run_id 续跑。
+    `semantic_review_fn`：给了就把语义审接进 analysis 阶段（一步模型调用，返回
+    `llm_review.review_dimension` 同形状的 dict）；不给则只跑规则审。
+    `use_llm`：`False`（默认）纯规则；`None` 能配就配、配不上降级；`True` 配不上报错。
+    `llm_meta_out`：传入 dict 时回填模型可用性与来源（CLI 摘要要用）。
+
+    `use_llm=True` 但模型不可用时抛 `ConfigError`——**显式要求过模型就不许静默降级**。
+    """
+    if review_id is None:
+        date = datetime.date.today().strftime("%Y%m%d")
+        review_id, id_lock = allocate_review_id(date)
+        try:
+            id_lock.unlink()
+        except OSError:
+            pass
+        _ID_LOCKS.discard(id_lock)
+
+    try:
+        text, source_encoding, enc_warn = read_target_text(target_path)
+    except (ValueError, OSError) as e:
+        raise UnreadableTargetError(
+            f"无法读取待审文件 {target_path.name}：{e}") from e
+
+    type_info = detect_type_detail(target_path, text)
+    chosen_type = type_override or type_info["type"]
+    target_rel = str(target_path.relative_to(ROOT)).replace("\\", "/")
+
+    agent, _reason = agent_spec.resolve(target_path, text, agent_id=agent_id)
+    rules = merge_agent_rules(rules, agent)
+    set_rule_index(rules)
+    active = [r for r in rules if r.get("enabled", True)]
+    dims = agent.dims_for(chosen_type)
+
+    run_id = domain_ids.format_run_id(review_id, 1)
+    session = Session(review_id, target_rel, chosen_type)
+    session.type_confidence = float(type_info.get("confidence") or 0.6)
+    legacy_ctx = {"target_path": target_path, "target_type": chosen_type,
+                  "agent": agent, "format_spec": None}
+
+    registry = build_rule_registry(session, text, active, legacy_ctx, run_id, agent)
+    _rule_executor = rule_executor_from(registry, review_id, run_id)
+
+    profile = ReviewProfile(
+        id=agent.id, name=agent.name, version=agent.version,
+        dimensions=tuple(dims),
+    )
+    # 完整性指纹：v1 报告也要能验证「结论没被改过」。算一次、两处用
+    # （初始状态的 target_hash + 影子报告的 integrity 块）。
+    integrity_inputs = _integrity_inputs(target_path, rules, active, agent)
+    if integrity_out is not None:
+        integrity_out.update(integrity_inputs)
+    app = ReviewApplication(
+        store=FileRunStore(store) if store else None,
+        checkpoints=MemoryCheckpointStore(),
+    )
+    state = app.initial_state(
+        review_id=review_id, run_id=run_id, profile=profile,
+        target_hash=integrity_inputs["target_hash"],
+    )
+    if semantic_review_fn is None and use_llm is not False:
+        semantic_review_fn, llm_meta = make_llm_review_fn(
+            active, text, chosen_type, use_llm=use_llm, agent=agent,
+            purpose_info=purpose_info)
+        if llm_meta_out is not None:
+            llm_meta_out.update(llm_meta)
+        if semantic_review_fn is None and use_llm is True:
+            raise ConfigError(
+                f"LLM 不可用：{llm_meta.get('reason')}；"
+                "如需纯规则审请显式传 --no-llm")
+    semantic_executor = None
+    if semantic_review_fn is not None:
+        semantic_executor = make_semantic_executor(
+            session=session, text=text, run_id=run_id,
+            review_fn=semantic_review_fn)
+    ports = PipelinePorts(
+        reader=read_target_text, rule_executor=_rule_executor,
+        finalize_node=_FinalizeNode(review_id),
+        semantic_executor=semantic_executor,
+    )
+    config = {
+        "target_path": str(target_path),
+        "dimensions": list(dims),
+        "handlers": {dim: (agent.handler_for(dim) or "") for dim in dims},
+        "checks": list(agent.checks),
+    }
+    outcome = asyncio.run(app.run(state, ports, config=config))
+    return outcome.state, outcome, session
+
+
+def make_semantic_executor(*, session, text, run_id, review_fn,
+                           tool_label="llm_api"):
+    """把「调一次模型」与「候选入库」接起来，供 SemanticReviewerNode 使用。
+
+    `review_fn(step)` 负责真正的模型调用（返回与 `llm_review.review_dimension`
+    同形状的 dict）。把它作为参数注入，而不是在这里直接建 client：
+    节点测试与离线校验要能跑，不需要网络与 API Key。
+
+    去重用的「已有结论」在构造时取一次快照，之后每步新收的发现追加进去——
+    分块审查时后面的块要能看到前面块已经报过什么。
+    """
+    known = [e.finding for e in encode_issues(session.issues, run_id=run_id)]
+    exemptions = tuple((rid, q, reason) for rid, q, reason in session.context_exempt)
+
+    def executor(step, start_seq):
+        res = review_fn(step) or {}
+        candidates = [
+            Candidate(
+                rule_id=str(item.get("rule_id") or ""),
+                quote=str(item.get("quote") or ""),
+                evidence=str(item.get("evidence") or ""),
+                confidence=float(item.get("confidence") or 0.0),
+                suggestion=str(item.get("suggestion") or ""),
+                severity=item.get("severity"),
+                open_discovery=bool(item.get("open_discovery")),
+            )
+            for item in (res.get("issues") or ())
+        ]
+        model = str(res.get("model") or "")
+        result = ingest_candidates(
+            candidates,
+            IngestContext(
+                run_id=run_id, text=text, dimension=step.dimension,
+                existing=tuple(known), exemptions=exemptions,
+                tool=f"{tool_label}({model})" if model else tool_label,
+            ),
+            start_seq=start_seq,
+        )
+        known.extend(result.findings)
+        return SemanticStepOutcome(
+            findings=result.findings,
+            candidates=len(candidates),
+            dropped=len(res.get("dropped") or ()),
+            retracted=tuple(res.get("retracted") or ()),
+            cached=bool(res.get("cached")),
+            usage=res.get("usage") or {},
+            truncated=bool(res.get("truncated")),
+            output_truncated=bool(res.get("output_truncated")),
+            finish_reason=str(res.get("finish_reason") or ""),
+        )
+
+    return executor
+
+
+def compare_with_report(report: dict, state) -> dict:
+    """双跑比对：新流水线的发现 vs 旧报告。
+
+    判据（REFACTOR_PLAN 阶段 2 的硬要求）：
+      * 新流水线保留下来的每条发现，必须能对上旧报告的 `issues` **或** `suppressed`；
+        对不上就是新实现的 bug，不许用「模型波动」搪塞。
+      * 旧报告里的每条 issue，必须在新流水线里存在。
+      * verdict 必须一致。
+
+    `suppressed` 也算对上，是因为同片段归口折叠（`collapse_rule_overlap`）等动作
+    目前仍只在旧流程里跑：折叠不等于丢结论，只是「不在清单里展开」。
+    """
+    from review_agent.runtime import surviving_findings as _surviving
+
+    def key(rule_id, quote):
+        return (str(rule_id or ""), str(quote or ""))
+
+    typed = [key(f.rule.rule_id if f.rule else "", f.quote)
+             for f in _surviving(state)]
+    legacy = [key(i.get("rule_id"), i.get("quote"))
+              for i in (report.get("issues") or [])]
+    folded = [key(i.get("rule_id"), i.get("quote"))
+              for i in (report.get("suppressed") or [])]
+    legacy_set, folded_set, typed_set = set(legacy), set(folded), set(typed)
+    unexplained = [k for k in typed if k not in legacy_set and k not in folded_set]
+    missing = [k for k in legacy if k not in typed_set]
+    folded_matches = [k for k in typed if k in folded_set and k not in legacy_set]
+    verdict_new = state.decision.verdict.value if state.decision else None
+    return {
+        "ok": not unexplained and not missing and verdict_new == report.get("verdict"),
+        "verdict_new": verdict_new,
+        "verdict_legacy": report.get("verdict"),
+        "unexplained": unexplained,
+        "missing": missing,
+        "folded": folded_matches,
+        "typed_count": len(typed),
+        "legacy_count": len(legacy),
+    }
 
 
 _MD_DANGEROUS_PROTO = re.compile(r"(?i)\b(javascript|data|vbscript)\s*:")
@@ -3631,6 +4058,314 @@ def render_md(report):
 RULE_BY_ID = rule_index(rules_store.load_all_rules())
 
 
+ENGINE_ENV = "REVIEW_ENGINE"
+ENGINES = ("legacy", "v1", "shadow")
+DEFAULT_ENGINE = "legacy"
+
+
+def _take_engine(args):
+    """从 argv 里取出 `--engine X` / `--engine=X`，缺省读环境变量，再缺省 legacy。
+
+    返回 (engine, 剩余 args)。非法值直接报错退出——静默回退到 legacy 是最坏的结果：
+    用户以为跑了新引擎，实际还是旧链路。
+    """
+    engine = None
+    rest = list(args)
+    for index, item in enumerate(list(rest)):
+        if item == "--engine":
+            if index + 1 >= len(rest):
+                print(f"--engine 缺少取值。可选：{' / '.join(ENGINES)}")
+                sys.exit(2)
+            engine = rest[index + 1]
+            del rest[index:index + 2]
+            break
+        if item.startswith("--engine="):
+            engine = item.split("=", 1)[1]
+            del rest[index]
+            break
+    if engine is None:
+        engine = os.environ.get(ENGINE_ENV, "").strip() or DEFAULT_ENGINE
+    engine = str(engine).strip().lower()
+    if engine not in ENGINES:
+        print(f"未知引擎：{engine!r}；可选：{' / '.join(ENGINES)}")
+        sys.exit(2)
+    return engine, rest
+
+
+def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None,
+                purpose=None, purpose_max=None):
+    """双跑：旧报告已生成，再跑一遍六节点流水线并比对。
+
+    差异写进 `state/double_run/<review_id>.json`，控制台打印一句话结论。
+    这是切流前的刹车：只有连续零未解释差异，才允许把默认链路换成 v1。
+    """
+    purpose_info = (purpose_mod.parse(str(purpose), max_chars=purpose_max)
+                    if purpose and str(purpose).strip() else None)
+    integrity_inputs: dict = {}
+    state, outcome, session = run_typed_pipeline(
+        target_path, rules, review_id=report["review_id"],
+        agent_id=agent_id, type_override=type_override,
+        store=STATE / "runs", integrity_out=integrity_inputs,
+        purpose_info=purpose_info)
+    diff = compare_with_report(report, state)
+    payload = {
+        "review_id": report["review_id"],
+        "engine": "shadow",
+        "status": outcome.status,
+        "errors": list(outcome.errors),
+        "diff": diff,
+        "state": state_to_dict(state),
+    }
+    out_dir = STATE / "double_run"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{report['review_id']}.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 双跑也留一份影子报告：差异要能对着「新链路自己怎么说」看，而不是只看计数
+    _write_shadow_report(state, outcome, integrity_inputs=integrity_inputs,
+                         session=session, purpose_info=purpose_info)
+    if diff["ok"]:
+        print(f"[shadow] {report['review_id']} 双跑一致："
+              f"verdict={diff['verdict_new']}，提及折叠 {len(diff['folded'])} 条")
+    else:
+        print(f"[shadow] {report['review_id']} 双跑存在未解释差异："
+              f"unexplained={len(diff['unexplained'])} missing={len(diff['missing'])} "
+              f"verdict {diff['verdict_new']} vs {diff['verdict_legacy']}；"
+              f"详见 state/double_run/{report['review_id']}.json")
+    return diff
+
+
+def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
+                       purpose_info=None):
+    """构造「一次模型调用」的函数，返回 (review_fn | None, meta)。
+
+    None 表示模型不可用（未配置 / 被关闭）；**调用方决定降级还是报错**——
+    这里不悄悄降级：静默降级会让用户以为结论里有模型判断。
+
+    口径与旧 `semantic_review` 一致：按维度取生效规则、任务书（含用户目的）、
+    事实库进 prompt、quote 对全文校验。
+    """
+    try:
+        cfg = llm_client.load_config(use_llm)
+    except Exception as e:                              # noqa: BLE001 - 配置加载失败
+        return None, {"available": False, "reason": f"配置加载失败：{e}"}
+    if not cfg.available:
+        reason = ("已通过 --no-llm 关闭" if use_llm is False
+                  else "config 中 enabled=false" if not cfg.enabled
+                  else "未配置 API Key 且非本地端点")
+        return None, {"available": False, "reason": reason, "model": cfg.model}
+
+    client = llm_client.LLMClient(cfg)
+    by_dim = {}
+    for rule in active:
+        by_dim.setdefault(rule.get("dimension"), []).append(rule)
+    charter = build_charter(target_type, agent=agent)
+    block = purpose_mod.charter_block(purpose_info)
+    if block:
+        charter = f"{charter}\n\n{block}"
+    facts = retrieve.load_facts()
+
+    def review_fn(step):
+        return llm_review.review_dimension(
+            client, step.dimension, by_dim.get(step.dimension, []),
+            step.text, cfg, charter=charter, full_text=text, facts=facts)
+
+    return review_fn, {"available": True, "model": cfg.model,
+                       "source": cfg.source, "base_url": cfg.base_url}
+
+
+def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
+            use_llm=False, purpose=None, purpose_max=None):
+    """只跑六节点流水线（影子）：**不写正式报告**，只落状态并打印摘要。
+
+    为什么不写报告：v1 还没有接报告写出（哈希链 / ledger / limitations）。
+    此时往 `outputs/` 写一份同名报告，等于让用户看到一份「看起来一样、实际少一半」的东西。
+    """
+    purpose_info = None
+    if purpose and str(purpose).strip():
+        purpose_info = purpose_mod.parse(str(purpose), max_chars=purpose_max)
+    llm_meta: dict = {}
+    integrity_inputs: dict = {}
+    try:
+        state, outcome, session = run_typed_pipeline(
+            target_path, rules, agent_id=agent_id, type_override=type_override,
+            store=STATE / "runs", use_llm=use_llm, llm_meta_out=llm_meta,
+            purpose_info=purpose_info, integrity_out=integrity_inputs)
+    except ConfigError as e:
+        print(f"[v1] {e}")
+        _emit_domain_error(e)
+        sys.exit(2)
+    if not outcome.ok:
+        print(f"[v1] 流水线未完成：{outcome.status}；{'；'.join(outcome.errors)[:300]}")
+        _emit_error("；".join(outcome.errors) or "流水线未完成", kind="system",
+                    http_status=500)
+        sys.exit(1)
+    if use_llm is False:
+        print("[v1] 语义审：已通过 --no-llm 关闭（本次为纯规则审）")
+    elif llm_meta.get("available"):
+        print(f"[v1] 语义审：model={llm_meta.get('model')}"
+              f"（{llm_meta.get('source') or '未知来源'}）")
+    else:
+        print(f"[v1] 语义审未启用：{llm_meta.get('reason') or '未配置'}"
+              "（本次为纯规则审）")
+    verdict = state.decision.verdict.value if state.decision else "-"
+    report_path = _write_shadow_report(state, outcome,
+                                       integrity_inputs=integrity_inputs,
+                                       session=session,
+                                       purpose_info=purpose_info)
+    try:
+        shown = report_path.relative_to(ROOT).as_posix()
+    except ValueError:
+        # 测试会把 OUTPUTS 重定向到临时目录：显示绝对路径，不因为「不在仓库里」而崩
+        shown = report_path.as_posix()
+    print(f"[v1] {state.review_id} 流水线完成：verdict={verdict} | "
+          f"发现 {len(state.findings)} 条 | 证据 {len(state.evidence)} 条 | "
+          f"影子报告：{shown} | "
+          f"状态：state/runs/{state.run_id}.state.json")
+    return state
+
+
+def _integrity_inputs(target_path, rules, active, agent):
+    """算一次完整性指纹：目标 / 规则集 / Agent / 知识库 + 各自版本号。
+
+    与旧报告的 `integrity` 块同口径（同一批 integrity.* 函数），
+    这样 v1 报告与历史报告可以用同一套工具验证「规则集变没变」。
+    """
+    return {
+        "target_hash": integrity.sha256_file(str(target_path)),
+        "ruleset_hash": integrity.sha256_bytes(
+            integrity.serialize_active_rules(active).encode("utf-8")),
+        "rules_dir_hash": integrity.sha256_dir(str(RULES)),
+        "rules_version": integrity.rules_version(),
+        "agent_dir_hash": (integrity.sha256_dir(str(agent.dir))
+                           if agent.dir.is_dir() else None),
+        "agent_version": agent.version,
+        "knowledge_hash": integrity.sha256_dir(str(KNOWLEDGE)),
+        "knowledge_version": integrity.knowledge_version(),
+    }
+
+
+def _write_v1_logs(session, outcome, review_id):
+    """把决策 / 工具 / 节点事件写成 `logs/v1/<review_id>/`，返回目录哈希。
+
+    旧报告会对 `logs/<review_id>/` 取哈希进 `integrity.logs_hash`。v1 之前没有这一层，
+    报告只能证明「结论没被改过」，不能证明「过程也没被改过」。这里补上，
+    而且放在**新命名空间** `logs/v1/`，不占正式日志目录。
+    """
+    log_dir = LOGS / "v1" / review_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for name, items in (("decisions.jsonl", session.decisions),
+                        ("tools.jsonl", session.tool_logs)):
+        log_dir.joinpath(name).write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items),
+            encoding="utf-8")
+    log_dir.joinpath("task.json").write_text(json.dumps({
+        "review_id": review_id,
+        "engine": "architecture-v1",
+        "final_status": outcome.status,
+        "errors": list(outcome.errors),
+        "steps": [event.as_dict() for event in outcome.events],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return integrity.sha256_dir(str(log_dir))
+
+
+def _attach_purpose(report, purpose_info, text):
+    """把「审查目的 → 目标 → 原文证据」接进影子报告。
+
+    直接复用 `purpose_mod.analyze()`：同一套意图词典、同一套证据定位规则。
+    `judge=None`：v1 暂不做模型语义裁决（那要额外一次调用），但确定性部分
+    （目标定位、覆盖、未找到说明）已经完整——这正是"目的比对"最不可替代的部分。
+    """
+    if not purpose_info:
+        return report
+    block = purpose_mod.analyze(text or "", purpose_info, report["issues"])
+    if block:
+        report["purpose"] = block
+        not_found = sum(1 for g in block.get("goals") or []
+                        if g.get("status") == "not_found")
+        if not_found:
+            report["limitations"].append(
+                f"目的比对：{not_found} 个目标未在原文找到证据（未找到 ≠ 不存在）")
+    return report
+
+
+def _attach_action_plan(report):
+    """给影子报告的每条发现挂整改建议（改哪句 / 怎么改 / 不改会怎样）。
+
+    整改单不是「再加一句建议」：它要能让人照着动手。所以直接复用旧链路的
+    `remediation.attach()`——同一份规则表、同一套改写模板，避免两套口径。
+    必须在算 `report_hash` 之前调用：报告哈希要覆盖整改建议本身。
+    """
+    try:
+        assertions = retrieve.load_facts().get("assertions", [])
+    except Exception:                                  # noqa: BLE001 - 事实库坏了不该拖垮报告
+        assertions = []
+    report["action_plan"] = remediation.attach(report["issues"], assertions)
+    for issue in report["issues"]:
+        fix = issue.get("fix") or {}
+        if fix.get("consequence"):
+            issue["consequence"] = fix["consequence"]
+    return report
+
+
+def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
+                         purpose_info=None):
+    """把影子报告写到 `outputs/v1/`，并给它补上可校验的完整性链。
+
+    为什么 v1 也要哈希链：报告是交付物，读者必须能验证「这份结论没被改过」。
+    为什么单独一条链（`ledger/v1-chain.log`）：v1 报告在 `outputs/v1/`，
+    混进官方 `ledger/chain.log` 会让 `integrity verify` 找不到对应报告文件。
+    切流时两条链合并（或 v1 链转正），那是发布动作，不能顺手做。
+    """
+    logs_hash = (_write_v1_logs(session, outcome, state.review_id)
+                 if session is not None else None)
+    report = build_shadow_report(
+        state,
+        target_meta=state.artifacts.get("target_meta"),
+        events=outcome.events,
+        checkpoints=outcome.checkpoints,
+        integrity_inputs=integrity_inputs,
+        logs_hash=logs_hash,
+    )
+    _attach_purpose(report, purpose_info, state.artifacts.get("target_text"))
+    _attach_action_plan(report)      # 必须早于 report_hash：哈希要覆盖整改建议
+    ledger_path = LEDGER / "v1-chain.log"
+    lock = _acquire_ledger_lock()
+    try:
+        prev, seq_no = "0" * 64, 1
+        if ledger_path.exists():
+            lines = [l for l in ledger_path.read_text(encoding="utf-8").splitlines()
+                     if l.strip()]
+            if lines:
+                prev = json.loads(lines[-1]).get("report_hash", "0" * 64)
+                seq_no = len(lines) + 1
+        report["integrity"]["prev_report_hash"] = prev
+        report["integrity"]["report_hash"] = integrity.compute_report_hash(report)
+        with open(ledger_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "seq": seq_no,
+                "review_id": report["review_id"],
+                "engine": report["engine"],
+                "target_hash": report["integrity"]["target_hash"],
+                "report_hash": report["integrity"]["report_hash"],
+                "prev_hash": prev,
+                "rules_dir_hash": report["integrity"]["rules_dir_hash"],
+                "rules_version": report["integrity"]["rules_version"],
+                "ts": now_iso(),
+            }, ensure_ascii=False) + "\n")
+            f.flush()
+    finally:
+        _release_ledger_lock(lock)
+
+    out_dir = OUTPUTS / "v1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{report['review_id']}.json"
+    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    (out_dir / f"{report['review_id']}.md").write_text(
+        render_shadow_md(report), encoding="utf-8")
+    return json_path
+
+
 def main():
     args = sys.argv[1:]
     use_llm = None
@@ -3642,6 +4377,10 @@ def main():
     purpose_notes = None
     scenario = None
     research_enabled = False
+    # 引擎选择：默认旧链路；v1 = 只跑六节点流水线（影子）；shadow = 两条都跑并比对。
+    engine, args = _take_engine(args)
+    if engine == "off":
+        return
     if "--scenario" in args:
         i = args.index("--scenario")
         if i + 1 < len(args):
@@ -3823,14 +4562,29 @@ def main():
               "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）；"
               "--research 对事实库外的数字/日期主张联网检索来源并核验（默认关闭）；"
               "--no-research 强制关闭联网核验；"
+              "--engine legacy|v1|shadow 选择执行引擎（legacy 默认；v1 只跑六节点流水线、"
+              "不写报告只落状态；shadow 出旧报告并双跑比对，差异写 state/double_run/；"
+              "v1/shadow 目前只支持 --no-llm）；"
               "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return
     target_arg = args[0]
     target_path = (ROOT / target_arg) if not os.path.isabs(target_arg) else Path(target_arg)
     if not target_path.exists():
         print(f"找不到待审文件：{target_path}")
+        _emit_domain_error(NotFoundError(f"找不到待审文件：{target_path}"))
         sys.exit(1)
     rules = load_rules()
+    if engine == "shadow" and use_llm is not False:
+        # 双跑比对不能拿模型输出比：语义审本身有波动，差异无从判定是 bug 还是随机。
+        # 显式拒绝，比产出一堆「未解释差异」强。
+        print("--engine shadow 目前只支持纯规则模式：请加 --no-llm")
+        _emit_error("--engine shadow 需要 --no-llm", kind="input", http_status=400)
+        sys.exit(2)
+    if engine == "v1":
+        _run_v1(target_path, rules, type_override=type_override,
+                agent_id=agent_id, use_llm=use_llm,
+                purpose=purpose, purpose_max=purpose_max)
+        return
     try:
         report = run_one(target_path, rules, use_llm=use_llm,
                          progress_path=progress_path, type_override=type_override,
@@ -3840,16 +4594,23 @@ def main():
                          research_enabled=research_enabled)
     except agent_spec.AgentError as e:
         print(f"Agent 配置错误：{e}")
+        _emit_domain_error(ConfigError(f"Agent 配置错误：{e}"))
         sys.exit(2)
     except scenario_mod.ScenarioError as e:
         print(f"审查情境错误：{e}")
+        _emit_domain_error(ConfigError(f"审查情境错误：{e}"))
         sys.exit(2)
     except format_spec_mod.FormatSpecError as e:
         print(f"格式规格错误：{e}")
+        _emit_domain_error(ConfigError(f"格式规格错误：{e}"))
         sys.exit(2)
     except UnreadableTargetError as e:
         print(f"目标不可读：{e}")
+        _emit_domain_error(e)
         sys.exit(1)
+    if engine == "shadow":
+        _run_shadow(report, target_path, rules,
+                    type_override=type_override, agent_id=agent_id)
     print(f"[{report['review_id']}] 裁定={report['verdict']} | "
           f"Agent={(report.get('agent') or {}).get('id')} | "
           f"情境={(report.get('scenario') or {}).get('id') or '-'} | "

@@ -207,6 +207,33 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# 审查子进程的错误分类行（review.py::_emit_error 写入 stderr）。
+# 用一行机器可读的 JSON 替代「拿正则去猜 stderr 里那句话是什么意思」：
+# 用户路径写错（input）与服务端坏了（system）要给完全不同的提示。
+ERROR_MARKER = "REVIEW_ERROR "
+
+
+def _parse_review_error(text):
+    """从子进程输出里取结构化错误信息；没有就返回 None（老版本 review.py）。"""
+    for line in reversed(str(text or "").splitlines()):
+        line = line.strip()
+        if not line.startswith(ERROR_MARKER):
+            continue
+        try:
+            info = json.loads(line[len(ERROR_MARKER):])
+        except ValueError:
+            return None
+        return info if isinstance(info, dict) else None
+    return None
+
+
+def _strip_error_marker(text):
+    """展示给用户的错误里不要出现那行机器可读 JSON。"""
+    kept = [line for line in str(text or "").splitlines()
+            if not line.strip().startswith(ERROR_MARKER)]
+    return "\n".join(kept).strip()
+
+
 def _load_llm_history():
     """读取 LLM 配置记忆（最近用过的端点 / 模型）。"""
     try:
@@ -1941,9 +1968,16 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": f"运行失败：{e}", "timeout": timeout}
         elapsed = round(time.time() - t0, 1)
         if proc.returncode != 0:
-            return {"ok": False, "error": (proc.stderr or proc.stdout)[-2500:],
-                    "returncode": proc.returncode, "timeout": timeout,
-                    "elapsed": elapsed}
+            raw = (proc.stderr or proc.stdout or f"退出码 {proc.returncode}")[-2500:]
+            info = _parse_review_error(raw) or {}
+            payload = {"ok": False,
+                       "error": _strip_error_marker(raw) or raw,
+                       "returncode": proc.returncode, "timeout": timeout,
+                       "elapsed": elapsed}
+            if info:
+                payload["error_kind"] = info.get("kind")
+                payload["error_status"] = info.get("http_status")
+            return payload
         after = {p.name for p in OUTPUTS.glob("R-*.json")}
         new = after - before
         if not new:
@@ -2225,6 +2259,7 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
     timeout = REVIEW_TIMEOUT
     status = "done"
     error = None
+    error_kind = None
     report_id = None
     print(f"[review] 任务 {job_id} 开始：{file}（超时 {timeout}s）", flush=True)
     try:
@@ -2233,7 +2268,10 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
         )
         if proc.returncode != 0:
             status = "error"
-            error = (proc.stderr or proc.stdout or f"退出码 {proc.returncode}")[-2000:]
+            raw = (proc.stderr or proc.stdout or f"退出码 {proc.returncode}")[-2000:]
+            info = _parse_review_error(raw) or {}
+            error_kind = info.get("kind")
+            error = _strip_error_marker(raw) or raw
         else:
             after = {p.stem for p in OUTPUTS.glob("R-*.json")}
             new = sorted(after - before)
@@ -2255,6 +2293,9 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
             job.update({
                 "status": status,
                 "error": error,
+                # 错误分类（input / config / system）：前端据此决定「让用户改参数」
+                # 还是「提示联系维护者」，不用去正则匹配 error 文本。
+                "error_kind": error_kind,
                 "report_id": report_id,
                 "finished": time.time(),
                 "elapsed": round(time.time() - started, 1),

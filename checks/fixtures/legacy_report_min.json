@@ -1,0 +1,139 @@
+{
+  "review_id": "R-20261030-001",
+  "target_type": "text",
+  "target_type_source": "auto",
+  "target_path": "targets/sample.txt",
+  "target_text": "第一句。豆包 App 月活用户突破 10 亿。第三句：本公司产品市场占有率达到 90%。",
+  "review_mode": "rule-only",
+  "agent": {
+    "id": "doc-review",
+    "name": "文档审查 Agent",
+    "version": "1.4.0",
+    "selected_by": "扩展名 .txt 自动路由",
+    "dimensions": [
+      {"id": "fact", "label": "事实"},
+      {"id": "compliance", "label": "合规"}
+    ]
+  },
+  "scenario": null,
+  "format_spec": null,
+  "active_rules": [
+    {"rule_id": "FACT-001", "dimension": "fact", "severity": "blocker", "desc": "具体数字必须与来源口径一致"},
+    {"rule_id": "COMP-001", "dimension": "compliance", "severity": "major", "desc": "绝对化表述需有依据"}
+  ],
+  "integrity": {
+    "target_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ruleset_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "rules_dir_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "rules_version": "v1-test",
+    "agent_dir_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "agent_version": "1.4.0",
+    "knowledge_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "knowledge_version": "1.1.1",
+    "report_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "logs_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "prev_report_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "verdict": "fail",
+  "verdict_scale": ["pass", "warn", "fail"],
+  "core_conclusion": "整体裁定 fail：共 3 条异议（blocker 1 / major 1 / minor 0 / nit 0）。需整改后使用。",
+  "coverage": {
+    "chars_total": 44,
+    "chars_reviewed": 44,
+    "complete": true,
+    "chunks": 1,
+    "chunked": false,
+    "active_rules": 2,
+    "dimensions_checked": ["fact", "compliance"],
+    "failed_chunks": [],
+    "uncovered": ["未做外部事实核验"],
+    "source_encoding": "utf-8",
+    "type_detection": {"type": "text", "confidence": 0.9, "source": "auto", "reason": "纯文本"}
+  },
+  "stats": {"blocker": 1, "major": 1, "minor": 1, "nit": 0},
+  "issues": [
+    {
+      "issue_id": "ISS-0001",
+      "dimension": "fact",
+      "severity": "blocker",
+      "quote": "豆包 App 月活用户突破 10 亿",
+      "location": "第 2 句",
+      "rule_id": "FACT-001",
+      "rule_text": "具体数字必须与来源口径一致",
+      "evidence": "公开口径：豆包 App MAU 约 1 亿量级，非 10 亿",
+      "tool": "retrieve + regex",
+      "confidence": 0.95,
+      "confidence_basis": "rule",
+      "suggestion": "改为 1 亿并注明口径与时间",
+      "open_discovery": false
+    },
+    {
+      "issue_id": "ISS-0002",
+      "dimension": "compliance",
+      "severity": "major",
+      "quote": "本公司产品市场占有率达到 90%",
+      "location": "第 3 句",
+      "rule_id": "COMP-001",
+      "rule_text": "绝对化表述需有依据",
+      "evidence": "绝对化表述缺少统计来源",
+      "tool": "regex + checklist",
+      "confidence": 0.6,
+      "confidence_basis": "heuristic",
+      "suggestion": "补充来源或改为区间表述",
+      "open_discovery": false
+    }
+  ],
+  "suppressed": [
+    {
+      "issue_id": "ISS-0003",
+      "dimension": "fact",
+      "severity": "minor",
+      "quote": "第三句：",
+      "location": "第 3 句",
+      "rule_id": "FACT-002",
+      "rule_text": "引用来源必须可定位",
+      "evidence": "同类提示已聚合",
+      "tool": "regex",
+      "confidence": 0.8,
+      "confidence_basis": "rule",
+      "suggestion": "补充来源",
+      "open_discovery": false,
+      "folded_into": "ISS-0002",
+      "fold_reason": "被结论级规则覆盖"
+    }
+  ],
+  "disputes": [
+    {
+      "between": ["fact-reviewer", "compliance-reviewer"],
+      "point": "ISS-0001 与 ISS-0002 指向同一段营销表述，定级不一致",
+      "resolution_hint": "交人工裁定：确认严重度是否被高估/低估",
+      "issue_ids": ["ISS-0001", "ISS-0002"]
+    }
+  ],
+  "decisions": [
+    {
+      "ts": "2026-10-30T13:00:00+08:00",
+      "decision": "verdict=fail",
+      "rule_id": "OVERALL-003",
+      "rationale": "blocker=1, major=1",
+      "alternatives": ["pass", "warn", "fail"],
+      "why_not_alternative": "存在 blocker→fail"
+    }
+  ],
+  "limitations": ["未做外部事实核验：仅比对项目内置事实库"],
+  "action_plan": {"total": 2, "concrete": 1, "manual": 1, "top": []},
+  "law_library": {"available": true, "articles_total": 10, "laws": [], "cited": [], "skipped": []},
+  "fact_gaps": {"count": 0, "items": []},
+  "research": {"enabled": false, "checked": 0, "supported": [], "refuted": [], "unverified": []},
+  "purpose": null,
+  "rule_execution": {"deterministic": ["FACT-001"], "declarative": [], "prompt_only": ["COMP-001"]},
+  "llm": {"enabled": false, "available": false, "model": "test", "calls": 0},
+  "to_fix": [],
+  "to_confirm": [],
+  "excluded": [],
+  "open_discoveries": [],
+  "key_facts": [],
+  "reviewer": "independent-review-agent",
+  "model_version": "0.9.1",
+  "timestamp": "2026-10-30T13:00:02+08:00"
+}
