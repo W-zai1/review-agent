@@ -101,6 +101,11 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
   **不写旧链路的正式报告**；`--llm` 已接真模型（语义审经 `SemanticExecutor` 注入）。
   `shadow` 出旧报告 + 双跑差异（`state/double_run/<review_id>.json`），**强制 `--no-llm`**——
   双跑比的是确定性结论，模型波动混进来会让「未解释差异」无从判定。
+* **任务与报告服务**（2026-10-31）：`review_agent/application/tasks.py` 的 `TaskService`
+  把「跑一次」变成落盘记录（`state/tasks/<review_id>.json`，先写 `running` 再执行），
+  `list_runs()` 按更新时间倒序；`application/reports.py` 的 `ReportService` 按 `run_id`
+  取报告（v1 优先、legacy 兜底），哈希校验是注入的（没注入时 `verify()` 返回 `None`，
+  不返回 `True`）。单测：`checks/test_task_service.py`（32 项，含真 Agent 的端到端）。
 
 **LLM 使用边界**（沿用方案原文，并给出代码落点）：
 

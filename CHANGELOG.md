@@ -42,6 +42,24 @@
 
 ---
 
+# 2026-10-31
+
+### 2026-10-31 · 新增 · 阶段 2 收尾：TaskService / ReportService
+
+- **文件**：`review_agent/application/tasks.py`（新增）、`review_agent/application/reports.py`（新增）、`review_agent/application/__init__.py`、`review.py`（`make_task_runner` / `make_task_service` / `make_report_service` / `_allocate_task_review_id` / `allocate_review_id` 增加 `state/tasks/` 扫描）、`checks/test_task_service.py`（新增 32 项）、`docs/REFACTOR_PLAN.md`、`docs/ARCHITECTURE.md`、`docs/AGENT_RUNTIME.md`
+- **改了什么**：
+  1. `TaskService`：`start_review(target, profile, purpose) -> TaskRecord`（含 `review_id` / `run_id`）、`get_task`、`list_runs`、`mark`。记录落 `state/tasks/<review_id>.json`，**执行前先写 `running`**，失败也留痕（`status=failed` + 错误串）后原样抛出。执行由注入的 `runner` 完成，本层不 import `review.py` / `tools/`。
+  2. `ReportService`：`locate` / `get_report` / `get_report_with_source` / `verify` / `list_reports`。来源顺序 `v1 → legacy`，并把 `source` 一起返回；哈希校验函数是注入的，未注入时 `verify()` 返回 `None`（**没验证 ≠ 通过**）。
+  3. `review.make_task_service()` / `make_report_service()` 负责装配；`TaskService` 的 `profile_id` 直接作为 Agent 选择器（v1 的 `ReviewProfile` 由 agent 派生）。
+  4. `allocate_review_id` 增加扫描 `state/tasks/`：任务先落盘、执行前失败时，下一个任务不会拿到同一个 R-id 覆盖记录。
+- **为什么**：阶段 2 的「入口」缺口。此前「跑一次」只存在于 CLI 的一次函数调用里，server 的 `JOBS` 是内存字典，进程重启后「那次跑完没有」无从判断；「报告在哪」由每个入口各拼一遍路径（CLI `outputs/`、v1 `outputs/v1/`、server 再一份）。
+- **修复**（写实现时暴露的真实缺陷）：`ReviewIdAllocator` 端口约定入参是 `datetime.date`，而旧 `allocate_review_id` 吃 `"YYYYMMDD"` 字符串。第一版直接透传，产出 `R-2026-10-31-001` 这类非法 ID（`format_run_id` 当场拒绝）。适配收在 `_allocate_task_review_id` 一处，不把日期格式化扩散出去。
+- **验证**：
+  - `python -m unittest discover -s checks` → **408 项 OK**（新增 32）
+  - `python -m unittest checks.test_task_service -v` → 32 项 OK，其中 2 项是**真 Agent / 真规则**的端到端（`start_review → get_report → verify=True`、两个任务拿到不同 R-id）
+  - 用例跑完 `state/tasks/` 仍为空（目录重定向到临时目录），不污染仓库
+- **未做**：接进 server 的 `JOBS`（要连并发、取消、超时一起改，属阶段 4）；幂等去重（同目标重复提交仍会得到两个 review_id）。
+
 # 2026-10-30
 
 ### 2026-10-30 · 修改 · 修正 6 处过期文档口径（ARCHITECTURE / AGENT_RUNTIME / REFACTOR_PLAN / CLI 帮助）

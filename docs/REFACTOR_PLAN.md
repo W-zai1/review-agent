@@ -16,7 +16,7 @@
 | --- | --- | --- | --- | --- |
 | 0 冻结与盘点 | 知道现状、能回归 | 盘点表、六份文档、领域骨架 | `python tools/arch_inventory.py` + `python -m unittest discover -s checks` | **完成**（2026-10-30） |
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
-| 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application Service 均已落地；剩 Task/Report 服务与在线切流） |
+| 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application / Task / Report 服务均已落地；剩在线切流） |
 | 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管，12 个 builtin + `pack:*` 已注册；`tools/` 42 个模块尚未逐个迁成 `BaseTool`，重复实现只标未删） |
 | 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | 未开始 |
 | 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | 未开始 |
@@ -92,7 +92,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 | 工作项 | 说明 | 验收 |
 | --- | --- | --- |
-| ~~Application Service~~ | **已完成（v1）**：`review_agent/application/service.py` 组装/执行/落盘/恢复；CLI 以 `--engine v1|shadow` 接入（`state/runs/` 落状态、`state/double_run/` 落双跑差异）；server 侧通过 `REVIEW_ENGINE` 环境变量透传。Task/Report 服务（建任务 / 取报告）未做 | `checks/test_application_service.py`（9 项）、`checks/test_engine_switch.py`（9 项） |
+| ~~Application Service~~ | **已完成（v1）**：`review_agent/application/service.py` 组装/执行/落盘/恢复；CLI 以 `--engine v1|shadow` 接入（`state/runs/` 落状态、`state/double_run/` 落双跑差异）；server 侧通过 `REVIEW_ENGINE` 环境变量透传。**Task/Report 服务已落地（2026-10-31）**：`application/tasks.py`（`start_review` / `get_task` / `list_runs` / `mark`，落 `state/tasks/`）+ `application/reports.py`（按 `run_id` 取报告、v1 优先 legacy 兜底、注入了才校验哈希） | `checks/test_application_service.py`（9 项）、`checks/test_engine_switch.py`（9 项）、`checks/test_task_service.py`（32 项） |
 | ~~Orchestrator~~ | **已完成**：`review_agent/runtime/orchestrator.py`；一阶段多节点（结果先合成再推进一次）、失败停住、可重试才重试、未覆盖阶段报错不跳过 | `checks/test_orchestrator.py`（21 项：happy path / 失败 / 重试 / 检查点 / 恢复 / 哈希 / 编号） |
 | 六节点 | 见 [AGENT_RUNTIME.md](AGENT_RUNTIME.md) §3，先 Decision，再 Evidence | 每节点独立测试，输入输出用固定语料 |
 | ~~Decision Engine~~ | **已完成**：`review_agent/runtime/nodes/decision.py`，S6 已改调 `build_decision` | `checks/test_decision_node.py`（16 项；含全量历史报告重放，仅 5 份已登记偏差） |
@@ -196,15 +196,17 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 ## 12. 现在就该做的三件事
 
-> 2026-10-30 更新：六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + 错误分类 +
-> 报告证据段已完成。阶段 2 只剩「入口与切流」。下面是**当前**的三件事。
+> 2026-10-31 更新：Task/Report 服务已完成（`application/tasks.py` + `application/reports.py`，
+> `checks/test_task_service.py` 32 项）。阶段 2 只剩「在线切流」。下面是**当前**的三件事。
 
-1. **切流观察**：`--engine shadow` 已能把每次审查的双跑差异写进 `state/double_run/`。
+1. **在线切流观察**：`--engine shadow` 已能把每次审查的双跑差异写进 `state/double_run/`。
    下一步是让它在真实使用里跑起来（server 侧设 `REVIEW_ENGINE=shadow`），
    连续零未解释差异后再把默认切到 v1。
-2. **Task/Report 服务**：`start_review(target, profile, purpose) -> RunId` +
-   `get_report(run_id)` + `list_runs()`。现在 CLI 只有一个目标一条流水线，
-   多任务管理仍在旧 server 的 JOBS 里。
+2. ~~Task/Report 服务~~ **已完成（2026-10-31）**：`start_review(target, profile, purpose)`
+   返回 `TaskRecord`（含 `review_id` / `run_id`），`get_task` / `list_runs` 读记录不重跑，
+   `ReportService` 按 `run_id` 取报告（v1 优先、legacy 兜底）并可选复算 `report_hash`。
+   记录落 `state/tasks/`，进程重启后仍在。**未做**：把它接进 server 的 JOBS
+   （那一步要连并发与取消一起改，属阶段 4）。
 3. **切流前的最后一道**：`--engine shadow` 仍需等模型差异分类方案（语义审有波动，
    不能当"未解释差异"处理）；`v1` 已能带模型跑（`--llm`）、产出带完整性链（含日志哈希）、
    规范化 limitations、整改单与目的比对的影子报告。要让 v1 替代 legacy，还要清零
@@ -218,7 +220,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 | # | 方案原文要求 | 实际落地 | 性质 | 登记位置 |
 | --- | --- | --- | --- | --- |
 | 1 | §7 技术栈：Pydantic / SQLAlchemy / SQLite→PostgreSQL / FastAPI / structlog | dataclass + pyyaml + `http.server` + 文件存储 | **偏离**（既有 ADR-001 取舍，非本轮引入；本轮沿用未改） | ARCHITECTURE ADR-001 |
-| 2 | §2 六层含 Application（ReviewService / TaskService / ReportService） | **部分**：`ReviewApplication`（组装/执行/落盘/恢复）+ CLI `--engine v1|shadow` 已接；server 走 `REVIEW_ENGINE` 环境变量；Task/Report 服务未做 | **部分完成**（2026-10-30） | §4 行 |
+| 2 | §2 六层含 Application（ReviewService / TaskService / ReportService） | **基本完成**：`ReviewApplication`（组装/执行/落盘/恢复）+ CLI `--engine v1|shadow` 已接；server 走 `REVIEW_ENGINE` 环境变量；`TaskService`（建任务/查/列/改状态）与 `ReportService`（按 run_id 取报告、复算哈希）已落地。**未接 server 的 JOBS**（要连并发与取消一起改） | **基本完成**（2026-10-31） | §4 行 |
 | 3 | §6 所有工具注册到 Registry，经统一执行器分发 | **分发管线已完成**：`review.build_rule_registry()` 把 12 个 builtin + Agent 自带 `pack:*` 处理器注册成工具（`_HandlerTool`，权限 WRITE），分发走 `registry.execute()`：存在性 → 权限 → 执行 → 结果。`run_rule_plan` 已改为 async，可 await 注册表的 async 执行器。旧 `resolve_handler` 无调用点，按迁移规矩保留到阶段 5。**但 `tools/` 42 个模块仍被 `_HandlerTool` 统一包装，没有逐个实现 `BaseTool`** | **部分完成**（管线完成，工具迁移未开始，2026-10-30） | TOOL_SPECIFICATION §4 |
 | 4 | §6 外部文档视为不可信输入，不得影响系统行为 | **部分**：`llm_review.build_messages` 改为随机串围栏（`<<<TARGET:<nonce>>>>` … `<<<END:<nonce>>>>`），文档里的 `TARGET>>>` 无法闭合数据区块；原文逐字保留、撞车直接拒绝。其余三项（工具权限不受文档影响、文档里的命令/URL 不执行、联网白名单）仍未做 | **部分完成**（2026-10-30） | TOOL_SPECIFICATION §6 |
 | 5 | §10 五个产品界面（工作台/执行中心/证据中心/裁定中心/审计中心） | 沿用旧控制台；新能力只在报告 JSON 里 | **未做**（未排期） | — |

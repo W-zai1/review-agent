@@ -51,7 +51,7 @@ import research
 import version
 # Architecture v1：裁定规则只有一份实现（领域策略）。旧流程调用它，不再自己复制一套。
 from review_agent.domain import ids as domain_ids
-from review_agent.domain import ReviewProfile, Stage
+from review_agent.domain import ReviewProfile, RunStatus, Stage
 from review_agent.domain.enums import Verification
 from review_agent.domain.errors import ConfigError, DomainError, InputError, NotFoundError
 from review_agent.domain.policy import DEFAULT_POLICY
@@ -75,8 +75,12 @@ from review_agent.capabilities import (
 )
 from review_agent.text import sentence_no as text_sentence_no
 from review_agent.application import (
+    FileTaskStore,
     PipelinePorts,
+    ReportService,
     ReviewApplication,
+    TaskOutcome,
+    TaskService,
     build_shadow_report,
     render_shadow_md,
 )
@@ -2324,6 +2328,12 @@ def allocate_review_id(date):
             review_id = stem.split("-RUN", 1)[0]
             if review_id:
                 used.add(review_id)
+    # 任务记录也占号：TaskService 建任务时先落 `state/tasks/`，再执行。
+    # 不把这里算进来，一次「建了任务但执行前失败」就会让下一个任务拿到同一个 R-id，
+    # 把前一条记录覆盖掉（任务层要能证明「这个号确实存在过」）。
+    tasks_dir = STATE / "tasks"
+    if tasks_dir.is_dir():
+        used.update(path.stem for path in tasks_dir.glob("R-*.json"))
     ledger = LEDGER / "chain.log"
     if ledger.exists():
         try:
@@ -4364,6 +4374,98 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
     (out_dir / f"{report['review_id']}.md").write_text(
         render_shadow_md(report), encoding="utf-8")
     return json_path
+
+
+# ---------------------------------------------------------------------------
+# Task / Report 服务（阶段 2 收尾）
+# ---------------------------------------------------------------------------
+def _allocate_task_review_id(day):
+    """给 TaskService 用的号分配：拿到号就立刻释放锁文件。
+
+    与 `run_typed_pipeline` 内的做法一致——锁只保护「分配」这一瞬间，
+    不跨越整个执行过程（跨越会让一次崩溃把当天的号锁死一小时）。
+
+    注意：`ReviewIdAllocator` 端口约定入参是 `datetime.date`（见 domain/ports.py），
+    而旧 `allocate_review_id` 吃的是 `"YYYYMMDD"` 字符串。适配放在这里，
+    不把「日期怎么格式化」扩散到任务层——否则两处各写一遍，迟早对不上
+    （实测第一版就是漏了这步，产出了 `R-2026-10-31-001` 这种非法 ID）。
+    """
+    key = day.strftime("%Y%m%d") if hasattr(day, "strftime") else str(day)
+    review_id, lock = allocate_review_id(key)
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+    _ID_LOCKS.discard(lock)
+    return review_id
+
+
+def _path_for_record(path: Path) -> str:
+    """记录里存相对仓库根的正斜杠路径：换盘符、换目录都还能对上。"""
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+def make_task_runner(*, rules=None, type_override=None, agent_id=None):
+    """把六节点流水线包成 TaskService 的 runner（不打印、不 sys.exit）。
+
+    与 `_run_v1` 的分工：`_run_v1` 是「人跑一次」的入口（打印摘要、错误码），
+    这里只返回结果。失败以 `TaskOutcome(status=FAILED)` 返回，由任务层记账。
+    """
+
+    def runner(target, *, review_id, profile_id=None, purpose=None,
+               engine="v1", use_llm=False):
+        # profile 目前就是「用哪个 Agent / 规则包」：v1 的 ReviewProfile 由 agent 派生，
+        # 所以 profile_id 直接当 agent 选择器用；传空则走既有的扩展名自动路由。
+        std_rules = rules if rules is not None else load_rules()
+        purpose_info = (purpose_mod.parse(str(purpose))
+                        if purpose and str(purpose).strip() else None)
+        integrity_inputs: dict = {}
+        state, outcome, session = run_typed_pipeline(
+            target, std_rules, review_id=review_id,
+            agent_id=profile_id or agent_id, type_override=type_override,
+            store=STATE / "runs", use_llm=use_llm,
+            purpose_info=purpose_info, integrity_out=integrity_inputs)
+        if not outcome.ok:
+            return TaskOutcome(
+                status=RunStatus.FAILED, stage=state.stage,
+                error="；".join(outcome.errors) or f"流水线未完成：{outcome.status}")
+        report_path = _write_shadow_report(
+            state, outcome, integrity_inputs=integrity_inputs,
+            session=session, purpose_info=purpose_info)
+        return TaskOutcome(
+            status=RunStatus.COMPLETED, stage=state.stage,
+            verdict=state.decision.verdict.value if state.decision else None,
+            findings=len(state.findings), evidence=len(state.evidence),
+            report_path=_path_for_record(report_path),
+        )
+
+    return runner
+
+
+def make_task_service(*, rules=None, type_override=None, agent_id=None) -> TaskService:
+    """装配任务服务：执行走六节点流水线，记录落 `state/tasks/`。
+
+    `STATE` 在调用时才读：测试会把模块级目录重定向到临时目录，
+    如果在导入时算好路径，重定向就失效（`test_engine_switch` 用的是同一套做法）。
+    """
+    return TaskService(
+        runner=make_task_runner(rules=rules, type_override=type_override,
+                                agent_id=agent_id),
+        store=FileTaskStore(STATE / "tasks"),
+        allocate=_allocate_task_review_id,
+        root=ROOT,
+    )
+
+
+def make_report_service() -> ReportService:
+    """装配报告服务：v1 影子报告优先，其次旧链路正式报告。"""
+    return ReportService(
+        {"v1": OUTPUTS / "v1", "legacy": OUTPUTS},
+        compute_hash=integrity.compute_report_hash,
+    )
 
 
 def main():

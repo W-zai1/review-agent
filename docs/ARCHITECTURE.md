@@ -44,7 +44,7 @@
 | 层 | 职责 | 允许依赖 | 当前代码 | 状态 |
 | --- | --- | --- | --- | --- |
 | 用户交互层 | Web / API / CLI | Application | `web/index.html`、`server.py`、`review.py` 的 CLI（含 `--engine`） | 旧实现 |
-| Application | 编排一次审查任务（建任务、选 Profile、启动 Run、取报告） | Runtime、Domain | `review_agent/application/`：`ReviewApplication`（组装/执行/落盘/恢复）+ 影子报告 | **已建（v1）**；Task/Report 服务未做 |
+| Application | 编排一次审查任务（建任务、选 Profile、启动 Run、取报告） | Runtime、Domain | `review_agent/application/`：`ReviewApplication`（组装/执行/落盘/恢复）、`TaskService`、`ReportService`、影子报告 | **已建（v1）**；未接 server 的 JOBS |
 | Agent Runtime | 阶段推进、节点调度、状态、checkpoint、异常 | Capabilities、Domain | `review_agent/runtime/`：协议 + 六节点 + `orchestrator.py` + `serialization.py` | **已建** |
 | 审查能力层 | 规则、LLM、检索、证据、工具 | Domain | `review_agent/capabilities/`（工具协议 + `ToolRegistry`）；`tools/`（实现） | 协议与分发已建，`tools/` 未逐个迁移 |
 | 领域层 | 六个核心对象、状态机、裁定策略、端口 | **无**（仅标准库） | `review_agent/domain/` | **已建** |
