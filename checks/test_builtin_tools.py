@@ -52,15 +52,20 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.registry = review.build_capability_registry()
 
     def test_batch1_tools_are_registered(self):
-        self.assertEqual(self.registry.names(), ("logic.check", "math.check"))
+        self.assertEqual(self.registry.names(),
+                         ("integrity.hash", "logic.check", "math.check",
+                          "rules.classify"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
-        self.assertEqual(described["math.check"]["permission"], "analyze")
-        self.assertEqual(described["logic.check"]["permission"], "analyze")
+        for name in ("math.check", "logic.check", "rules.classify"):
+            self.assertEqual(described[name]["permission"], "analyze"
+                             if name != "rules.classify" else "read")
         for item in described.values():
             self.assertTrue(item["description"], "每个工具都必须有可读的说明")
-            self.assertIn("text", item["arguments"])
+            self.assertTrue(item["arguments"], "每个工具都必须声明入参")
+        self.assertIn("text", described["math.check"]["arguments"])
+        self.assertIn("rules", described["rules.classify"]["arguments"])
 
     def test_read_only_context_cannot_analyze(self):
         with self.assertRaises(ToolPermissionError):
@@ -165,6 +170,96 @@ class ContractTests(unittest.TestCase):
         """工具能脱离规则流水线独立调用——这正是「工具从 Agent 中独立」的验收点。"""
         registry = review.build_capability_registry()
         result, _ = run_tool(registry, "math.check", {"text": SUM_TEXT})
+        self.assertTrue(result.ok)
+
+
+class RuleClassifyToolTests(unittest.TestCase):
+    """规则执行方式分类：决定「这条结论能不能复现」。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def _rules(self):
+        return [dict(r) for r in review.load_rules()]
+
+    def test_real_rules_are_all_counted(self):
+        rules = self._rules()
+        result, _ = run_tool(self.registry, "rules.classify", {"rules": rules})
+        self.assertTrue(result.ok)
+        counts = result.data["counts"]
+        self.assertEqual(sum(counts.values()), len(rules),
+                         "每条规则必须落进且只落进一个执行方式")
+
+    def test_builtin_rule_is_deterministic(self):
+        rules = [{"rule_id": "LOGIC-001", "dimension": "logic", "desc": "加总"}]
+        result, _ = run_tool(self.registry, "rules.classify", {"rules": rules})
+        self.assertEqual(result.data["counts"]["deterministic"], 1)
+
+    def test_pattern_only_rule_is_declarative(self):
+        rules = [{"rule_id": "CUSTOM-900", "dimension": "custom",
+                  "pattern": r"必须.{0,6}审批"}]
+        result, _ = run_tool(self.registry, "rules.classify", {"rules": rules})
+        self.assertEqual(result.data["counts"]["declarative"], 1)
+
+    def test_unregistered_rule_is_prompt_only_and_listed(self):
+        rules = [{"rule_id": "NOPE-001", "dimension": "custom"}]
+        result, _ = run_tool(self.registry, "rules.classify", {"rules": rules})
+        self.assertEqual(result.data["counts"]["prompt_only"], 1)
+        self.assertEqual(result.data["prompt_only"], ("NOPE-001",),
+                         "没有执行器的规则要显式列出来，不能只给个计数")
+
+    def test_read_permission_is_enough(self):
+        """分类只查表，不读材料——READ 就该能用。"""
+        result, _ = run_tool(self.registry, "rules.classify",
+                             {"rules": [{"rule_id": "LOGIC-001"}]},
+                             context(permissions=[Permission.READ]))
+        self.assertTrue(result.ok)
+
+    def test_empty_rules_is_a_failure(self):
+        result, _ = run_tool(self.registry, "rules.classify", {"rules": []})
+        self.assertFalse(result.ok)
+        self.assertIn("为空", result.errors[0])
+
+    def test_rule_without_id_is_rejected(self):
+        result, _ = run_tool(self.registry, "rules.classify",
+                             {"rules": [{"dimension": "logic"}]})
+        self.assertFalse(result.ok)
+        self.assertIn("rule_id", result.errors[0])
+
+
+class IntegrityHashToolTests(unittest.TestCase):
+    """内容指纹：用来判断「两处引用是不是同一段原文」。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def test_known_digest(self):
+        import hashlib
+        result, _ = run_tool(self.registry, "integrity.hash", {"text": "abc"})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["sha256"],
+                         hashlib.sha256(b"abc").hexdigest())
+        self.assertEqual(result.data["size"], 3)
+
+    def test_empty_text_has_a_digest(self):
+        import hashlib
+        result, _ = run_tool(self.registry, "integrity.hash", {"text": ""})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["sha256"],
+                         hashlib.sha256(b"").hexdigest())
+        self.assertEqual(result.data["size"], 0)
+
+    def test_utf8_bytes_are_hashed(self):
+        import hashlib
+        result, _ = run_tool(self.registry, "integrity.hash", {"text": "中文"})
+        self.assertEqual(result.data["sha256"],
+                         hashlib.sha256("中文".encode("utf-8")).hexdigest())
+        self.assertEqual(result.data["size"], 6)
+
+    def test_read_permission_is_enough(self):
+        result, _ = run_tool(self.registry, "integrity.hash",
+                             {"text": "abc"},
+                             context(permissions=[Permission.READ]))
         self.assertTrue(result.ok)
 
 

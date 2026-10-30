@@ -20,7 +20,7 @@ docx 要解压、检索要读索引）留到批次 2，理由与迁移批次表�
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -95,10 +95,88 @@ class LogicCheckTool(_TextCheckTool):
         )
 
 
-def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll) -> tuple[BaseTool, ...]:
+@dataclass(frozen=True, slots=True)
+class RuleClassifyArgs:
+    """规则执行方式分类的入参：把规则定义（YAML 读出来的 dict）传进来。"""
+
+    rules: tuple[dict[str, Any], ...]
+
+
+class RuleClassifyTool(BaseTool):
+    """回答「这条规则是代码算的、还是声明式跑的、还是只在提示词里出现」。
+
+    这个问题的答案决定了结论的可信度：`prompt_only` 的规则跨次可能漂移，
+    报告里必须能让人看出差别（见 tools/rule_exec.py 的模块说明）。
+    """
+
+    name = "rules.classify"
+    description = ("按规则的执行方式分类：deterministic（有专用执行器）/ "
+                   "declarative（自带 pattern，由通用引擎跑）/ prompt_only（只在提示词里）。"
+                   "纯查表，不读文件、不跑审查。")
+    permission = Permission.READ
+    arguments_type = RuleClassifyArgs
+
+    def __init__(self, *, summarize: Callable[[Sequence[Mapping[str, Any]]], dict],
+                 counts: Callable[[Sequence[Mapping[str, Any]]], dict]) -> None:
+        self._summarize = summarize
+        self._counts = counts
+
+    async def execute(self, arguments: RuleClassifyArgs,
+                      context: ToolContext) -> ToolResult:
+        rules = tuple(arguments.rules or ())
+        if not rules:
+            return ToolResult.failure("rules 为空：没有可分类的规则")
+        bad = [i for i, rule in enumerate(rules)
+               if not isinstance(rule, Mapping) or not rule.get("rule_id")]
+        if bad:
+            return ToolResult.failure(
+                f"第 {bad[:5]} 条规则缺少 rule_id：无法按执行方式归类")
+        summary = self._summarize(list(rules))
+        return ToolResult.success(data={
+            "summary": summary,
+            "counts": self._counts(list(rules)),
+            # 未登记执行器的规则最需要被看见：它们是最不可复现的那批
+            "prompt_only": tuple(summary.get("prompt_only") or ()),
+        })
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrityHashArgs:
+    text: str
+
+
+class IntegrityHashTool(BaseTool):
+    """对一段内容算 SHA-256：引用去重、证据指纹、跨报告比对「同一段原文」。"""
+
+    name = "integrity.hash"
+    description = ("计算一段文本的 SHA-256（UTF-8 字节）。用于证据指纹、"
+                   "引用去重、跨报告比对同一段原文。不读文件、不写盘。")
+    permission = Permission.READ
+    arguments_type = IntegrityHashArgs
+
+    def __init__(self, *, sha256_bytes: Callable[[bytes], str]) -> None:
+        self._sha256_bytes = sha256_bytes
+
+    async def execute(self, arguments: IntegrityHashArgs,
+                      context: ToolContext) -> ToolResult:
+        payload = (arguments.text or "").encode("utf-8")
+        return ToolResult.success(data={
+            "sha256": self._sha256_bytes(payload),
+            "size": len(payload),
+        })
+
+
+def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
+                 rule_summarize, rule_counts,
+                 sha256_bytes) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
     为什么集中成一个函数：注册表怎么装配是入口的事，工具清单是能力层的事。
-    将来补上 `text.regex` / `rules.pattern` 等，只在这个元组里加一项。
+    补新工具时只在这个元组里加一项，注释里写清卡点的不往里塞。
     """
-    return (MathCheckTool(math_run_all), LogicCheckTool(logic_run_all))
+    return (
+        MathCheckTool(math_run_all),
+        LogicCheckTool(logic_run_all),
+        RuleClassifyTool(summarize=rule_summarize, counts=rule_counts),
+        IntegrityHashTool(sha256_bytes=sha256_bytes),
+    )

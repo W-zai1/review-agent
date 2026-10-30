@@ -1841,8 +1841,12 @@ def build_capability_registry(*, on_invoke=None):
     `logic_checks.run_all`。`capabilities` 层不许 import `tools/`，所以注入点在这里。
     """
     registry = ToolRegistry(on_invoke=on_invoke)
-    for tool in batch1_tools(math_run_all=arith_check.run_all,
-                             logic_run_all=logic_checks.run_all):
+    for tool in batch1_tools(
+            math_run_all=arith_check.run_all,
+            logic_run_all=logic_checks.run_all,
+            rule_summarize=rule_exec.summarize,
+            rule_counts=rule_exec.counts,
+            sha256_bytes=integrity.sha256_bytes):
         registry.register(tool)
     return registry
 

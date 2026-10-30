@@ -44,6 +44,18 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`rules.classify` / `integrity.hash` 两个独立工具（批次 1 达 4/10）
+
+- **文件**：`review_agent/capabilities/builtin_tools.py`、`review.py`（`build_capability_registry` 注入 `rule_exec` / `integrity`）、`checks/test_builtin_tools.py`（+11 项 → 28 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `rules.classify`（权限 **READ**）：入参 `{rules:[规则定义]}`，出参 `{summary, counts, prompt_only}`。回答「这条规则是代码算的 / 声明式跑的 / 只出现在提示词里」——`prompt_only` 的结论跨次可能漂移，报告里必须能分辨。
+  2. `integrity.hash`（权限 **READ**）：入参 `{text}`，出参 `{sha256, size}`（UTF-8 字节）。用于证据指纹、引用去重、跨报告判断「是不是同一段原文」。
+  3. 规则里缺 `rule_id` 的条目在工具边界就被拒绝（`summarize` 会 `KeyError`，不能让它变成运行时崩溃）；`rules` 为空返回 `ok=False`（没有可分类的规则 ≠ 全部合格）。
+  4. 两个工具权限都按**最小**给 `READ`：只查表 / 只算哈希，不读材料，不该要求 `ANALYZE`。权限收紧比放宽难。
+- **为什么**：批次 1 的验收是「注册表里有它 + `review.py` 通过注册表调用 + `checks/` 有测试」。这两个模块本来就纯（`rule_exec` 三个函数零 IO，`integrity.sha256_bytes` 零 IO），属于「卡点最少、收益最直接」的两个——先把纯的迁完，再动需要改旧代码的那批。
+- **验证**：`python -m unittest checks.test_builtin_tools` → 28 项 OK；规则分类用 `review.load_rules()` 的**真实规则集**跑，断言「每条规则落进且只落进一个执行方式」；哈希用例对照 `hashlib` 独立复算（含空串与中文）。
+- **未做**：批次 1 还剩 6 个，卡点已逐条写进 TOOL_SPECIFICATION §7（`text.regex` 缺位置映射、`rules.pattern` 要先抽纯核心、`law.cite` 要先做索引注入…），不是「忘了」。
+
 ### 2026-10-31 · 新增 · 阶段 4 起步：单节点超时（`Orchestrator(timeout=...)`）
 
 - **文件**：`review_agent/runtime/orchestrator.py`、`review_agent/application/service.py`、`checks/test_orchestrator.py`（+6 项）、`docs/AGENT_RUNTIME.md` §7、`docs/REFACTOR_PLAN.md` §1/§6

@@ -17,7 +17,7 @@
 | 0 冻结与盘点 | 知道现状、能回归 | 盘点表、六份文档、领域骨架 | `python tools/arch_inventory.py` + `python -m unittest discover -s checks` | **完成**（2026-10-30） |
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
 | 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application / Task / Report 服务均已落地；剩在线切流） |
-| 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管，12 个 builtin + `pack:*` 已注册；批次 1 已迁 `math.check` / `logic.check` 两个独立工具；其余 8 个与 `tools/` 42 模块的逐条理由见 TOOL_SPECIFICATION §7） |
+| 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管；批次 1 已迁 4 个独立工具：`math.check` / `logic.check` / `rules.classify` / `integrity.hash`；其余 6 个与 `tools/` 42 模块的逐条理由见 TOOL_SPECIFICATION §7） |
 | 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **进行中**（Retry ✅；Checkpoint ✅；**单节点超时 ✅ 2026-10-31**；幂等 / 统一 AuditEvent 流 / 故障注入未做） |
 | 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | 未开始 |
 
