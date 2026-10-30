@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 4：统一审计事件流（`events.jsonl` + 旧格式投影）
+
+- **文件**：`review_agent/application/audit.py`（新增）、`checks/test_audit_stream.py`（新增 14 项）、`review.py`（`_write_v1_logs` 改走事件流）、`review_agent/application/__init__.py`（导出 `build_audit_stream` / `load_audit_stream` / `audit_to_legacy` / `write_audit_stream`）
+- **改了什么**：
+  1. 新增 `AuditEvent` 有序事件流：节点事件 / 工具调用 / 决策 / 检查点四个来源汇成一条 `events.jsonl`，`seq` 从 1 连续编号。
+  2. `_write_v1_logs` 改为先 `build_audit_stream` 写 `events.jsonl`，再由 `audit_to_legacy` 投影生成旧的 `task.json` / `tools.jsonl` / `decisions.jsonl`——格式逐字不变，UI 与历史脚本照旧读，消费者不用改。
+  3. 事实来源只剩一份，跨文件顺序问题（如「第 7 步之前调了哪个工具」）从此有唯一答案。
+- **为什么**：旧实现把「发生了什么」记在三处字段各异的文件里，审计中心只能按文件分别展示，回答不了跨来源的先后关系；`checkpoints` 还只留在内存，进程重启即丢。切流不能顺带改旧文件格式——那是发布动作，所以用投影保格式。
+- **验证**：`python -m unittest discover -s checks` → **471 项 OK**（+14）；新用例钉住汇流顺序连续、投影与旧形状逐字一致、jsonl 往返与坏行跳过、`_write_v1_logs` 同时产出事件流与旧三件（含目录哈希）。
+- **已知边界**：跨来源没有统一时钟，`seq` 是「来源优先级 + 来源内原始顺序」，不是墙钟顺序；要真实先后看 `ts`（没有时间的记 `None`，不用「现在」冒充）。
+
 ### 2026-10-31 · 新增 · 阶段 4：报告写入幂等（`run_id` + finalize）
 
 - **文件**：`review.py`（`_report_already_written` + `_write_shadow_report` 提前返回）、`checks/test_idempotency.py`（新增 4 项）、`docs/REFACTOR_PLAN.md` §1/§6

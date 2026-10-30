@@ -82,8 +82,11 @@ from review_agent.application import (
     ReviewApplication,
     TaskOutcome,
     TaskService,
+    audit_to_legacy,
+    build_audit_stream,
     build_shadow_report,
     render_shadow_md,
+    write_audit_stream,
 )
 from review_agent.runtime import (
     FileRunStore,
@@ -4280,16 +4283,30 @@ def _integrity_inputs(target_path, rules, active, agent):
 
 
 def _write_v1_logs(session, outcome, review_id):
-    """把决策 / 工具 / 节点事件写成 `logs/v1/<review_id>/`，返回目录哈希。
+    """把审计事件流写成 `logs/v1/<review_id>/`，返回目录哈希。
 
     旧报告会对 `logs/<review_id>/` 取哈希进 `integrity.logs_hash`。v1 之前没有这一层，
     报告只能证明「结论没被改过」，不能证明「过程也没被改过」。这里补上，
     而且放在**新命名空间** `logs/v1/`，不占正式日志目录。
+
+    四套记录（节点事件 / 工具 / 决策 / 检查点）先汇成**一条** `AuditEvent` 流写进
+    `events.jsonl`；旧的 `task.json` / `tools.jsonl` / `decisions.jsonl` 由这条流
+    **投影**生成，格式逐字不变（UI 与历史脚本还在读它们）。
+    事实来源只有一份，但消费者不用改——这是切流前能做到的最小改动。
     """
     log_dir = LOGS / "v1" / review_id
     log_dir.mkdir(parents=True, exist_ok=True)
-    for name, items in (("decisions.jsonl", session.decisions),
-                        ("tools.jsonl", session.tool_logs)):
+    stream = build_audit_stream(
+        run_id=outcome.state.run_id,
+        node_events=outcome.events,
+        tool_logs=session.tool_logs,
+        decisions=session.decisions,
+        checkpoints=outcome.checkpoints,
+    )
+    write_audit_stream(log_dir / "events.jsonl", stream)
+    legacy = audit_to_legacy(stream)
+    for name, items in (("decisions.jsonl", legacy["decisions"]),
+                        ("tools.jsonl", legacy["tools"])):
         log_dir.joinpath(name).write_text(
             "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items),
             encoding="utf-8")
@@ -4298,7 +4315,7 @@ def _write_v1_logs(session, outcome, review_id):
         "engine": "architecture-v1",
         "final_status": outcome.status,
         "errors": list(outcome.errors),
-        "steps": [event.as_dict() for event in outcome.events],
+        "steps": legacy["steps"],
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return integrity.sha256_dir(str(log_dir))
 
