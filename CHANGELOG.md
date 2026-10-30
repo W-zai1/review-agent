@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 4：三类故障注入（模型不可用 / 写盘失败 / 进程中断）
+
+- **文件**：`checks/test_failure_injection.py`（新增 3 项）、`docs/REFACTOR_PLAN.md` §1/§6
+- **改了什么**：按阶段 4 的验收原话「三类故障都要给出明确错误或恢复，不允许静默半成品」各打一发：
+  1. **模型不可用**：注入一个必抛的语义审执行器 → 运行必须失败、`state.decision is None`、`DECISION`/`FINALIZE` 不在 `completed_stages`，错误串里能读到「模型不可用」。
+  2. **写盘失败**：把 `outputs/` 占成同名文件制造 `NotADirectoryError` → `_write_shadow_report` 抛错，且事后 `R-*.json` **一个都没有**（半成品比没有更危险：它看起来像结论）。
+  3. **进程中断**：任务记录落成 `running` 时抛 `KeyboardInterrupt` → 新构造的服务实例仍能 `list_runs()` 看到它、状态是 `failed` 且带原因，并可用 `mark(ABORTED)` 收敛。
+- **为什么**：阶段 4 的六项里，「失败注入」是唯一能证明前五项真的生效的手段——不注入故障，「不会留半成品」只是文档里的承诺。
+- **验证**：`python -m unittest discover -s checks` → **453 项 OK**（+3）；故障从**注入点**进（执行器 / 目录 / 重新构造服务），没有 mock 掉被测对象本身。
+- **未做**：真正的「杀进程」演练（`subprocess` + `taskkill`）没做，当前用「记录已落 running 后抛中断」等价模拟；要在 CI 上稳定跑还需要先解决进程清理的跨平台差异。
+
 ### 2026-10-31 · 新增 · 阶段 3：`rules.pattern` 工具 + `pattern_rules.scan_hits` 纯核心（批次 1 达 5/10）
 
 - **文件**：`tools/pattern_rules.py`（新增 `scan_hits`，`scan` 改为委托）、`review_agent/capabilities/builtin_tools.py`（`PatternScanTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `pattern_rules.scan_hits`）、`checks/test_builtin_tools.py`（+8 项 → 36 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
