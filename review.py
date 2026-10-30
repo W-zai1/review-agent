@@ -4342,6 +4342,24 @@ def _attach_action_plan(report):
     return report
 
 
+def _report_already_written(json_path, run_id):
+    """幂等键 `(run_id, stage=finalize)`：同一次运行只写一份报告、只进一次链。
+
+    为什么按 `run_id` 而不是按内容：同一次执行的结论是确定的（节点必须确定性），
+    所以「这个 run_id 已经写过报告」就足以判定重复。按内容比对反而危险——
+    内容里含 audit / logs_hash 这类每次都会变的东西，永远比不相等。
+
+    读不出来的坏文件不算「已经写过」：宁可重写一份，也不拿坏文件当既成事实。
+    """
+    if not run_id or not json_path.exists():
+        return False
+    try:
+        existing = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return existing.get("run_id") == run_id
+
+
 def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
                          purpose_info=None):
     """把影子报告写到 `outputs/v1/`，并给它补上可校验的完整性链。
@@ -4350,7 +4368,17 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
     为什么单独一条链（`ledger/v1-chain.log`）：v1 报告在 `outputs/v1/`，
     混进官方 `ledger/chain.log` 会让 `integrity verify` 找不到对应报告文件。
     切流时两条链合并（或 v1 链转正），那是发布动作，不能顺手做。
+
+    幂等：同一次运行（相同 `run_id`）第二次调用直接返回已有路径——
+    不重写报告、不重写日志、不往链上追加第二条记录。否则「恢复后重跑一次」
+    会在审计链里留下两条同一份结论的记录，链就没法用来证明「跑了几次」。
     """
+    out_dir = OUTPUTS / "v1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{state.review_id}.json"
+    if _report_already_written(json_path, state.run_id):
+        return json_path
+
     logs_hash = (_write_v1_logs(session, outcome, state.review_id)
                  if session is not None else None)
     report = build_shadow_report(
@@ -4391,9 +4419,6 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
     finally:
         _release_ledger_lock(lock)
 
-    out_dir = OUTPUTS / "v1"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"{report['review_id']}.json"
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
                          encoding="utf-8")
     (out_dir / f"{report['review_id']}.md").write_text(

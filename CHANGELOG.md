@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 4：报告写入幂等（`run_id` + finalize）
+
+- **文件**：`review.py`（`_report_already_written` + `_write_shadow_report` 提前返回）、`checks/test_idempotency.py`（新增 4 项）、`docs/REFACTOR_PLAN.md` §1/§6
+- **改了什么**：
+  1. `_write_shadow_report` 在写报告/写日志/追加链之前先查 `outputs/v1/<review_id>.json` 是否已是**同一个 `run_id`**；是就直接返回该路径，不重写报告、不重写 `logs/v1/<id>/`、不往 `ledger/v1-chain.log` 追加第二条记录。
+  2. 幂等键选 `(run_id, finalize)` 而不是内容哈希：报告里含 `audit.latency_ms` 与 `integrity.logs_hash` 这类每次都会变的东西，按内容比对永远不相等，等于没做幂等。
+  3. 读不出来的坏文件不算「已写过」——宁可重写一份，也不拿坏文件当既成事实。
+- **为什么**：中断恢复会重跑最后一个阶段。没有幂等的话，`outputs/v1/` 会被重写（读者手里的那份和一小时后下载的不是同一份），审计链也会多出一条同结论记录，链就不再能回答「到底跑了几次」。
+- **验证**：`python -m unittest discover -s checks` → **457 项 OK**（+4）；用例覆盖「同 run 两次只写一份且链上 1 条」「换一次 run 就该有新记录且链可校验」「坏文件会被重写」「缺 `run_id` 的旧文件不算已写过」。
+- **未做**：任务层（`TaskService.start_review`）仍然一次调用一个 review_id，同目标重复提交会得到两个 R-id——那属于「请求级幂等」，与报告写入幂等不是同一层，没有混在一起做。
+
 ### 2026-10-31 · 新增 · 阶段 4：三类故障注入（模型不可用 / 写盘失败 / 进程中断）
 
 - **文件**：`checks/test_failure_injection.py`（新增 3 项）、`docs/REFACTOR_PLAN.md` §1/§6

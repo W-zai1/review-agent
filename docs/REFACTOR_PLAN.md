@@ -18,7 +18,7 @@
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
 | 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application / Task / Report 服务均已落地；剩在线切流） |
 | 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管；批次 1 已迁 5 个独立工具：`math.check` / `logic.check` / `rules.classify` / `integrity.hash` / `rules.pattern`；其余 5 个与 `tools/` 42 模块的逐条理由见 TOOL_SPECIFICATION §7） |
-| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **进行中**（Retry ✅；Checkpoint ✅；单节点超时 ✅；**三类故障注入 ✅ 2026-10-31**：模型不可用 / 写盘失败 / 进程中断；幂等键与统一 AuditEvent 流未做） |
+| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **进行中**（Retry ✅；Checkpoint ✅；单节点超时 ✅；幂等键 ✅；三类故障注入 ✅ 2026-10-31；**只剩统一 AuditEvent 流**） |
 | 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | 未开始 |
 
 ## 2. 阶段 0：冻结与盘点（已完成）
@@ -132,7 +132,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 | Checkpoint | ✅ `FileRunStore` + `MemoryCheckpointStore` + `state_hash`（阶段 2 已落地） | 阶段边界落盘 + `state_hash` 校验 |
 | Retry | ✅ 由 `Orchestrator(max_attempts)` 统一；只有 `retryable=True` 才重试 | 由 Orchestrator 统一策略（见 AGENT_RUNTIME §7） |
 | Timeout | ✅ **2026-10-31 已加单节点超时**（`Orchestrator(timeout=...)`，超时=可重试失败）；整体兜底仍是 server 的 `--review-timeout` | 节点级超时 + 整体兜底 |
-| 幂等 | 部分：`allocate_review_id` 用锁文件，并已扫描 `state/tasks/`；**没有 `(run_id, stage)` 幂等键** | `(run_id, stage)` 幂等键；重复执行不产生第二份报告 |
+| 幂等 | ✅ **2026-10-31**：`_write_shadow_report` 按 `(run_id, finalize)` 幂等——同一次运行第二次写报告直接返回已有文件，不重写报告/日志、不追加链记录；坏文件不算「已写过」 | `(run_id, stage)` 幂等键；重复执行不产生第二份报告 |
 | 审计 | 未做：仍是 `task.json` + `tools.jsonl` + `decisions.jsonl` 三套 | 统一 `AuditEvent` 流，旧文件由事件流生成 |
 | 失败注入 | ✅ **2026-10-31**：`checks/test_failure_injection.py`（3 项）覆盖三类——模型不可用 / 写盘失败 / 进程中断 | 故障注入测试：模型超时、写盘失败、进程被杀 |
 
