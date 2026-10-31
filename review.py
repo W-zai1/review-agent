@@ -1860,7 +1860,10 @@ def build_capability_registry(*, on_invoke=None):
             matrix_build=match_matrix.build,
             matrix_load_config=match_matrix.load_config,
             law_check=law_cite.check,
-            law_load_articles=law_cite.load_articles):
+            law_load_articles=law_cite.load_articles,
+            docx_format_run_all=docx_format_checks.run_all,
+            docx_extract=lambda path: docx_extract.extract(path),
+            lint_run=lint.run_lint):
         registry.register(tool)
     return registry
 

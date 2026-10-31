@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3 收口：`docx.format` / `text.lint`，批次 1 达 10/10
+
+- **文件**：`review_agent/capabilities/builtin_tools.py`（`DocxFormatTool` / `TextLintTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `docx_format_checks.run_all` / `docx_extract.extract` / `lint.run_lint`）、`checks/test_builtin_tools.py`（+12 项 → 66 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `docx.format`（ANALYZE）：入参 `{rule_ids, path?, spec?, info?}`。**给了 `info`（解析产物）就直接判**，纯函数式、不碰磁盘；只给 `path` 才让注入的 `extract` 去解析。`rule_ids` 必须显式给——判哪几项取决于本次启用的规则，工具不替调用方猜。
+  2. `text.lint`（ANALYZE）：入参 `{path}`，`run_lint` 整个注入。工具不关心跑的是 ruff 还是 eslint，只把 `ok / issues / skipped / failed` 四种状态如实带出来：`skipped` 提成 warning，`failed` 按失败返回。
+  3. 两者原先被划在「批次 2（有 IO）」，实际做法与前面八个一致——IO/外部命令收进注入的可调用对象。所以它们迁进了批次 1，**批次 1 到此 10/10 收口**。
+- **为什么**：批次 1 的验收是「注册表里有它 + 通过注册表调用 + 有单工具测试」。剩下这两个的卡点不是「能不能判」，而是「解析/外部命令从哪来」——注入之后就不再是卡点。
+- **验证**：`python -m unittest discover -s checks` → **520 项 OK**（+12）。用例覆盖「`info` 直传不走磁盘」「解析失败给出明确错误（不是空结果）」「真实 docx 能解析并判定」「密钥扫描在 ruff 缺失时仍命中」「`skipped` 必须有 warning」「`failed` 按失败返回」。
+- **未做**：`tools/` 其余模块（检索 / OCR / 事实库 / 学习闭环 / 评测运维）仍在批次 2、3 的清单里；重复实现清理需要逐个人工确认。
+
 ### 2026-10-31 · 新增 · 阶段 3：`law.cite` 工具 + 条文注入（批次 1 达 8/10）
 
 - **文件**：`tools/law_cite.py`（新增 `load_articles`；`check(..., articles=...)`）、`review_agent/capabilities/builtin_tools.py`（`LawCiteTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入）、`checks/test_builtin_tools.py`（+5 项 → 54 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

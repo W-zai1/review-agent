@@ -435,6 +435,128 @@ class LawCiteTool(BaseTool):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DocxFormatArgs:
+    """Word 版式判定。给 `info` 就直接判（纯函数式），只给 `path` 才去解析。"""
+
+    rule_ids: tuple[str, ...]
+    path: str | None = None
+    spec: dict[str, Any] | None = None
+    info: dict[str, Any] | None = None
+
+
+class DocxFormatTool(BaseTool):
+    """按启用的 FORMAT-* 规则判版式（字体 / 字号 / 缩进 / 行距 / 标题 / 图表编号）。
+
+    `rule_ids` 必须显式给：判哪几项**取决于本次启用的规则**，工具不替调用方猜。
+    （`docx_format_checks.run_all(info, ridset, spec)` 里 `ridset` 就是这份清单。）
+
+    阈值全部来自 `spec`（格式规格）；规格没写的那一项不判——没有委托方标准时
+    「字号对不对」没有答案。
+    """
+
+    name = "docx.format"
+    description = ("按启用的 FORMAT-* 规则检查 Word 版式：正文字体/字号、首行缩进、"
+                   "行距、标题层级、图表编号一致性。阈值来自格式规格；"
+                   "规格没规定的项不判。需 docx 解析产物或文档路径。")
+    permission = Permission.ANALYZE
+    arguments_type = DocxFormatArgs
+
+    def __init__(self, *, run_all: Callable[..., list[dict[str, Any]]],
+                 extract: Callable[[str], dict[str, Any]]) -> None:
+        self._run_all = run_all
+        self._extract = extract
+
+    async def execute(self, arguments: DocxFormatArgs,
+                      context: ToolContext) -> ToolResult:
+        rule_ids = tuple(arguments.rule_ids or ())
+        if not rule_ids:
+            return ToolResult.failure(
+                "rule_ids 为空：不指定要判哪几项，版式检查没有意义")
+
+        info = arguments.info
+        if info is None:
+            path = arguments.path or ""
+            if not path.strip():
+                return ToolResult.failure(
+                    "info 与 path 都没有：需要 docx 解析产物或文档路径")
+            try:
+                info = self._extract(path)
+            except Exception as exc:            # noqa: BLE001 - 解析失败要给出明确错误
+                return ToolResult.failure(
+                    f"docx 解析失败（{path}）：{type(exc).__name__}: {exc}")
+        if not isinstance(info, Mapping):
+            return ToolResult.failure(
+                f"info 必须是解析产物字典，实际 {type(info).__name__}")
+
+        findings = tuple(self._run_all(info, set(rule_ids), arguments.spec))
+        return ToolResult.success(
+            data={"findings": findings, "count": len(findings),
+                  "rules_examined": len(rule_ids)},
+            untrusted=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TextLintArgs:
+    """代码/文本 lint：入参是路径（外部 linter 按路径工作）。"""
+
+    path: str
+
+
+class TextLintTool(BaseTool):
+    """对代码文件跑 ruff / eslint 并做密钥扫描。
+
+    为什么入参是路径而不是文本：ruff / eslint 是**按文件**工作的外部命令，
+    传一段字符串给它等于在临时目录里造文件——那层副作用不该藏在工具里。
+    所以 `run_lint` 由装配层注入，工具只负责「校验入参 → 调 → 归一结果」。
+
+    状态语义（沿用 `tools/lint.py`）：`ok` / `issues` / `skipped` / `failed`。
+    `skipped` 不是成功（例如文件后缀不支持），要以 warning 讲出来；
+    `failed` 是工具坏了，按失败返回。
+    """
+
+    name = "text.lint"
+    description = ("对代码文件跑 ruff（Python）/ eslint（JS/TS）并做密钥扫描，"
+                   "返回 lint 与密钥类问题。需要文件路径；外部工具缺失时如实报 skipped。")
+    permission = Permission.ANALYZE
+    arguments_type = TextLintArgs
+
+    def __init__(self, *, run_lint: Callable[[str], dict[str, Any]]) -> None:
+        self._run_lint = run_lint
+
+    async def execute(self, arguments: TextLintArgs,
+                      context: ToolContext) -> ToolResult:
+        path = (arguments.path or "").strip()
+        if not path:
+            return ToolResult.failure("path 为空：lint 需要文件路径")
+        try:
+            result = self._run_lint(path)
+        except Exception as exc:                # noqa: BLE001 - 外部工具异常要转成明确错误
+            return ToolResult.failure(
+                f"lint 执行失败（{path}）：{type(exc).__name__}: {exc}")
+        if not isinstance(result, Mapping):
+            return ToolResult.failure(
+                f"run_lint 必须返回 dict，实际 {type(result).__name__}")
+
+        status = str(result.get("status") or "")
+        details = result.get("details")
+        findings = tuple(result.get("findings") or ())
+        if status == "failed":
+            return ToolResult.failure(
+                f"lint 执行失败（{path}）：{details or '外部工具返回失败'}")
+        warnings = ()
+        if status == "skipped":
+            warnings = (f"lint 未执行：{details or '该类型文件不跑 lint'}",)
+        return ToolResult.success(
+            data={"file": result.get("file") or path, "status": status,
+                  "details": details, "findings": findings,
+                  "count": len(findings)},
+            warnings=warnings,
+            untrusted=True,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  rule_summarize, rule_counts, sha256_bytes,
                  pattern_scan_hits: Callable[..., tuple[int, list]],
@@ -444,6 +566,9 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  matrix_load_config: Callable[[], dict[str, Any]],
                  law_check: Callable[..., tuple[list, list, list]],
                  law_load_articles: Callable[[], dict[tuple[str, Any], Any]],
+                 docx_format_run_all: Callable[..., list[dict[str, Any]]],
+                 docx_extract: Callable[[str], dict[str, Any]],
+                 lint_run: Callable[[str], dict[str, Any]],
                  ) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
@@ -459,4 +584,6 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         TextRegexTool(normalize_with_map=strip_invisible_with_map),
         MatrixMatchTool(build=matrix_build, load_config=matrix_load_config),
         LawCiteTool(check=law_check, load_articles=law_load_articles),
+        DocxFormatTool(run_all=docx_format_run_all, extract=docx_extract),
+        TextLintTool(run_lint=lint_run),
     )

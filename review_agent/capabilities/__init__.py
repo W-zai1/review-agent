@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from .builtin_tools import (
+    DocxFormatArgs,
+    DocxFormatTool,
     IntegrityHashTool,
     LawCiteArgs,
     LawCiteTool,
@@ -19,6 +21,8 @@ from .builtin_tools import (
     RuleClassifyArgs,
     RuleClassifyTool,
     TextCheckArgs,
+    TextLintArgs,
+    TextLintTool,
     TextRegexArgs,
     TextRegexTool,
     batch1_tools,
@@ -53,4 +57,5 @@ __all__ = [
     "PatternScanArgs", "RuleClassifyArgs", "RuleClassifyTool", "TextCheckArgs",
     "TextRegexArgs", "TextRegexTool", "batch1_tools",
     "MatrixMatchArgs", "MatrixMatchTool", "LawCiteArgs", "LawCiteTool",
+    "DocxFormatArgs", "DocxFormatTool", "TextLintArgs", "TextLintTool",
 ]

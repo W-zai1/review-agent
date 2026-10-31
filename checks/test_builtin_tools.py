@@ -17,6 +17,7 @@ mock 掉算术层等于把要验证的东西换成自己写的期望值。
 """
 import asyncio
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -53,9 +54,10 @@ class CapabilityRegistryTests(unittest.TestCase):
 
     def test_batch1_tools_are_registered(self):
         self.assertEqual(self.registry.names(),
-                         ("integrity.hash", "law.cite", "logic.check",
-                          "math.check", "matrix.match", "rules.classify",
-                          "rules.pattern", "text.regex"))
+                         ("docx.format", "integrity.hash", "law.cite",
+                          "logic.check", "math.check", "matrix.match",
+                          "rules.classify", "rules.pattern", "text.lint",
+                          "text.regex"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
@@ -542,6 +544,132 @@ class LawCiteToolTests(unittest.TestCase):
 
     def test_results_are_untrusted(self):
         result, _ = self._run(articles={"labor-contract:19": ART19})
+        self.assertTrue(result.untrusted)
+
+
+def _minimal_docx(path, text="合同正文第一段。\n第二段：试用期 9 个月。"):
+    """造一个只含 document.xml 的最小 docx（够 docx_extract 解析）。"""
+    import zipfile
+    body = "".join(
+        f"<w:p><w:r><w:t>{line}</w:t></w:r></w:p>" for line in text.split("\n"))
+    xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+           '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           f"<w:body>{body}</w:body></w:document>")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", xml)
+    return path
+
+
+class DocxFormatToolTests(unittest.TestCase):
+    """版式判定：能判、也只在给了解析产物/路径时才判。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def _run(self, **over):
+        args = {"rule_ids": ["FORMAT-001"], "info": {}}
+        args.update(over)
+        return run_tool(self.registry, "docx.format", args)
+
+    def test_injected_info_is_used_without_touching_disk(self):
+        result, _ = self._run()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["rules_examined"], 1)
+        self.assertEqual(tuple(result.data["findings"]), (),
+                         "没有格式规格时该项不判（阈值来自规格，不是代码常量）")
+
+    def test_rules_without_rule_ids_are_rejected(self):
+        result, _ = self._run(rule_ids=[])
+        self.assertFalse(result.ok)
+        self.assertIn("rule_ids", result.errors[0])
+
+    def test_missing_info_and_path_is_a_failure(self):
+        result, _ = self._run(info=None, path=None)
+        self.assertFalse(result.ok)
+        self.assertIn("info", result.errors[0])
+
+    def test_extraction_failure_is_reported_not_swallowed(self):
+        result, _ = self._run(info=None, path=str(self.base / "nope.docx"))
+        self.assertFalse(result.ok)
+        self.assertIn("docx 解析失败", result.errors[0])
+
+    def test_real_docx_is_parsed_and_judged(self):
+        path = _minimal_docx(self.base / "sample.docx")
+        result, _ = self._run(info=None, path=str(path),
+                              rule_ids=["FORMAT-001", "FORMAT-005"])
+        self.assertTrue(result.ok, result.errors[0] if not result.ok else "")
+        self.assertEqual(result.data["rules_examined"], 2)
+        self.assertIsInstance(tuple(result.data["findings"]), tuple)
+
+    def test_results_are_untrusted(self):
+        result, _ = self._run()
+        self.assertTrue(result.untrusted)
+
+
+class TextLintToolTests(unittest.TestCase):
+    """lint：外部工具的结果要原样带出，状态语义不能被抹平。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def _run(self, **args):
+        return run_tool(self.registry, "text.lint", args)
+
+    def test_findings_pass_through(self):
+        path = self.base / "sample.py"
+        path.write_text("x = 1\n", encoding="utf-8")
+        result, _ = self._run(path=str(path))
+        self.assertTrue(result.ok, result.errors[0] if not result.ok else "")
+        self.assertIn(result.data["status"], {"ok", "issues", "skipped"})
+        self.assertEqual(result.data["count"], len(tuple(result.data["findings"])))
+
+    def test_secret_scan_runs_even_without_ruff(self):
+        """密钥扫描是纯 Python 的：外部 linter 不在也该命中。"""
+        path = self.base / "cfg.py"
+        path.write_text('password = "hunter2xyz"\n', encoding="utf-8")
+        result, _ = self._run(path=str(path))
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(result.data["count"], 1,
+                                "硬编码口令必须被密钥扫描抓到")
+
+    def test_skipped_is_a_warning_not_a_pass(self):
+        path = self.base / "notes.txt"
+        path.write_text("普通文本", encoding="utf-8")
+        result, _ = self._run(path=str(path))
+        self.assertTrue(result.ok)
+        if result.data["status"] == "skipped":
+            self.assertEqual(len(result.warnings), 1,
+                             "「没跑 lint」必须说出来，不能当成通过")
+
+    def test_failed_status_is_a_failure(self):
+        class _Runner:
+            def __call__(self, path):
+                return {"file": path, "status": "failed",
+                        "details": "ruff 崩了", "findings": []}
+
+        from review_agent.capabilities import TextLintTool
+        tool = TextLintTool(run_lint=_Runner())
+        registry = review.ToolRegistry()
+        registry.register(tool)
+        result, _ = run_tool(registry, "text.lint", {"path": "x.py"})
+        self.assertFalse(result.ok)
+        self.assertIn("ruff 崩了", result.errors[0])
+
+    def test_empty_path_is_a_failure(self):
+        result, _ = self._run(path="  ")
+        self.assertFalse(result.ok)
+        self.assertIn("path", result.errors[0])
+
+    def test_results_are_untrusted(self):
+        path = self.base / "a.py"
+        path.write_text("x = 1\n", encoding="utf-8")
+        result, _ = self._run(path=str(path))
         self.assertTrue(result.untrusted)
 
 

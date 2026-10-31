@@ -132,18 +132,31 @@ ToolRegistry
 | `pattern_rules.py` | `rules.pattern` | READ | 声明式规则求值 |
 | `match_matrix.py` | `matrix.match` | ANALYZE | 要求对照矩阵 |
 
-**进度（2026-10-31）**：批次 1 已迁 **8 个**为独立 `BaseTool`：
-`math.check`（← `arith_check.run_all`）、`logic.check`（← `logic_checks.run_all`）、
-`rules.classify`（← `rule_exec.summarize` / `counts`）、`integrity.hash`（← `integrity.sha256_bytes`）、
-`rules.pattern`（← 新增纯核心 `pattern_rules.scan_hits`，旧的 `scan()` 改为委托）、
-`text.regex`（← 新增 `regex_check.strip_invisible_with_map`，带「清洗后位置 → 原文位置」映射）、
-`matrix.match`（← `match_matrix.build`，配置由装配层注入）、
-`law.cite`（← 新增 `law_cite.load_articles`，条文由入参注入）。
+**进度（2026-10-31）**：批次 1 **10/10 全部迁移完成**，都实现为独立 `BaseTool`：
+
+| 工具 | 算法来源 |
+| --- | --- |
+| `math.check` | `arith_check.run_all` |
+| `logic.check` | `logic_checks.run_all` |
+| `rules.classify` | `rule_exec.summarize` / `counts` |
+| `integrity.hash` | `integrity.sha256_bytes` |
+| `rules.pattern` | 新增纯核心 `pattern_rules.scan_hits`，旧的 `scan()` 改为委托 |
+| `text.regex` | 新增 `regex_check.strip_invisible_with_map`（带原文位置映射） |
+| `matrix.match` | `match_matrix.build`，配置由装配层注入 |
+| `law.cite` | 新增 `law_cite.load_articles`，条文由入参注入 |
+| `docx.format` | `docx_format_checks.run_all`，解析产物 `info` 可入参直传 |
+| `text.lint` | `lint.run_lint`（外部 ruff/eslint + 密钥扫描） |
+
 实现在 `review_agent/capabilities/builtin_tools.py`，由 `review.build_capability_registry()` 装配，
-验收 `checks/test_builtin_tools.py`（54 项：真算法、三态 `rule_ids`、权限分级、审计、
-确定性、坐标映射、配置/条文注入，以及 `rules.pattern` 与旧 `scan()` 的**差分一致性**）。
+验收 `checks/test_builtin_tools.py`（66 项：真算法、三态 `rule_ids`、权限分级、审计、
+确定性、坐标映射、配置/条文/解析产物注入、`skipped` 语义，以及 `rules.pattern` 与旧
+`scan()` 的**差分一致性**）。
 算法本体不复制——`capabilities` 层不许 import `tools/`（ARCHITECTURE §3 第 3 条），
 所以由 `review.py` 在装配时注入函数。
+
+**统一的注入口径**（十次迁移踩出来的同一条路）：IO / 外部命令 / 配置加载都收进
+**注入的可调用对象**，工具本身只做「校验入参 → 调 → 归一结果 → 定性（成功/失败/skipped）」。
+所以这十个工具在没有文件系统、没有网络、没有法条库、没有 ruff 的环境里都能被单测。
 
 `rules.pattern` 的抽法值得单独记一句：`scan(s, ...)` 的第一个参数是 Session，
 工具不该造一个假 Session 来跑。做法是把匹配语义抽成纯核心 `scan_hits(text, rules, ...)`
@@ -167,12 +180,11 @@ ToolRegistry
 （`art19['law_short']` 打在 `None` 上）——现在缺哪条就整段跳过，并把「该项未执行」
 写进 `skipped`，再由工具提成 warning。
 
-其余 2 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
-
-| 工具 | 卡在哪 |
-| --- | --- |
-| `text.lint` | `lint.run_lint(path)` 收的是**路径**（要读文件、跑 ruff/eslint），属有 IO |
-| `docx.format` | `run_all(info, ridset, spec)` 本身是纯的，但入参要 docx 解析产物（批次 2 的接口） |
+`docx.format` 与 `text.lint` 原先被划进「批次 2（有 IO）」，实际做法与前几个一致：
+`docx.format` 可以**直接给解析产物 `info`**（纯函数式），也可以只给 `path` 让注入的
+`extract` 去解析；`text.lint` 把 `run_lint` 整个注入——工具不关心它跑的是 ruff、
+eslint 还是别的，只把 `ok / issues / skipped / failed` 四种状态如实带出来。
+所以两者都迁进了批次 1，批次 1 到此收口。
 
 `rules.classify` 与 `integrity.hash` 的权限是 **READ**——它们只查表/只算哈希，不读材料，
 不该要求 `ANALYZE`。权限收紧比放宽难，先按最小权限给。
@@ -181,6 +193,10 @@ ToolRegistry
 > + 内置执行器）。所以 `rules.pattern` 在真实规则集上会明确返回「没有带 pattern 的规则」，
 > 而不是假装扫过一遍——这条由 `checks/test_builtin_tools.py::test_real_ruleset_is_handled_honestly`
 > 钉住；将来规则集加了声明式规则，这条用例会变成正向断言。
+
+**批次 1 之后还剩什么**：`tools/` 里其余模块（检索、OCR、事实库、学习闭环、评测运维）
+按下面两节处理；以及「重复实现清理」（盘点 §5 的重名函数），那需要逐个人工确认，
+不是机械替换。
 
 ### 批次 2：有 IO / 依赖外部，后迁（接口先定，实现后换）
 
