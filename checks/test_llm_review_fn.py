@@ -36,6 +36,12 @@ def fake_cfg(*, available=False):
     )
 
 
+def fake_client():
+    """满足 ModelClient 端口的最小对象（`review_dimension` 在这些用例里被替换掉）。"""
+    return SimpleNamespace(model="fake-model",
+                           chat=lambda messages: None)
+
+
 class ReviewFnTests(unittest.TestCase):
     def test_unavailable_returns_none_with_reason(self):
         with mock.patch.object(review.llm_client, "load_config",
@@ -66,7 +72,7 @@ class ReviewFnTests(unittest.TestCase):
         with mock.patch.object(review.llm_client, "load_config",
                                return_value=fake_cfg(available=True)), \
                 mock.patch.object(review.llm_client, "LLMClient",
-                                  return_value=object()), \
+                                  return_value=fake_client()), \
                 mock.patch.object(review.llm_review, "review_dimension",
                                   side_effect=fake_review_dimension):
             fn, meta = review.make_llm_review_fn(active, "完整原文", "contract",
@@ -121,7 +127,7 @@ class PipelineLlmTests(unittest.TestCase):
         with mock.patch.object(review.llm_client, "load_config",
                                return_value=fake_cfg(available=True)), \
                 mock.patch.object(review.llm_client, "LLMClient",
-                                  return_value=object()), \
+                                  return_value=fake_client()), \
                 mock.patch.object(review.llm_review, "review_dimension",
                                   side_effect=fake_review_dimension):
             meta = {}

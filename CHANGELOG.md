@@ -44,6 +44,18 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · `ModelClient` 端口：七问里最后一个「部分」转「是」
+
+- **文件**：`review_agent/domain/ports.py`（`ModelReply` + `ModelClient`）、`review_agent/domain/__init__.py`、`review_agent/adapters/model.py`（新增：`ChatClientAdapter` / `as_model_client` / `settings_for` / `ModelClientSettings`）、`review.py`（`make_llm_review_fn(..., model_client=...)`，真实供应商也走适配器）、`checks/test_model_client.py`（新增 14 项）、`checks/test_llm_review_fn.py`（假客户端改为满足端口）、`docs/ARCHITECTURE.md` §9、`docs/REFACTOR_PLAN.md` §10
+- **改了什么**：
+  1. 领域端口 `ModelClient`：只有一个方法 `chat(messages) -> ModelReply`。`ModelReply` 只登记审查真正用到的五个字段（content / model / finish_reason / usage / latency_ms），供应商特有的东西留在适配器里。
+  2. `ChatClientAdapter`：把任意「有 `chat()` 且返回带上述字段的对象」归一成 `ModelReply`。缺字段给默认值，不让 `getattr` 失败把审查打断在「读结果」这一步；**没有 `chat()` 的客户端在装配时就 `TypeError`**，不留到跑到一半才炸。
+  3. `make_llm_review_fn(model_client=...)`：给了客户端就不再读配置文件，配置只保留「审查侧预算」（送多少字、每维最多几条、要不要缓存），这些换供应商时不跟着变。
+  4. 真实路径（`llm_client.LLMClient`）**也走同一个适配器**——否则「端口」只是摆设，换供应商时才发现审查侧其实还在依赖具体返回类型。
+- **为什么**：`REFACTOR_PLAN` §10 的七问里，只有「能否单独替换 LLM？」一直是「部分」：节点层有 `SemanticExecutor` 端口，但语义审内部直接绑 `LLMResult`。这正是方案 §2「换模型、换数据库时不需要推倒整个项目」的具体落点。
+- **验证**：`python -m unittest discover -s checks` → **498 项 OK**（+14）。`checks/test_model_client.py` 不 mock `review_dimension`：走真实 prompt 构造与解析，两个「供应商」共用同一段审查代码，各自返回自己的 `model`；另有用例证明 `finish_reason=length` 仍被标成「没写完」。
+- **已知边界**：只定义了「单轮对话」端口。流式输出、tool-calling、多模态都没有进契约——现在没有调用点需要它们，先加会变成没人维护的可选项。
+
 ### 2026-10-31 · 新增 · 阶段 3：`text.regex` 工具 + 隐形字符位置映射（批次 1 达 6/10）
 
 - **文件**：`tools/regex_check.py`（新增 `strip_invisible_with_map`）、`review_agent/capabilities/builtin_tools.py`（`TextRegexTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入）、`checks/test_builtin_tools.py`（+8 项 → 44 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

@@ -17,10 +17,46 @@ Domain 需要外部能力时，只声明 Protocol，由 infrastructure 实现：
 """
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from .models import AuditEvent, Checkpoint, Review, ReviewRun
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ModelReply:
+    """一次模型调用的结果，与供应商无关。
+
+    为什么单独定义而不是直接复用 `tools/llm_client.LLMResult`：
+        领域层不许 import `tools/`（ARCHITECTURE §3），而语义审需要读
+        `content` / `model` / `finish_reason` / `usage` / `latency_ms` 五个字段。
+        这里只登记「审查流程真正会用到」的字段；供应商特有的东西（原始 JSON、
+        token 明细、重试次数）留在适配器里，不污染领域。
+
+    `finish_reason == "length"` 是「输出没写完」的唯一可靠信号——结论完整性
+    判定靠它，所以它是端口契约的一部分，不是可选装饰。
+    """
+
+    content: str
+    model: str = ""
+    finish_reason: str = ""
+    usage: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    latency_ms: int = 0
+
+
+@runtime_checkable
+class ModelClient(Protocol):
+    """模型调用端口：换供应商只换实现，审查节点与 prompt 不用改。
+
+    契约刻意只有一个方法：`review_dimension` 只调 `client.chat(messages)`。
+    把 temperature / max_tokens 放进端口会让每个实现都要处理一遍可选项，
+    而实际调用点从来只传 messages。
+    """
+
+    def chat(self, messages: Sequence[Mapping[str, str]]) -> ModelReply:
+        """发一次对话请求。失败抛异常，由调用方决定降级还是中止。"""
 
 
 @runtime_checkable

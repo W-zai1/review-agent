@@ -18,7 +18,7 @@
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
 | 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application / Task / Report 服务均已落地；剩在线切流） |
 | 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管；批次 1 已迁 6 个独立工具：`math.check` / `logic.check` / `rules.classify` / `integrity.hash` / `rules.pattern` / `text.regex`；其余 4 个与 `tools/` 42 模块的逐条理由见 TOOL_SPECIFICATION §7） |
-| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **完成**（2026-10-31：Retry ✅；Checkpoint ✅；单节点超时 ✅；幂等键 ✅；三类故障注入 ✅；统一 AuditEvent 流 ✅——`application/audit.py` 汇流，旧三个文件由事件流投影生成） |
+| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **完成**（2026-10-31：Retry ✅；Checkpoint ✅；单节点超时 ✅；幂等键 ✅；三类故障注入 ✅；统一 AuditEvent 流 ✅——`application/audit.py` 汇流，旧三个文件由事件流投影生成。**另**：`ModelClient` 端口补上，七问里最后一个「部分」转「是」） |
 | 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | **进行中**（2026-10-31：集成测试 ✅ 三类对象真跑；部署自检 ✅；ledger 全量校验 ✅ 219 份；golden ✅；**「在线双跑切流」未做，那需要真实使用时间**） |
 
 ## 2. 阶段 0：冻结与盘点（已完成）
@@ -183,7 +183,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 | 问题 | 阶段 | 证据（测试/文件） | 状态 |
 | --- | --- | --- | --- |
 | 能否追踪一次审查的完整生命周期？ | 2/4 | `RunState` 阶段链 + 统一 `AuditEvent` 流；`checks/test_domain_v1.py`、`checks/test_audit_stream.py` | **是**：六节点 + 编排器跑完整八阶段，检查点/状态可落盘；v1 的审计事件写入 `logs/v1/<id>/events.jsonl`，可按 `seq` 回放（跨来源无统一时钟，见 audit.py 的说明） |
-| 能否单独替换 LLM？ | 2 | `SemanticExecutor` 端口（节点层可注入执行器）+ 旧链路仍直连 `llm_client` | **部分**：新链路的语义审不直接依赖 provider；`ModelClient` 端口与「换供应商不改代码」尚未做 |
+| 能否单独替换 LLM？ | 2 | `ModelClient` 端口（`domain/ports.py`）+ `ChatClientAdapter`（`adapters/model.py`）+ `make_llm_review_fn(model_client=...)` | **是**（2026-10-31）：任意 `chat(messages) -> ModelReply` 的客户端都能注入，不需要配置文件；真实供应商也走同一条缝。证据：`checks/test_model_client.py`（14 项，两个「供应商」共用同一段审查代码） |
 | 能否单独测试每个审查节点？ | 2 | 每节点独立用例（固定语料） | **是**（Decision 16 + Evidence 16 + Cross 17 + Rule 17 + Semantic 21 + Document 15；另有 Planner 8、编排器 21） |
 | 能否在中断后恢复执行？ | 2/4 | Checkpoint + 杀进程恢复用例 | **是（状态层）**：`FileRunStore` 落盘 → 读回 → 从断点阶段续跑（`checks/test_state_serialization.py`）；「杀进程后自动续跑」要等 Application Service 接上读回逻辑 |
 | 能否追溯每条 Finding 的证据？ | 1/3 | `Evidence` + `verification` + 适配器测试 + 报告 `evidence[]` 段 | **是**（历史报告可追溯；报告 `evidence[]` 自 schema 1.2 起随报告输出，`anchored` 可回查原文） |

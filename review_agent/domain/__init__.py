@@ -59,6 +59,7 @@ from .policy import (
     consistency_issues,
     finding_violations,
 )
+from .ports import ModelClient, ModelReply
 from .transitions import (
     STAGE_ARTIFACTS,
     STAGE_ORDER,
@@ -85,6 +86,8 @@ __all__ = [
     # policy
     "DEFAULT_POLICY", "POLICY_ID", "DecisionDraft", "DecisionPolicy",
     "consistency_issues", "finding_violations",
+    # ports
+    "ModelClient", "ModelReply",
     # transitions
     "STAGE_ARTIFACTS", "STAGE_ORDER", "ensure_dispute_transition",
     "ensure_finding_transition", "ensure_review_transition",

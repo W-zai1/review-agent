@@ -205,7 +205,7 @@ review_agent/
 | 问题 | 现状（2026-10-30，`v0.9.2-arch-v1`） | 谁证明 |
 | --- | --- | --- |
 | 能否追踪一次审查的完整生命周期？ | 旧：`steps` + 三份 jsonl；新：`RunState` 阶段链 + `AuditEvent` + `state/runs/` 落盘 | `checks/test_domain_v1.py::RuntimeStateTests`、`checks/test_orchestrator.py` |
-| 能否单独替换 LLM？ | **部分**：节点层经 `SemanticExecutor` 端口注入，可换实现；但 `ModelClient` 端口未建，换供应商仍要改 `llm_client` | `checks/test_semantic_node.py`、`checks/test_llm_review_fn.py` |
+| 能否单独替换 LLM？ | **是**：节点层经 `SemanticExecutor` 注入执行器；模型层经 `ModelClient` 端口注入客户端（`review.make_llm_review_fn(model_client=...)`），真实供应商也走同一条适配缝（`adapters/model.py`） | `checks/test_semantic_node.py`、`checks/test_model_client.py` |
 | 能否单独测试每个审查节点？ | **是**：六节点各有独立用例（Decision 16 / Evidence 16 / Cross 17 / Rule 17 / Semantic 21 / Document 15），另有 Planner 8、编排器 21 | `checks/test_*_node.py`、`checks/test_planner_node.py` |
 | 能否在中断后恢复执行？ | **状态层是**：`FileRunStore` 落盘 → 读回 → 从断点阶段续跑；「杀进程后自动续跑」仍需入口侧接线 | `checks/test_state_serialization.py`、`checks/test_orchestrator.py::test_resume_does_not_rerun_completed_stages` |
 | 能否追溯每条 Finding 的证据？ | **是**：`Evidence` + `verification` + `verified_by`，报告自 schema 1.2 起带 `evidence[]` | `checks/test_legacy_adapter.py`、`checks/test_report_evidence.py` |

@@ -62,6 +62,11 @@ from review_agent.adapters.issue_codec import (
     encode_issues,
     export_issues,
 )
+from review_agent.adapters.model import (
+    ChatClientAdapter,
+    as_model_client,
+    settings_for,
+)
 from review_agent.capabilities import (
     BaseTool,
     Candidate,
@@ -4174,7 +4179,7 @@ def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None
 
 
 def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
-                       purpose_info=None):
+                       purpose_info=None, model_client=None):
     """构造「一次模型调用」的函数，返回 (review_fn | None, meta)。
 
     None 表示模型不可用（未配置 / 被关闭）；**调用方决定降级还是报错**——
@@ -4182,18 +4187,32 @@ def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
 
     口径与旧 `semantic_review` 一致：按维度取生效规则、任务书（含用户目的）、
     事实库进 prompt、quote 对全文校验。
-    """
-    try:
-        cfg = llm_client.load_config(use_llm)
-    except Exception as e:                              # noqa: BLE001 - 配置加载失败
-        return None, {"available": False, "reason": f"配置加载失败：{e}"}
-    if not cfg.available:
-        reason = ("已通过 --no-llm 关闭" if use_llm is False
-                  else "config 中 enabled=false" if not cfg.enabled
-                  else "未配置 API Key 且非本地端点")
-        return None, {"available": False, "reason": reason, "model": cfg.model}
 
-    client = llm_client.LLMClient(cfg)
+    `model_client`：注入一个满足 `ModelClient` 端口的客户端（有 `chat(messages)`）。
+    给了它就不再读配置文件——这是「换供应商不改审查代码」的落点：
+    审查侧只依赖端口，供应商适配放在 `adapters/model.py`。
+    """
+    if model_client is not None:
+        client = as_model_client(model_client)
+        cfg = settings_for(model_client)
+        meta = {"available": True, "model": cfg.model, "source": "injected",
+                "base_url": None}
+    else:
+        try:
+            cfg = llm_client.load_config(use_llm)
+        except Exception as e:                          # noqa: BLE001 - 配置加载失败
+            return None, {"available": False, "reason": f"配置加载失败：{e}"}
+        if not cfg.available:
+            reason = ("已通过 --no-llm 关闭" if use_llm is False
+                      else "config 中 enabled=false" if not cfg.enabled
+                      else "未配置 API Key 且非本地端点")
+            return None, {"available": False, "reason": reason, "model": cfg.model}
+        # 真实供应商也走同一个端口：否则「端口」只是摆设，换供应商时才发现
+        # 审查侧其实还在依赖 LLMClient 的具体返回类型。
+        client = as_model_client(llm_client.LLMClient(cfg))
+        meta = {"available": True, "model": cfg.model,
+                "source": cfg.source, "base_url": cfg.base_url}
+
     by_dim = {}
     for rule in active:
         by_dim.setdefault(rule.get("dimension"), []).append(rule)
@@ -4208,8 +4227,7 @@ def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
             client, step.dimension, by_dim.get(step.dimension, []),
             step.text, cfg, charter=charter, full_text=text, facts=facts)
 
-    return review_fn, {"available": True, "model": cfg.model,
-                       "source": cfg.source, "base_url": cfg.base_url}
+    return review_fn, meta
 
 
 def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
