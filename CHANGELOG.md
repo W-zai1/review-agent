@@ -44,6 +44,13 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 修复 · CI 在 cp1252 控制台下因中文输出崩溃（UnicodeEncodeError）
+
+- **文件**：`review.py`、`server.py`（启动时强制 UTF-8 输出）、`.github/workflows/ci.yml`（job 级 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`）
+- **改了什么**：`review.py` / `server.py` 在模块加载后对 `sys.stdout` / `sys.stderr` 调 `reconfigure(encoding="utf-8", errors="replace")`；`ci.yml` 的 `test` job 加 `env`（`PYTHONUTF8: "1"`、`PYTHONIOENCODING: utf-8`），覆盖 `checks` / `golden` / `changelog_guard` 等所有 python 调用及其子进程。
+- **为什么**：GitHub Actions `windows-latest` runner 的 Python（3.12.10/3.13.x，hostedtoolcache）默认 stdout 是 **cp1252**（en-US 区域），打印中文（`--engine 缺少取值`、`未知引擎：'v2'`、`[recover] 恢复 N 个任务状态`）直接抛 `UnicodeEncodeError`，导致 `Public invariants` 步骤 3 error + 2 fail（此前 14 次 CI 全部失败）；本地 zh-CN（cp936/UTF-8）能编码中文，所以本地复现全绿。`changelog_guard.py` 等工具同样受影响。
+- **验证**：`PYTHONIOENCODING=cp1252` 下复现 `checks` → **503 项 FAILED（failures=2, errors=3, skipped=42）**，与 CI 日志逐条一致；修复后同环境重跑 → **538 项 OK**；`changelog_guard --explain` 在 cp1252 下由崩溃（exit 1）转为正常。
+
 ### 2026-10-31 · 新增 · 阶段 3 收口：重复实现审计 + `_location` 合并
 
 - **文件**：`tools/dup_audit.py`（新增）、`checks/test_dup_audit.py`（新增 5 项）、`review_agent/adapters/issue_codec.py`（`_location` → `location_from_label`）、`review_agent/adapters/legacy_report.py`（改为 import）、`docs/TOOL_SPECIFICATION.md` §9、`docs/REFACTOR_PLAN.md` §1

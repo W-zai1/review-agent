@@ -10,6 +10,11 @@ jobs:
     # 项目的主运行环境是 Windows（OCR / .bat / 路径处理），CI 跟主环境保持一致。
     runs-on: windows-latest
     timeout-minutes: 20
+    # runner 的 Python 默认 stdout 是 cp1252，打印中文会 UnicodeEncodeError；
+    # 强制 UTF-8，覆盖本 job 所有 python 调用及其子进程。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:

@@ -26,6 +26,16 @@ import time
 import datetime
 from pathlib import Path
 
+# 强制 UTF-8 输出：Windows / GitHub Actions runner 的控制台可能用 cp1252 等
+# 非 UTF-8 编码，打印中文（引擎错误、恢复日志等）会抛 UnicodeEncodeError。
+for _stream in (sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if _reconf is not None:
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "tools"))
 import agent_spec

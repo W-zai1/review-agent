@@ -49,6 +49,16 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, urlsplit
 
+# 强制 UTF-8 输出：Windows / GitHub Actions runner 的控制台可能用 cp1252 等
+# 非 UTF-8 编码，打印中文（任务恢复日志等）会抛 UnicodeEncodeError。
+for _stream in (sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if _reconf is not None:
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 TARGETS = ROOT / "targets"
