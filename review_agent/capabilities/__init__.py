@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from .builtin_tools import (
     IntegrityHashTool,
+    LawCiteArgs,
+    LawCiteTool,
     LogicCheckTool,
     MathCheckTool,
     MatrixMatchArgs,
@@ -50,5 +52,5 @@ __all__ = [
     "IntegrityHashTool", "LogicCheckTool", "MathCheckTool", "PatternScanTool",
     "PatternScanArgs", "RuleClassifyArgs", "RuleClassifyTool", "TextCheckArgs",
     "TextRegexArgs", "TextRegexTool", "batch1_tools",
-    "MatrixMatchArgs", "MatrixMatchTool",
+    "MatrixMatchArgs", "MatrixMatchTool", "LawCiteArgs", "LawCiteTool",
 ]

@@ -44,6 +44,18 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`law.cite` 工具 + 条文注入（批次 1 达 8/10）
+
+- **文件**：`tools/law_cite.py`（新增 `load_articles`；`check(..., articles=...)`）、`review_agent/capabilities/builtin_tools.py`（`LawCiteTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入）、`checks/test_builtin_tools.py`（+5 项 → 54 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `law_cite.load_articles()`：把「取哪三条（第十九/二十/二十四条）」与「加载法条库」收进一个函数，IO 只在它里面。
+  2. `check(text, min_conf=0.6, *, articles=None)`：给了条文字典就不碰法条库，判定逻辑可以被单独测试或被工具调用而**不带隐式 IO**。
+  3. `law.cite`（ANALYZE）工具：入参 `{text, min_confidence?, articles?}`（键写成 `"labor-contract:19"`，JSON 友好），出参 `{issues, verified, skipped}`；`skipped` 同时提成 warning。
+- **修复（写工具时暴露的真实缺陷）**：条文缺失时 `check()` 会 `TypeError`——第 232 行的分支直接用 `art19['law_short']`，而 `art19` 可能是 `None`。旧实现里「法条库缺条」只写进 `skipped` 却没有拦住后续使用，所以只要同时出现「试用期 9 个月」和「合同期限未写明」，整条法条检查就会崩。现在缺哪条就整段跳过（`for m in (finditer(...) if art19 else ())`），保留原来的 `skipped` 语义。
+- **为什么**：批次 1 的 `law.cite` 一直卡在「`check()` 内部自己加载法条库」。把加载与判定拆开后，工具才可能在**没有法条库**的环境里被测试（注入一张条文字典即可）。
+- **验证**：`python -m unittest discover -s checks` → **508 项 OK**（+5）。用例覆盖「注入 art19 → 命中 LAW-001 且 citation 带条号」「注入空字典 → 0 条结论 + 3 条「未执行」warning」「不注入时用真实法条库仍可用」「空文本失败」。
+- **未做**：批次 1 还剩 2 个（`text.lint` 有文件 IO、`docx.format` 要 docx 解析产物）。
+
 ### 2026-10-31 · 新增 · 阶段 3：`matrix.match` 工具（批次 1 达 7/10）
 
 - **文件**：`review_agent/capabilities/builtin_tools.py`（`MatrixMatchTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `match_matrix.build` / `load_config`）、`checks/test_builtin_tools.py`（+5 项 → 49 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

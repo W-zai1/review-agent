@@ -375,6 +375,66 @@ class MatrixMatchTool(BaseTool):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class LawCiteArgs:
+    """法条比对：法条库可注入（`articles`），不注入才走加载器。"""
+
+    text: str
+    min_confidence: float = 0.6
+    # 键写成 "law_id:条号"（如 "labor-contract:19"）：JSON 友好，也看得懂
+    articles: dict[str, Any] | None = None
+
+
+def _normalize_articles(raw: Mapping[str, Any]) -> dict[tuple[str, Any], Any]:
+    """把 `{"labor-contract:19": {...}}` 还原成 `{("labor-contract", 19): {...}}`。"""
+    out: dict[tuple[str, Any], Any] = {}
+    for key, article in raw.items():
+        law_id, _, number = str(key).partition(":")
+        try:
+            number_value: Any = int(number)
+        except ValueError:
+            number_value = number
+        out[(law_id, number_value)] = article
+    return out
+
+
+class LawCiteTool(BaseTool):
+    """把合同条款与法条原文比对（试用期上限 / 竞业限制期限 / 试用期工资）。
+
+    缺条文时不是「没问题」：`skipped` 会说明「该项未执行」，这里把它提成 warning。
+    """
+
+    name = "law.cite"
+    description = ("把文本里的试用期时长、竞业限制期限、试用期工资比例与法条原文比对，"
+                   "给出结论与依据。法条库可由入参注入；缺条文时明确报「未执行」，"
+                   "不当作「已核验」。")
+    permission = Permission.ANALYZE
+    arguments_type = LawCiteArgs
+
+    def __init__(self, *, check: Callable[..., tuple[list, list, list]],
+                 load_articles: Callable[[], dict[tuple[str, Any], Any]]) -> None:
+        self._check = check
+        self._load_articles = load_articles
+
+    async def execute(self, arguments: LawCiteArgs,
+                      context: ToolContext) -> ToolResult:
+        text = arguments.text or ""
+        if not text.strip():
+            return ToolResult.failure("text 为空：没有可比对的条款内容")
+        articles = (None if arguments.articles is None
+                    else _normalize_articles(arguments.articles))
+        if articles is None:
+            articles = self._load_articles()
+        issues, verified, skipped = self._check(
+            text, arguments.min_confidence, articles=articles)
+        return ToolResult.success(
+            data={"issues": tuple(issues), "verified": tuple(verified),
+                  "skipped": tuple(skipped)},
+            warnings=tuple(skipped),        # 「没查」必须说出来，不能混进结论
+            untrusted=True,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  rule_summarize, rule_counts, sha256_bytes,
                  pattern_scan_hits: Callable[..., tuple[int, list]],
@@ -382,6 +442,8 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  Callable[[str], tuple[str, list[int]]],
                  matrix_build: Callable[..., dict[str, Any]],
                  matrix_load_config: Callable[[], dict[str, Any]],
+                 law_check: Callable[..., tuple[list, list, list]],
+                 law_load_articles: Callable[[], dict[tuple[str, Any], Any]],
                  ) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
@@ -396,4 +458,5 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         PatternScanTool(scan_hits=pattern_scan_hits),
         TextRegexTool(normalize_with_map=strip_invisible_with_map),
         MatrixMatchTool(build=matrix_build, load_config=matrix_load_config),
+        LawCiteTool(check=law_check, load_articles=law_load_articles),
     )

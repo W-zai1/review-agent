@@ -190,23 +190,40 @@ def _probation_cap(term_months):
     return 6, "合同期限三年以上/无固定期限"
 
 
-def check(text, min_conf=0.6):
-    """返回 (issues, verified, skipped)。
+def load_articles():
+    """取出本次判定要用的条文，返回 `{(law_id, no): article}`。
 
-    `skipped` 非空表示「本该跑但判不了」——法条库缺条文，或合同期限未写明
-    导致试用期档位无法确定。必须由调用方写进 limitations：静默跳过等于
-    报告正常但少跑一整类检查，那比报错更危险。
+    为什么单独成函数：`check()` 要能被单独测试、也要能被工具调用，而「加载法条库」
+    是 IO。把 IO 收在这里，判定逻辑只认一张条文字典——缺条文自然落进 `skipped`，
+    不会因为「读不到库」把整类检查静默变成「没问题」。
     """
-    issues, verified = [], []
     try:
         law_index.load_all()
     except Exception as e:                      # noqa: BLE001
         # 法条库坏了必须显式失败，不能静默变成"没有法律依据可查"
         raise law_index.LawLibraryError(f"法条库不可用：{e}") from e
+    wanted = (("labor-contract", 19), ("labor-contract", 20),
+              ("labor-contract", 24))
+    return {key: law_index.get_article(*key) for key in wanted}
 
-    art19 = _article("labor-contract", 19)
-    art20 = _article("labor-contract", 20)
-    art24 = _article("labor-contract", 24)
+
+def check(text, min_conf=0.6, *, articles=None):
+    """返回 (issues, verified, skipped)。
+
+    `skipped` 非空表示「本该跑但判不了」——法条库缺条文，或合同期限未写明
+    导致试用期档位无法确定。必须由调用方写进 limitations：静默跳过等于
+    报告正常但少跑一整类检查，那比报错更危险。
+
+    `articles`：注入的条文字典（`{(law_id, no): article}`）。给了它就不碰法条库，
+    这让判定逻辑可以被单独测试、也可以被工具调用而不带隐式 IO。
+    """
+    issues, verified = [], []
+    if articles is None:
+        articles = load_articles()
+
+    art19 = articles.get(("labor-contract", 19))
+    art20 = articles.get(("labor-contract", 20))
+    art24 = articles.get(("labor-contract", 24))
     skipped = [f"法条库缺少「{label}」，该项未执行（不是没问题，是没查）"
                for label, art in (("劳动合同法 第十九条 试用期上限", art19),
                                   ("劳动合同法 第二十条 试用期工资", art20),
@@ -219,7 +236,10 @@ def check(text, min_conf=0.6):
         # ---- 1) 试用期时长 ----
         term_months, _term_reason = _term_months(text, sent)
         cap, cap_label = _probation_cap(term_months)
-        for m in re.finditer(r"试用期[^。；\n]{0,24}?" + _NUM + r"\s*(个月|月|年)", sent):
+        # 缺条文时整段跳过：结论要引用法条，条文都没有就不能出结论。
+        # 「缺哪条」已经由上面的 skipped 记下——静默跳过不行，编一条依据更不行。
+        for m in (re.finditer(r"试用期[^。；\n]{0,24}?" + _NUM + r"\s*(个月|月|年)", sent)
+                  if art19 else ()):
             n = _to_num(m.group(1))
             if n is None:
                 continue
@@ -286,7 +306,8 @@ def check(text, min_conf=0.6):
             break       # 一句只报一条，避免同一句里两个数字各报一次
 
         # ---- 2) 竞业限制期限 ----
-        for m in re.finditer(r"竞业限制[^。；\n]{0,40}?" + _NUM + r"\s*(年)", sent):
+        for m in (re.finditer(r"竞业限制[^。；\n]{0,40}?" + _NUM + r"\s*(年)", sent)
+                  if art24 else ()):
             n = _to_num(m.group(1))
             if n is None:
                 continue
@@ -310,7 +331,7 @@ def check(text, min_conf=0.6):
             break
 
         # ---- 3) 试用期工资比例 ----
-        for m in _SALARY_RE.finditer(sent):
+        for m in (_SALARY_RE.finditer(sent) if art20 else ()):
             if m.group(1):
                 pct = _to_num(m.group(1))
                 written = f"百分之{m.group(1)}"

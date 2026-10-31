@@ -53,9 +53,9 @@ class CapabilityRegistryTests(unittest.TestCase):
 
     def test_batch1_tools_are_registered(self):
         self.assertEqual(self.registry.names(),
-                         ("integrity.hash", "logic.check", "math.check",
-                          "matrix.match", "rules.classify", "rules.pattern",
-                          "text.regex"))
+                         ("integrity.hash", "law.cite", "logic.check",
+                          "math.check", "matrix.match", "rules.classify",
+                          "rules.pattern", "text.regex"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
@@ -491,6 +491,57 @@ class MatrixMatchToolTests(unittest.TestCase):
 
     def test_results_are_untrusted(self):
         result, _ = self._run()
+        self.assertTrue(result.untrusted)
+
+
+ART19 = {
+    "law_short": "劳动合同法", "law_name": "中华人民共和国劳动合同法",
+    "no_cn": "第十九条", "no": 19, "text": "试用期最长不得超过六个月。",
+    "chapter": "第二章", "law_status": "现行有效",
+}
+PROBATION_TEXT = "本合同的试用期为 9 个月。"
+
+
+class LawCiteToolTests(unittest.TestCase):
+    """法条比对：条文可注入，缺条文时明说「没查」。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def _run(self, **over):
+        args = {"text": PROBATION_TEXT}
+        args.update(over)
+        return run_tool(self.registry, "law.cite", args)
+
+    def test_injected_article_fires_the_check(self):
+        result, _ = self._run(articles={"labor-contract:19": ART19})
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.data["issues"]), 1)
+        self.assertEqual(result.data["issues"][0]["rule_id"], "LAW-001")
+        self.assertEqual(result.data["issues"][0]["citation"]["article"], "第十九条")
+        # 缺 art20 / art24 时另外两项本就该报「未执行」
+        self.assertEqual(len(result.data["skipped"]), 2)
+
+    def test_missing_articles_are_reported_not_silently_passed(self):
+        result, _ = self._run(articles={})
+        self.assertTrue(result.ok, "缺条文不是崩溃，也不是「没问题」")
+        self.assertEqual(tuple(result.data["issues"]), ())
+        self.assertEqual(len(result.data["skipped"]), 3)
+        self.assertEqual(len(result.warnings), 3,
+                         "「该项未执行」必须提成 warning，不能被当成已核验")
+
+    def test_loader_is_used_when_articles_are_not_injected(self):
+        result, _ = self._run()
+        self.assertTrue(result.ok, "真实法条库应可用（knowledge/laws 随仓库走）")
+        self.assertIn("issues", result.data)
+
+    def test_empty_text_is_a_failure(self):
+        result, _ = self._run(text="   ")
+        self.assertFalse(result.ok)
+        self.assertIn("为空", result.errors[0])
+
+    def test_results_are_untrusted(self):
+        result, _ = self._run(articles={"labor-contract:19": ART19})
         self.assertTrue(result.untrusted)
 
 
