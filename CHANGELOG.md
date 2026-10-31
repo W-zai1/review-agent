@@ -44,6 +44,13 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 删除 · 金标准数据（tests/）整体移出公开仓库
+
+- **文件**：`tests/`（62 个金标准文件：cases 39 + labels 23 + baseline.json，`git rm --cached` 保留本地）、`.gitignore`（`tests/*` 的 golden 例外改为整目录排除 `tests/`）、`.github/workflows/ci.yml`（移除 Golden suite 步骤）、`README.md`（目录树注释同步）
+- **改了什么**：从版本库索引移除 `tests/golden/` 全部数据（本地文件保留，不再随仓库上传）；`.gitignore` 将 `tests/*` + `!tests/golden/**` 改为整目录 `tests/` 排除；CI 去掉 `python tools/golden_eval.py` 步骤（该步骤在公开 clone 下本就因缺 `agents/` 跳过）。
+- **为什么**：用户要求去除测试数据、公开仓库只保留源码与核心文档；金标准是作者自出题集，判定基准留在本地即可。
+- **验证**：`python -m unittest discover -s checks`（cp1252 模拟 CI）→ **538 项 OK**（checks 套件不依赖 tests/golden 文件，`golden_eval.py`/`fact_promote.py` 对缺失 golden 均优雅降级）；`changelog_guard --explain` → 通过。
+
 ### 2026-10-31 · 修复 · CI 在 cp1252 控制台下因中文输出崩溃（UnicodeEncodeError）
 
 - **文件**：`review.py`、`server.py`（启动时强制 UTF-8 输出）、`.github/workflows/ci.yml`（job 级 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`）

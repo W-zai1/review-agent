@@ -49,8 +49,5 @@ jobs:
             Write-Host "tests/ has no test files in this checkout - skipped (see checks/)"
           }
 
-      - name: Golden suite (recall / false positives must not regress)
-        run: python tools/golden_eval.py
-
       - name: Changelog guard (clean tree must pass)
         run: python tools/changelog_guard.py --explain

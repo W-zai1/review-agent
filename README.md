@@ -37,7 +37,7 @@ review-agent/
 ├── README.md
 ├── VERSION                 # 版本号唯一事实源（review.py / server.py / README 都读它）
 ├── requirements.txt        # 运行时依赖（仅 pyyaml；PDF/OCR 为可选增强）
-├── .github/workflows/ci.yml # CI：公开不变量 + 金标准（tests/ 不入库时不会假装跑过）
+├── .github/workflows/ci.yml # CI：公开不变量（checks/）；tests/ 已整体不入库
 ├── checks/                 # 可公开的最小不变量集（法条分档/覆盖率/控制台安全/版本）
 ├── CHANGELOG.md            # 改动流水：每次增删改逐条登记（想查"谁动了哪一处"看这里）
 ├── .githooks/pre-commit    # 提交前调用 changelog_guard，漏登记就拦（core.hooksPath 指向它）
