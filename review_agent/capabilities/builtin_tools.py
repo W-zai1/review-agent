@@ -20,6 +20,7 @@ docx 要解压、检索要读索引）留到批次 2，理由与迁移批次表�
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -234,9 +235,91 @@ class PatternScanTool(BaseTool):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class TextRegexArgs:
+    """隐形字符剥离 + 正则匹配。坐标一律给**原文**偏移。"""
+
+    text: str
+    pattern: str
+    ignore_case: bool = False
+    multiline: bool = False
+    max_matches: int = 50
+
+
+class TextRegexTool(BaseTool):
+    """在文本里按正则找匹配，匹配前先剥掉零宽/不可见字符。
+
+    为什么必须先剥离：复制粘贴来的合同里常混零宽字符，会让「市场占有率」
+    这类关键词整段失配——「明明写了却没查出来」比报错更难发现。
+
+    为什么坐标要映射回原文：证据要能回查原句。清洗后的偏移直接拿去切原文会错位
+    （少掉几个零宽字符），所以命中的 `start` / `end` 是**原文**下标。
+    """
+
+    name = "text.regex"
+    description = ("按正则扫描文本；扫描前剥离零宽/不可见字符（\\u200b 等），"
+                   "返回原文坐标下的命中片段。用于关键词、数字格式、敏感结构等确定性匹配。")
+    permission = Permission.ANALYZE
+    arguments_type = TextRegexArgs
+
+    def __init__(self, *, normalize_with_map:
+                 Callable[[str], tuple[str, list[int]]]) -> None:
+        self._normalize = normalize_with_map
+
+    async def execute(self, arguments: TextRegexArgs,
+                      context: ToolContext) -> ToolResult:
+        text = arguments.text or ""
+        if not text.strip():
+            return ToolResult.failure("text 为空：没有可匹配的内容（空输入不等于无问题）")
+        pattern = arguments.pattern or ""
+        if not pattern:
+            return ToolResult.failure("pattern 为空：没有可执行的匹配条件")
+
+        flags = 0
+        if arguments.ignore_case:
+            flags |= re.IGNORECASE
+        if arguments.multiline:
+            flags |= re.MULTILINE
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error as exc:
+            return ToolResult.failure(f"pattern 不是合法正则：{exc}")
+
+        cleaned, index_map = self._normalize(text)
+        limit = max(1, int(arguments.max_matches or 50))
+        matches: list[dict[str, Any]] = []
+        truncated = False
+        for found in compiled.finditer(cleaned):
+            if len(matches) >= limit:
+                truncated = True
+                break
+            start, end = found.start(), found.end()
+            if end <= start:                 # 零宽匹配：没有可引用的原文片段
+                continue
+            original_start = index_map[start]
+            original_end = index_map[end - 1] + 1
+            matches.append({
+                "match": found.group(0),
+                "quote": text[original_start:original_end],
+                "start": original_start,
+                "end": original_end,
+                "line": cleaned.count("\n", 0, start) + 1,
+            })
+        warnings = (f"命中超过上限 {limit} 条，已截断",) if truncated else ()
+        return ToolResult.success(
+            data={"matches": tuple(matches), "count": len(matches),
+                  "matched_on_cleaned_text": cleaned != text},
+            warnings=warnings,
+            untrusted=True,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  rule_summarize, rule_counts, sha256_bytes,
-                 pattern_scan_hits: Callable[..., tuple[int, list]]) -> tuple[BaseTool, ...]:
+                 pattern_scan_hits: Callable[..., tuple[int, list]],
+                 strip_invisible_with_map:
+                 Callable[[str], tuple[str, list[int]]],
+                 ) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
     为什么集中成一个函数：注册表怎么装配是入口的事，工具清单是能力层的事。
@@ -248,4 +331,5 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         RuleClassifyTool(summarize=rule_summarize, counts=rule_counts),
         IntegrityHashTool(sha256_bytes=sha256_bytes),
         PatternScanTool(scan_hits=pattern_scan_hits),
+        TextRegexTool(normalize_with_map=strip_invisible_with_map),
     )

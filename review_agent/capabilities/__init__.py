@@ -15,6 +15,8 @@ from .builtin_tools import (
     RuleClassifyArgs,
     RuleClassifyTool,
     TextCheckArgs,
+    TextRegexArgs,
+    TextRegexTool,
     batch1_tools,
 )
 from .semantic_ingest import (  # noqa: F401 - 能力层公共出口
@@ -45,5 +47,5 @@ __all__ = [
     "Candidate", "IngestContext", "IngestResult", "ingest_candidates",
     "IntegrityHashTool", "LogicCheckTool", "MathCheckTool", "PatternScanTool",
     "PatternScanArgs", "RuleClassifyArgs", "RuleClassifyTool", "TextCheckArgs",
-    "batch1_tools",
+    "TextRegexArgs", "TextRegexTool", "batch1_tools",
 ]

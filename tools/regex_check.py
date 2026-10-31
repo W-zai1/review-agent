@@ -53,6 +53,25 @@ def strip_invisible(text):
     return cleaned, n
 
 
+def strip_invisible_with_map(text):
+    """剥离不可见字符，并给出「清洗后位置 → 原文位置」的映射。
+
+    为什么需要映射：`strip_invisible` 只给清洗后的文本，匹配到的位置拿去切
+    原文会错位。证据必须指向**原文**的真实偏移（报告要能回查原句），
+    所以这里同时返回 `index_map`：`index_map[i]` 是 `cleaned[i]` 在原文的下标。
+
+    与 `strip_invisible` 共用同一个 `INVISIBLE_RE`：判定「什么算不可见字符」
+    只有一处，两个函数的结论不会分叉。
+    """
+    kept, index_map = [], []
+    for position, char in enumerate(text):
+        if INVISIBLE_RE.match(char):
+            continue
+        kept.append(char)
+        index_map.append(position)
+    return "".join(kept), index_map
+
+
 CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "壹": 1, "二": 2, "两": 2, "贰": 2, "三": 3,
              "叁": 3, "四": 4, "肆": 4, "五": 5, "伍": 5, "六": 6, "陆": 6, "七": 7,
              "柒": 7, "八": 8, "捌": 8, "九": 9, "玖": 9}

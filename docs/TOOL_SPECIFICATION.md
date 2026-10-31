@@ -132,13 +132,14 @@ ToolRegistry
 | `pattern_rules.py` | `rules.pattern` | READ | 声明式规则求值 |
 | `match_matrix.py` | `matrix.match` | ANALYZE | 要求对照矩阵 |
 
-**进度（2026-10-31）**：批次 1 已迁 **5 个**为独立 `BaseTool`：
+**进度（2026-10-31）**：批次 1 已迁 **6 个**为独立 `BaseTool`：
 `math.check`（← `arith_check.run_all`）、`logic.check`（← `logic_checks.run_all`）、
 `rules.classify`（← `rule_exec.summarize` / `counts`）、`integrity.hash`（← `integrity.sha256_bytes`）、
-`rules.pattern`（← 新增纯核心 `pattern_rules.scan_hits`，旧的 `scan()` 改为委托）。
+`rules.pattern`（← 新增纯核心 `pattern_rules.scan_hits`，旧的 `scan()` 改为委托）、
+`text.regex`（← 新增 `regex_check.strip_invisible_with_map`，带「清洗后位置 → 原文位置」映射）。
 实现在 `review_agent/capabilities/builtin_tools.py`，由 `review.build_capability_registry()` 装配，
-验收 `checks/test_builtin_tools.py`（36 项：真算法、三态 `rule_ids`、权限分级、审计、
-确定性，以及 `rules.pattern` 与旧 `scan()` 的**差分一致性**）。
+验收 `checks/test_builtin_tools.py`（44 项：真算法、三态 `rule_ids`、权限分级、审计、
+确定性、坐标映射，以及 `rules.pattern` 与旧 `scan()` 的**差分一致性**）。
 算法本体不复制——`capabilities` 层不许 import `tools/`（ARCHITECTURE §3 第 3 条），
 所以由 `review.py` 在装配时注入函数。
 
@@ -147,11 +148,15 @@ ToolRegistry
 返回 `(参与匹配的规则数, [命中])`，`scan()` 只负责把命中写进 Session。
 判定条件（pattern / require / guard / unless / 注释去噪 / 文档字符串去噪）仍然只有一份。
 
-其余 5 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
+`text.regex` 同理：`strip_invisible` 只返回清洗后的文本，匹配偏移拿去切原文会错位
+（少掉几个零宽字符），证据就回查不到原句。新增的 `strip_invisible_with_map` 与它
+**共用同一个 `INVISIBLE_RE`**，只是多返回一张位置映射表；工具给出的 `start` / `end`
+是原文坐标。
+
+其余 4 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
 
 | 工具 | 卡在哪 |
 | --- | --- |
-| `text.regex` | `regex_check.strip_invisible` 只返回清洗后文本，没有「清洗后位置 → 原文位置」映射；工具要在原文坐标上给证据，得先给旧实现加一个带映射的版本（属改旧代码，单独评） |
 | `text.lint` | `lint.run_lint(path)` 收的是**路径**（要读文件、跑 ruff/eslint），属有 IO |
 | `docx.format` | `run_all(info, ridset, spec)` 本身是纯的，但入参要 docx 解析产物（批次 2 的接口） |
 | `law.cite` | `check()` 内部 `law_index.load_all()`，要先改成索引注入 |

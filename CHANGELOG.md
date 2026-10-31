@@ -44,6 +44,18 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`text.regex` 工具 + 隐形字符位置映射（批次 1 达 6/10）
+
+- **文件**：`tools/regex_check.py`（新增 `strip_invisible_with_map`）、`review_agent/capabilities/builtin_tools.py`（`TextRegexTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入）、`checks/test_builtin_tools.py`（+8 项 → 44 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `regex_check.strip_invisible_with_map(text)`：剥离零宽/不可见字符，同时返回「清洗后位置 → 原文位置」的映射表。与既有的 `strip_invisible` **共用同一个 `INVISIBLE_RE`**，只是多返回一张表。
+  2. `text.regex`（ANALYZE）工具：入参 `{text, pattern, ignore_case?, multiline?, max_matches?}`，出参 `{matches, count, matched_on_cleaned_text}`，标 `untrusted=True`。
+  3. 命中坐标给的是**原文**偏移（`start` / `end`），`quote` 直接切原文——证据能回查原句，不会因为少掉几个零宽字符而错位。
+  4. 非法正则返回 `ok=False`；零宽匹配（`end <= start`）跳过（没有可引用的原文片段）；超过上限截断并给 warning。
+- **为什么**：复制粘贴来的合同里常混零宽字符，`市场占用率` 这类关键词会整段失配——「明明写了却没查出来」比报错更难发现。之前没迁这个工具，卡点就是「清洗后偏移不能直接切原文」。
+- **验证**：`python -m unittest discover -s checks` → **484 项 OK**（+8）；用例里 `市\u200b场\u200b占有率` 必须命中「市场占有率」，且 `text[start:end]` 等于 `quote`、剥掉零宽后等于原词。
+- **未做**：批次 1 还剩 4 个（`text.lint` 有文件 IO、`docx.format` 要解析产物、`law.cite` 要索引注入、`matrix.match` 要明确配置加载归属），卡点写在 TOOL_SPECIFICATION §7。
+
 ### 2026-10-31 · 新增 · 阶段 5 起步：三类对象集成测试 + 部署自检
 
 - **文件**：`checks/test_integration_objects.py`（新增 5 项）、`docs/REFACTOR_PLAN.md` §1/§7/§10/§11

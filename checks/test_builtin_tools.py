@@ -54,7 +54,7 @@ class CapabilityRegistryTests(unittest.TestCase):
     def test_batch1_tools_are_registered(self):
         self.assertEqual(self.registry.names(),
                          ("integrity.hash", "logic.check", "math.check",
-                          "rules.classify", "rules.pattern"))
+                          "rules.classify", "rules.pattern", "text.regex"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
@@ -376,6 +376,67 @@ class PatternScanToolTests(unittest.TestCase):
         else:
             self.assertFalse(result.ok)
             self.assertIn("pattern", result.errors[0])
+
+
+ZERO_WIDTH = "\u200b"
+INVISIBLE_TEXT = f"市{ZERO_WIDTH}场{ZERO_WIDTH}占有率 90%"
+
+
+class TextRegexToolTests(unittest.TestCase):
+    """隐形字符剥离 + 原文坐标映射。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def _run(self, **over):
+        args = {"text": INVISIBLE_TEXT, "pattern": "市场占有率"}
+        args.update(over)
+        return run_tool(self.registry, "text.regex", args)
+
+    def test_zero_width_chars_do_not_hide_a_match(self):
+        result, _ = self._run()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 1,
+                         "零宽字符不该让「市场占有率」整段失配")
+        self.assertTrue(result.data["matched_on_cleaned_text"])
+
+    def test_offsets_point_at_the_original_text(self):
+        result, _ = self._run()
+        match = result.data["matches"][0]
+        original = INVISIBLE_TEXT[match["start"]:match["end"]]
+        self.assertEqual(original, match["quote"], "证据必须能按偏移回查原文")
+        self.assertEqual(original.replace(ZERO_WIDTH, ""), "市场占有率")
+        self.assertGreater(match["end"], 5, "原文坐标要含被剥掉的零宽字符")
+
+    def test_no_match_is_an_empty_success(self):
+        result, _ = self._run(pattern="不存在的词")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 0)
+        self.assertEqual(result.warnings, ())
+
+    def test_illegal_pattern_is_a_failure(self):
+        result, _ = self._run(pattern="(")
+        self.assertFalse(result.ok)
+        self.assertIn("正则", result.errors[0])
+
+    def test_ignore_case(self):
+        result, _ = self._run(text="ABC abc", pattern="abc", ignore_case=True)
+        self.assertEqual(result.data["count"], 2)
+        result, _ = self._run(text="ABC abc", pattern="abc")
+        self.assertEqual(result.data["count"], 1)
+
+    def test_max_matches_truncates_with_warning(self):
+        result, _ = self._run(text="a a a a", pattern="a", max_matches=2)
+        self.assertEqual(result.data["count"], 2)
+        self.assertEqual(len(result.warnings), 1)
+
+    def test_empty_text_is_a_failure(self):
+        result, _ = self._run(text="   ")
+        self.assertFalse(result.ok)
+
+    def test_results_are_untrusted(self):
+        result, _ = self._run()
+        self.assertTrue(result.untrusted)
 
 
 if __name__ == "__main__":
