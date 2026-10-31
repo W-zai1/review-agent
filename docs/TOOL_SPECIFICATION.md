@@ -200,12 +200,12 @@ eslint 还是别的，只把 `ok / issues / skipped / failed` 四种状态如实
 
 ### 批次 2：有 IO / 依赖外部，后迁（接口先定，实现后换）
 
-| 模块 | 工具名 | 注意 |
-| --- | --- | --- |
-| `retrieve.py` / `law_index.py` | `knowledge.retrieve` | 索引加载要可注入（测试不读真实库） |
-| `docx_extract.py` / `ingest.py` / `ocr.py` | `document.extract` | 解析器可换；失败要给明确错误 |
-| `llm_client.py` / `llm_review.py` | `model.complete` | 属于基础设施端口，**不是**工具；工具只能通过 ModelClient 调用 |
-| `research.py` | `research.web` | 网络：白名单 + 超时 + 来源记录 |
+| 模块 | 工具名 | 注意 | 状态 |
+| --- | --- | --- | --- |
+| `retrieve.py` / `law_index.py` | `knowledge.retrieve` | 索引加载要可注入（测试不读真实库） | ✅ **已迁（2026-10-31）**：`search_articles` / `grep_facts` / `cite` 全部注入，`scope` 取 laws / facts / all。关键口径：知识库是**系统自己的资产**，结果 `untrusted=False`（与待审文档区分开）；没命中给 warning（「没命中 ≠ 没有相关规定」） |
+| `docx_extract.py` / `ingest.py` / `ocr.py` | `document.extract` | 解析器可换；失败要给明确错误 | 未迁：`docx.format` 已经能接解析产物，`document.extract` 要把 ingest/ocr 三条链路统一成「给路径 → 给结构化结果 + 明确失败」 |
+| `llm_client.py` / `llm_review.py` | `model.complete` | 属于基础设施端口，**不是**工具；工具只能通过 ModelClient 调用 | ✅ **已建端口（2026-10-31）**：`ModelClient` + `ChatClientAdapter`，见 ARCHITECTURE §9 |
+| `research.py` | `research.web` | 网络：白名单 + 超时 + 来源记录 | 未迁：联网核验是**对外副作用**，要先有白名单与来源落库 |
 
 ### 不迁（运维 / 学习闭环 / 评测，不进 Agent 工具集）
 

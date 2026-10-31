@@ -10,6 +10,8 @@ from .builtin_tools import (
     DocxFormatArgs,
     DocxFormatTool,
     IntegrityHashTool,
+    KnowledgeRetrieveArgs,
+    KnowledgeRetrieveTool,
     LawCiteArgs,
     LawCiteTool,
     LogicCheckTool,
@@ -58,4 +60,5 @@ __all__ = [
     "TextRegexArgs", "TextRegexTool", "batch1_tools",
     "MatrixMatchArgs", "MatrixMatchTool", "LawCiteArgs", "LawCiteTool",
     "DocxFormatArgs", "DocxFormatTool", "TextLintArgs", "TextLintTool",
+    "KnowledgeRetrieveArgs", "KnowledgeRetrieveTool",
 ]

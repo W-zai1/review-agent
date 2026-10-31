@@ -1863,7 +1863,10 @@ def build_capability_registry(*, on_invoke=None):
             law_load_articles=law_cite.load_articles,
             docx_format_run_all=docx_format_checks.run_all,
             docx_extract=lambda path: docx_extract.extract(path),
-            lint_run=lint.run_lint):
+            lint_run=lint.run_lint,
+            search_articles=law_index.search,
+            grep_facts=retrieve.grep_knowledge,
+            cite_article=lambda hit: law_index.citation(hit, max_chars=400)):
         registry.register(tool)
     return registry
 

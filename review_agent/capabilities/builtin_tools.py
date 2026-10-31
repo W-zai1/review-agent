@@ -557,6 +557,73 @@ class TextLintTool(BaseTool):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class KnowledgeRetrieveArgs:
+    """知识库检索：法条与事实库分开取，`scope` 决定取哪一边。"""
+
+    query: str
+    top_n: int = 5
+    scope: str = "laws"          # laws / facts / all
+
+
+class KnowledgeRetrieveTool(BaseTool):
+    """按关键词检索法条与事实库。
+
+    与「审材料」的工具有一个关键区别：**知识库是系统自己的资产，不是待审文档**，
+    所以结果 `untrusted=False`。把两者混为一谈，会让「知识库里的某句话」
+    被当成「材料作者试图影响审查」的证据。
+
+    检索不到时不能说「没有问题」：知识库里没有命中，与「法律上没有规定」
+    是两件事，所以给一条 warning。
+    """
+
+    name = "knowledge.retrieve"
+    description = ("按关键词检索法条库与事实库，返回带条号定位的条目。"
+                   "scope 取 laws / facts / all。用于给结论找依据，不用于判定。")
+    permission = Permission.READ
+    arguments_type = KnowledgeRetrieveArgs
+
+    def __init__(self, *,
+                 search_articles: Callable[..., list[dict[str, Any]]],
+                 grep_facts: Callable[[str], list[dict[str, Any]]],
+                 cite: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+                 ) -> None:
+        self._search = search_articles
+        self._grep = grep_facts
+        self._cite = cite
+
+    async def execute(self, arguments: KnowledgeRetrieveArgs,
+                      context: ToolContext) -> ToolResult:
+        query = (arguments.query or "").strip()
+        if not query:
+            return ToolResult.failure("query 为空：没有检索条件")
+        scope = (arguments.scope or "laws").strip()
+        if scope not in {"laws", "facts", "all"}:
+            return ToolResult.failure(
+                f"scope 非法：{scope!r}（只能是 laws / facts / all）")
+        top_n = max(1, int(arguments.top_n or 5))
+
+        articles: tuple[dict[str, Any], ...] = ()
+        if scope in {"laws", "all"}:
+            hits = self._search(query, top_n) or []
+            articles = tuple(
+                (dict(hit, citation=self._cite(hit)) if self._cite else dict(hit))
+                for hit in hits)
+        facts: tuple[dict[str, Any], ...] = ()
+        if scope in {"facts", "all"}:
+            facts = tuple(dict(item) for item in (self._grep(query) or []))
+
+        warnings = ()
+        if not articles and not facts:
+            # 「知识库没命中」≠「法律没规定」：这是最容易把检索当结论的地方
+            warnings = ("知识库没有命中：这不等于「没有相关规定」，可能只是关键词不匹配",)
+        return ToolResult.success(
+            data={"articles": articles, "facts": facts,
+                  "count": len(articles) + len(facts), "scope": scope},
+            warnings=warnings,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  rule_summarize, rule_counts, sha256_bytes,
                  pattern_scan_hits: Callable[..., tuple[int, list]],
@@ -569,6 +636,9 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  docx_format_run_all: Callable[..., list[dict[str, Any]]],
                  docx_extract: Callable[[str], dict[str, Any]],
                  lint_run: Callable[[str], dict[str, Any]],
+                 search_articles: Callable[..., list[dict[str, Any]]],
+                 grep_facts: Callable[[str], list[dict[str, Any]]],
+                 cite_article: Callable[[dict[str, Any]], dict[str, Any]],
                  ) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
@@ -586,4 +656,6 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         LawCiteTool(check=law_check, load_articles=law_load_articles),
         DocxFormatTool(run_all=docx_format_run_all, extract=docx_extract),
         TextLintTool(run_lint=lint_run),
+        KnowledgeRetrieveTool(search_articles=search_articles,
+                              grep_facts=grep_facts, cite=cite_article),
     )

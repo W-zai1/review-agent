@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`knowledge.retrieve`（批次 2 第一项，工具总数 11）
+
+- **文件**：`review_agent/capabilities/builtin_tools.py`（`KnowledgeRetrieveTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `law_index.search` / `retrieve.grep_knowledge` / `law_index.citation`）、`checks/test_builtin_tools.py`（+6 项 → 72 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `knowledge.retrieve`（**READ**）：入参 `{query, top_n, scope}`，`scope` 取 `laws` / `facts` / `all`，返回带条号引用的法条与事实库命中。
+  2. 三条链路全部注入：`search_articles` / `grep_facts` / `cite`。工具不 import `law_index` / `retrieve`，所以「索引加载」这件事留在装配层。
+  3. 两个口径被写进代码注释：**知识库是系统自己的资产** → `untrusted=False`（与待审文档区分）；**没命中 ≠ 没有相关规定** → 给 warning 而不是静默返回空。
+- **为什么**：批次 2 的 `knowledge.retrieve` 是「给结论找依据」的入口。它和审查类工具的性质不同——输入是查询词，输出是系统资产，不是材料内容；混为一谈会让「知识库里的某句话」被误当成材料作者的意图。
+- **验证**：`python -m unittest discover -s checks` → **526 项 OK**（+6）。用例覆盖「法条命中带 citation」「facts scope 走 grep」「空查询/非法 scope 失败」「没命中给 warning」「结果不是 untrusted」。
+- **未做**：批次 2 还剩 `document.extract`（要统一 ingest / ocr 三条链路）与 `research.web`（要白名单 + 来源落库）。
+
 ### 2026-10-31 · 新增 · 阶段 3 收口：`docx.format` / `text.lint`，批次 1 达 10/10
 
 - **文件**：`review_agent/capabilities/builtin_tools.py`（`DocxFormatTool` / `TextLintTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `docx_format_checks.run_all` / `docx_extract.extract` / `lint.run_lint`）、`checks/test_builtin_tools.py`（+12 项 → 66 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

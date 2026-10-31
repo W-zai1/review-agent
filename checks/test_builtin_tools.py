@@ -54,10 +54,10 @@ class CapabilityRegistryTests(unittest.TestCase):
 
     def test_batch1_tools_are_registered(self):
         self.assertEqual(self.registry.names(),
-                         ("docx.format", "integrity.hash", "law.cite",
-                          "logic.check", "math.check", "matrix.match",
-                          "rules.classify", "rules.pattern", "text.lint",
-                          "text.regex"))
+                         ("docx.format", "integrity.hash", "knowledge.retrieve",
+                          "law.cite", "logic.check", "math.check",
+                          "matrix.match", "rules.classify", "rules.pattern",
+                          "text.lint", "text.regex"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
@@ -671,6 +671,51 @@ class TextLintToolTests(unittest.TestCase):
         path.write_text("x = 1\n", encoding="utf-8")
         result, _ = self._run(path=str(path))
         self.assertTrue(result.untrusted)
+
+
+class KnowledgeRetrieveToolTests(unittest.TestCase):
+    """知识库检索：取到的是**系统自己的资产**，不是待审文档。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def _run(self, **args):
+        return run_tool(self.registry, "knowledge.retrieve", args)
+
+    def test_law_search_is_cited(self):
+        result, _ = self._run(query="竞业限制", top_n=3)
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(result.data["count"], 1)
+        article = result.data["articles"][0]
+        self.assertIn("citation", article, "法条命中必须带可引用的定位")
+
+    def test_facts_scope_uses_the_grep(self):
+        result, _ = self._run(query="营收", scope="facts")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["articles"], ())
+        self.assertEqual(result.data["scope"], "facts")
+
+    def test_empty_query_is_a_failure(self):
+        result, _ = self._run(query="   ")
+        self.assertFalse(result.ok)
+        self.assertIn("query", result.errors[0])
+
+    def test_illegal_scope_is_a_failure(self):
+        result, _ = self._run(query="合同", scope="everything")
+        self.assertFalse(result.ok)
+        self.assertIn("scope", result.errors[0])
+
+    def test_no_hit_is_a_warning_not_a_conclusion(self):
+        result, _ = self._run(query="完全不存在的词条zzz", scope="laws")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 0)
+        self.assertEqual(len(result.warnings), 1,
+                         "没命中 ≠ 没有相关规定，必须说出来")
+
+    def test_knowledge_base_results_are_not_untrusted(self):
+        result, _ = self._run(query="竞业限制", top_n=1)
+        self.assertFalse(result.untrusted,
+                         "知识库是系统自己的资产，不该被当成待审文档的内容")
 
 
 if __name__ == "__main__":
