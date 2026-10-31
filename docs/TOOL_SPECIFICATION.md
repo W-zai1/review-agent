@@ -228,10 +228,23 @@ eslint 还是别的，只把 `ok / issues / skipped / failed` 四种状态如实
 
 ## 9. 命名与「禁止重复实现」
 
-* 一个能力一个工具；名字表达「对象.动作」（`law.cite`、`docx.format`）。
+* 一个能力一个工具；名字表达「对象·动作」（`law.cite`、`docx.format`）。
 * 注册表拒绝同名重复注册（`DuplicateToolError`）。新增工具前先 `registry.describe()` 查一遍，
-  再在 `tools/` 里搜同类实现——旧系统同一件事最多有 3 个实现（见盘点 §5 重名函数表）。
+  再在 `tools/` 里搜同类实现。
 * 别名只是迁移期兼容，不允许长期存在两套同名能力。
+
+**「盘点 §5 的重名」到底是不是重复实现（2026-10-31 复核）**：不是。用
+`python tools/dup_audit.py` 比**函数体**（去掉 docstring、忽略缩进，≥3 条语句才算），
+27 个 `main`、6 个 `summarize`、4 个 `load_config` 全都「同名不同物」——它们只是
+都叫 `main` 的 CLI 入口、都叫 `summarize` 的不同汇总口径。真正的重复只有两处：
+
+| 重复 | 现状 |
+| --- | --- |
+| `_location`（`issue_codec` / `legacy_report`） | ✅ **已合并**：统一为 `issue_codec.location_from_label`，`legacy_report` 改为 import。两个适配器都从旧报告读「第 N 句」，抄两份那天起就不再是唯一口径 |
+| `run_all`（`arith_check` / `logic_checks`） | **登记为已知形态**：结构相同、只差各自的 `CHECKS` 常量（同形不同数据）。合并要改两边的模块级常量，收益低、回归面大，这一轮不做 |
+
+这条约束现在有测试守着：`checks/test_dup_audit.py` 断言「`review_agent/` 内部零重复」
+「`review_agent/` 与 `tools/` 之间零重复」，并允许旧 `tools/` 内部已登记的形态。
 
 ## 10. 测试要求
 

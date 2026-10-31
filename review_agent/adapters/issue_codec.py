@@ -122,7 +122,7 @@ def _basis(raw: Any) -> ConfidenceBasis | None:
         return None
 
 
-def _location(raw: Any) -> Location:
+def location_from_label(raw: Any) -> Location:
     label = str(raw or "").strip() or "未定位"
     m = _SENTENCE_RE.search(label)
     return Location(label=label, sentence=int(m.group(1)) if m else None)
@@ -201,7 +201,7 @@ def encode_issue(raw: Mapping[str, Any], *, run_id: str) -> EncodedIssue:
         finding = Finding(
             id=raw_id, run_id=run_id, dimension=dimension, severity=severity,
             quote=str(raw.get("quote") or ""),
-            location=_location(raw.get("location")),
+            location=location_from_label(raw.get("location")),
             confidence=confidence, origin=origin, rule=rule,
             statement=str(raw.get("evidence") or ""),
             confidence_basis=basis, status=status,

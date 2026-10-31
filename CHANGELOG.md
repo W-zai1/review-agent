@@ -44,6 +44,19 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3 收口：重复实现审计 + `_location` 合并
+
+- **文件**：`tools/dup_audit.py`（新增）、`checks/test_dup_audit.py`（新增 5 项）、`review_agent/adapters/issue_codec.py`（`_location` → `location_from_label`）、`review_agent/adapters/legacy_report.py`（改为 import）、`docs/TOOL_SPECIFICATION.md` §9、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `tools/dup_audit.py`：比**函数体**（去 docstring、忽略缩进、≥3 条语句）而不是名字。`python tools/dup_audit.py` 输出同名分组与「函数体逐字相同」的候选重复。
+  2. 复核结论：盘点 §5 的 27 个 `main` / 6 个 `summarize` / 4 个 `load_config` **都不是重复实现**——同名不同物。真重复只有两处：
+     - `_location`（`issue_codec` / `legacy_report`）：**已合并**为 `issue_codec.location_from_label`，`legacy_report` 改成 import。
+     - `run_all`（`arith_check` / `logic_checks`）：同形不同数据（只差各自的 `CHECKS` 常量），登记为已知形态，这一轮不合并。
+  3. `checks/test_dup_audit.py`：断言「`review_agent/` 内部零重复」「`review_agent/` 与 `tools/` 之间零重复」，并只允许旧 `tools/` 内部的已登记形态；新增未登记重复会直接失败。
+- **为什么**：`_location` 是**新包自己复制自己**——两个适配器都从旧报告读「第 N 句」，抄两份之后只要有一个改了正则，两边解析出来的 `Location` 就会不一致，而这种偏差不会报错、只会让证据定位悄悄错位。
+- **验证**：`python -m unittest discover -s checks` → **538 项 OK**（+5）；`python tools/dup_audit.py` → 仅剩 `run_all` 一处已登记形态。
+- **过程中的坑**：用 PowerShell 批量替换时把 UTF-8 BOM 写进了 `.py`，`ast.parse` 直接炸（`invalid non-printable character U+FEFF`），架构守卫用例当场抓到。改回无 BOM 后全绿——顺手证明了那条守卫不是摆设。
+
 ### 2026-10-31 · 新增 · 阶段 3：`document.extract`（批次 2 第二项，工具总数 12）
 
 - **文件**：`review_agent/capabilities/builtin_tools.py`（`DocumentExtractTool`）、`review_agent/capabilities/__init__.py`、`review.py`（`import ingest` + 注入 `ingest.ingest_file`）、`checks/test_builtin_tools.py`（+7 项 → 79 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

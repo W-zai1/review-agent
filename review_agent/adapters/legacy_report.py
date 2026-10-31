@@ -64,6 +64,9 @@ from ..domain import (                                # noqa: F401 - 边界层�
     ids,
 )
 from ..profiles import resolve_profile
+# 「第 N 句」→ Location 的解析只留一份（`issue_codec.location_from_label`）。
+# 两个适配器都从旧报告里读 location 字符串；抄两份的那天起就不再有唯一口径。
+from .issue_codec import location_from_label
 
 # 被真正消费（进入领域对象）的顶层键；其余全部原样进 extra。
 CONSUMED_KEYS = frozenset({
@@ -204,10 +207,6 @@ def _coverage(report: Mapping[str, Any]) -> Coverage | None:
     )
 
 
-def _location(raw: Any) -> Location:
-    label = str(raw or "").strip() or "未定位"
-    m = _SENTENCE_RE.search(label)
-    return Location(label=label, sentence=int(m.group(1)) if m else None)
 
 
 def _severity(raw: Any, finding_id: str, warnings: list[str]) -> Severity:
@@ -295,7 +294,7 @@ def _parse_issue(raw: Mapping[str, Any], run_id: str, text: str, created_at,
         next_evidence[0] += 1
         evidence = Evidence(
             id=ev_id, run_id=run_id, kind=EvidenceKind.QUOTE, quote=quote,
-            location=_location(raw.get("location")),
+            location=location_from_label(raw.get("location")),
             verification=verification, verified_by=verified_by,
             created_at=created_at, finding_ids=(raw_id,),
         )
@@ -306,7 +305,7 @@ def _parse_issue(raw: Mapping[str, Any], run_id: str, text: str, created_at,
 
     finding = Finding(
         id=raw_id, run_id=run_id, dimension=dimension, severity=severity,
-        quote=quote, location=_location(raw.get("location")),
+        quote=quote, location=location_from_label(raw.get("location")),
         confidence=confidence, origin=_origin(raw), rule=rule,
         statement=str(raw.get("evidence") or ""),
         confidence_basis=_basis(raw.get("confidence_basis")),
