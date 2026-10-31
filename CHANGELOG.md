@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 5 起步：三类对象集成测试 + 部署自检
+
+- **文件**：`checks/test_integration_objects.py`（新增 5 项）、`docs/REFACTOR_PLAN.md` §1/§7/§10/§11
+- **改了什么**：
+  1. 集成用例现场造三类目标（txt / `.py` 代码 / 用 `zipfile` 手写的最小 docx），用**真实** `run_one` 跑，断言「出报告、报告落盘、裁定在合法档位、问题能追溯到规则」。
+  2. txt 用例盯的是确定性信号：分项 360+210+480=1050 与「加总 1080」的矛盾必须命中 `LOGIC-001`，且证据里能读到 1050——这是「结论不依赖模型」的可执行证据。
+  3. 部署自检：`start-console.bat --check` 通过（Python / pyyaml / LLM 配置）；`python tools/integrity.py verify` 通过（链完整 + **219 份**报告自洽）。
+- **为什么**：单元测试证明「每个零件是对的」，集成测试才证明「拼起来能出结论」。阶段 5 的验收要求「全量 checks + golden + 双跑报告」，前两项现在都有可复现证据。
+- **验证**：`python -m unittest discover -s checks` → **476 项 OK**（+5）；`tools/integrity.py verify` exit 0 / 219 份 OK / 0 失败。
+- **未做（不装完成）**：真的起控制台进程、在浏览器里走完「建任务 → 看执行中心 → 下载报告」（要占端口，且是人工验收动作）；「在线双跑切流」需要真实使用时间，不是写代码能提前完成的。
+
 ### 2026-10-31 · 修改 · CI 修复：公开 clone 无私有资产时优雅跳过（26 用例 + golden + tests 步骤）
 
 - **文件**：`checks/test_engine_switch.py`、`checks/test_v1_integrity.py`、`checks/test_pipeline_parity.py`、`checks/test_llm_review_fn.py`、`checks/test_report_evidence.py`、`checks/test_rule_dispatch.py`、`checks/test_shadow_report.py`、`checks/test_holdout.py`（8 个文件共 26 个用例加守卫）、`tools/golden_eval.py`、`.github/workflows/ci.yml`

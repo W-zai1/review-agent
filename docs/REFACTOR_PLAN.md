@@ -18,8 +18,8 @@
 | 1 领域模型统一 | 一套对象、一套枚举、一套错误 | `review_agent/domain`、旧报告适配器、issue 编解码、错误分类 | `python -m unittest checks.test_domain_v1 checks.test_legacy_adapter checks.test_issue_codec checks.test_error_taxonomy` | **完成**（2026-10-30：对象/枚举/适配/Profile/出口闸门/错误分类均已统一） |
 | 2 执行层重构 | 阶段化、可恢复、可双跑 | Application Service、Orchestrator、六节点、Checkpoint | 双跑零未解释差异；中断恢复用例 | **收尾中**（六节点 + 编排器 + 检查点 + 状态序列化 + 影子流水线双跑 + Application / Task / Report 服务均已落地；剩在线切流） |
 | 3 能力层整理 | 工具注册表接管分发 | `BaseTool` 实现、`_h_*` 改造、重复实现清理 | 注册表工具清单 + 单工具测试 | **进行中**（分发已由 `registry.execute()` 接管；批次 1 已迁 5 个独立工具：`math.check` / `logic.check` / `rules.classify` / `integrity.hash` / `rules.pattern`；其余 5 个与 `tools/` 42 模块的逐条理由见 TOOL_SPECIFICATION §7） |
-| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **进行中**（Retry ✅；Checkpoint ✅；单节点超时 ✅；幂等键 ✅；三类故障注入 ✅ 2026-10-31；**只剩统一 AuditEvent 流**） |
-| 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | 未开始 |
+| 4 可靠性 | 重试/超时/幂等/审计单流 | 统一事件流、恢复演练、失败注入测试 | 故障注入用例全绿 | **完成**（2026-10-31：Retry ✅；Checkpoint ✅；单节点超时 ✅；幂等键 ✅；三类故障注入 ✅；统一 AuditEvent 流 ✅——`application/audit.py` 汇流，旧三个文件由事件流投影生成） |
+| 5 验证与交付 | 可评测、可部署、文档同步 | 评测集、集成测试、部署脚本、文档 | 全量 checks + golden + 双跑报告 | **进行中**（2026-10-31：集成测试 ✅ 三类对象真跑；部署自检 ✅；ledger 全量校验 ✅ 219 份；golden ✅；**「在线双跑切流」未做，那需要真实使用时间**） |
 
 ## 2. 阶段 0：冻结与盘点（已完成）
 
@@ -133,7 +133,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 | Retry | ✅ 由 `Orchestrator(max_attempts)` 统一；只有 `retryable=True` 才重试 | 由 Orchestrator 统一策略（见 AGENT_RUNTIME §7） |
 | Timeout | ✅ **2026-10-31 已加单节点超时**（`Orchestrator(timeout=...)`，超时=可重试失败）；整体兜底仍是 server 的 `--review-timeout` | 节点级超时 + 整体兜底 |
 | 幂等 | ✅ **2026-10-31**：`_write_shadow_report` 按 `(run_id, finalize)` 幂等——同一次运行第二次写报告直接返回已有文件，不重写报告/日志、不追加链记录；坏文件不算「已写过」 | `(run_id, stage)` 幂等键；重复执行不产生第二份报告 |
-| 审计 | 未做：仍是 `task.json` + `tools.jsonl` + `decisions.jsonl` 三套 | 统一 `AuditEvent` 流，旧文件由事件流生成 |
+| 审计 | ✅ **2026-10-31**：`application/audit.py` 把节点事件 / 工具 / 决策 / 检查点汇成一条 `AuditEvent` 流写 `logs/v1/<id>/events.jsonl`；旧的 `task.json` / `tools.jsonl` / `decisions.jsonl` 改为由事件流**投影**生成（内容逐字不变，UI 不用改） | 统一 `AuditEvent` 流，旧文件由事件流生成 |
 | 失败注入 | ✅ **2026-10-31**：`checks/test_failure_injection.py`（3 项）覆盖三类——模型不可用 / 写盘失败 / 进程中断 | 故障注入测试：模型超时、写盘失败、进程被杀 |
 
 验收：三类故障（模型不可用、磁盘只读、进程中断）都能给出明确错误或恢复，不允许「静默半成品」。
@@ -141,9 +141,17 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 ## 7. 阶段 5：验证与交付
 
 * 评测集：金标准（`tools/golden_eval.py`）+ 历史语料 + 新增 Profile 的对照集。
+  **现状**：golden 38 用例 / 召回 100% / 误报 0（每次 CI 跑）；历史 219 份报告
+  `integrity.py verify` 全绿；「新增 Profile 的对照集」未做。
 * 集成测试：真实 `run_one` 跑通 docx / txt / 代码三类对象。
+  **已完成（2026-10-31）**：`checks/test_integration_objects.py`（5 项）现场造三类目标，
+  真跑 `run_one`，断言「出报告 / 落到磁盘 / 裁定在合法档位 / 问题能追溯到规则」。
 * 文档同步：本组六份文档与实现对齐；删掉与现状矛盾的旧描述。
+  **进行中**：本轮已修 6 处过期口径 + 逐阶段状态同步；每加一项能力都回写本文件。
 * 部署验证：`start-console.bat` 起控制台 → 建任务 → 看执行中心 → 下载报告 → 校验 ledger。
+  **部分完成（2026-10-31）**：`start-console.bat --check` 通过（Python / pyyaml / LLM 配置
+  均 OK）；`python tools/integrity.py verify` 通过（链完整 + 219 份报告自洽）。
+  **未做**：真的起进程、在浏览器里点完整流程（那要占端口、且是人工验收动作）。
 * 交付判据：§10 七问全部有「是」的证据（测试或演示），而不是文档承诺。
 
 ## 8. 开关与回滚
@@ -174,7 +182,7 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 | 问题 | 阶段 | 证据（测试/文件） | 状态 |
 | --- | --- | --- | --- |
-| 能否追踪一次审查的完整生命周期？ | 2 | `RunState` 阶段链 + `AuditEvent`；`checks/test_domain_v1.py` | **是（运行时）**：六节点 + 编排器跑完整八阶段，检查点/状态可落盘；报告的审计导出仍由旧链路写 |
+| 能否追踪一次审查的完整生命周期？ | 2/4 | `RunState` 阶段链 + 统一 `AuditEvent` 流；`checks/test_domain_v1.py`、`checks/test_audit_stream.py` | **是**：六节点 + 编排器跑完整八阶段，检查点/状态可落盘；v1 的审计事件写入 `logs/v1/<id>/events.jsonl`，可按 `seq` 回放（跨来源无统一时钟，见 audit.py 的说明） |
 | 能否单独替换 LLM？ | 2 | `SemanticExecutor` 端口（节点层可注入执行器）+ 旧链路仍直连 `llm_client` | **部分**：新链路的语义审不直接依赖 provider；`ModelClient` 端口与「换供应商不改代码」尚未做 |
 | 能否单独测试每个审查节点？ | 2 | 每节点独立用例（固定语料） | **是**（Decision 16 + Evidence 16 + Cross 17 + Rule 17 + Semantic 21 + Document 15；另有 Planner 8、编排器 21） |
 | 能否在中断后恢复执行？ | 2/4 | Checkpoint + 杀进程恢复用例 | **是（状态层）**：`FileRunStore` 落盘 → 读回 → 从断点阶段续跑（`checks/test_state_serialization.py`）；「杀进程后自动续跑」要等 Application Service 接上读回逻辑 |
@@ -184,13 +192,13 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 ## 11. 工作量估计（人日，仅作排期参考）
 
-| 阶段 | 估计 | 现状（2026-10-30） | 主要不确定性 |
+| 阶段 | 估计 | 现状（2026-10-31） | 主要不确定性 |
 | --- | --- | --- | --- |
 | 1 收口（错误类型统一） | 1~2 | **已完成** | 旧异常散落在 server / review / tools 三处 |
-| 2 执行层（Application + 其余 5 节点 + 双跑） | 12~18 | 主体完成；剩 Task/Report 服务与在线切流 | Semantic Reviewer 的 prompt 与结果稳定性 |
-| 3 能力层（42 个工具 + 分发改造） | 6~10 | 分发已接管；工具未迁移 | 工具间的隐式依赖 |
-| 4 可靠性（checkpoint/retry/审计） | 5~8 | checkpoint / retry 有骨架；timeout / 幂等 / 审计单流未做 | 恢复语义的边界情况 |
-| 5 验证交付 | 4~6 | **未开始** | 评测集建设 |
+| 2 执行层（Application + 其余 5 节点 + 双跑） | 12~18 | **基本完成**；只剩在线切流（需要真实使用时间） | Semantic Reviewer 的 prompt 与结果稳定性 |
+| 3 能力层（42 个工具 + 分发改造） | 6~10 | 分发已接管；批次 1 迁了 5/10，其余 5 个卡点已登记 | 工具间的隐式依赖 |
+| 4 可靠性（checkpoint/retry/审计） | 5~8 | **完成**（checkpoint / retry / timeout / 幂等 / 审计单流 / 故障注入） | 恢复语义的边界情况 |
+| 5 验证交付 | 4~6 | 集成测试与部署自检已做；在线双跑与 Profile 对照集未做 | 评测集建设 |
 
 估计的前提是「单主题小步提交 + 每阶段验收通过」；并行开发会显著放大双跑比对的成本。
 
