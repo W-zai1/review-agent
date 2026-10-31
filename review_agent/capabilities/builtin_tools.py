@@ -314,11 +314,74 @@ class TextRegexTool(BaseTool):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class MatrixMatchArgs:
+    """要求侧 vs 候选侧的逐项对照。
+
+    `config` 给了就直接用（纯函数式）；不给就由注入的加载器去读配置——
+    读文件这件事留在装配层，工具本身不做 IO。
+    """
+
+    purpose_text: str
+    target_text: str
+    config: dict[str, Any] | None = None
+
+
+class MatrixMatchTool(BaseTool):
+    """把「JD / 检查清单」与「候选材料」按维度逐项对照，给出覆盖与缺口。
+
+    为什么不把「读配置」放进工具：`match_matrix.load_config()` 是文件 IO，
+    而工具应当是「给定入参就出结果」。配置由装配层注入（`review.py` 负责），
+    所以测试可以塞一份 `config`，完全不碰磁盘。
+    """
+
+    name = "matrix.match"
+    description = ("把要求侧文本（JD / 招标要求 / 检查清单）与候选侧文本按维度"
+                   "逐项对照，输出每项是满足 / 部分 / 缺失 / 超范围，以及覆盖率与缺口。"
+                   "不是「打分」：只回答「要求有没有被覆盖」。")
+    permission = Permission.ANALYZE
+    arguments_type = MatrixMatchArgs
+
+    def __init__(self, *, build: Callable[..., dict[str, Any]],
+                 load_config: Callable[[], dict[str, Any]]) -> None:
+        self._build = build
+        self._load_config = load_config
+
+    async def execute(self, arguments: MatrixMatchArgs,
+                      context: ToolContext) -> ToolResult:
+        purpose = arguments.purpose_text or ""
+        target = arguments.target_text or ""
+        if not purpose.strip():
+            return ToolResult.failure(
+                "purpose_text 为空：没有要求侧文本，逐项对照无从谈起")
+        if not target.strip():
+            return ToolResult.failure("target_text 为空：没有可对照的候选文本")
+
+        config = arguments.config
+        if config is None:
+            config = self._load_config()
+        matrix = self._build(purpose, target, config)
+        warnings: tuple[str, ...] = ()
+        if not matrix.get("available"):
+            # 「没有矩阵」不是错误（往往只是没上传要求文件），但必须说出来，
+            # 否则调用方会以为「对照过且全满足」。
+            warnings = (f"对照矩阵未生成：{matrix.get('reason') or '原因未知'}",)
+        return ToolResult.success(
+            data={"matrix": matrix,
+                  "coverage": matrix.get("coverage") or {},
+                  "available": bool(matrix.get("available"))},
+            warnings=warnings,
+            untrusted=True,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  rule_summarize, rule_counts, sha256_bytes,
                  pattern_scan_hits: Callable[..., tuple[int, list]],
                  strip_invisible_with_map:
                  Callable[[str], tuple[str, list[int]]],
+                 matrix_build: Callable[..., dict[str, Any]],
+                 matrix_load_config: Callable[[], dict[str, Any]],
                  ) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
@@ -332,4 +395,5 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         IntegrityHashTool(sha256_bytes=sha256_bytes),
         PatternScanTool(scan_hits=pattern_scan_hits),
         TextRegexTool(normalize_with_map=strip_invisible_with_map),
+        MatrixMatchTool(build=matrix_build, load_config=matrix_load_config),
     )

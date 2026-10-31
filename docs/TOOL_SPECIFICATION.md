@@ -132,14 +132,15 @@ ToolRegistry
 | `pattern_rules.py` | `rules.pattern` | READ | 声明式规则求值 |
 | `match_matrix.py` | `matrix.match` | ANALYZE | 要求对照矩阵 |
 
-**进度（2026-10-31）**：批次 1 已迁 **6 个**为独立 `BaseTool`：
+**进度（2026-10-31）**：批次 1 已迁 **7 个**为独立 `BaseTool`：
 `math.check`（← `arith_check.run_all`）、`logic.check`（← `logic_checks.run_all`）、
 `rules.classify`（← `rule_exec.summarize` / `counts`）、`integrity.hash`（← `integrity.sha256_bytes`）、
 `rules.pattern`（← 新增纯核心 `pattern_rules.scan_hits`，旧的 `scan()` 改为委托）、
-`text.regex`（← 新增 `regex_check.strip_invisible_with_map`，带「清洗后位置 → 原文位置」映射）。
+`text.regex`（← 新增 `regex_check.strip_invisible_with_map`，带「清洗后位置 → 原文位置」映射）、
+`matrix.match`（← `match_matrix.build`，配置由装配层注入）。
 实现在 `review_agent/capabilities/builtin_tools.py`，由 `review.build_capability_registry()` 装配，
-验收 `checks/test_builtin_tools.py`（44 项：真算法、三态 `rule_ids`、权限分级、审计、
-确定性、坐标映射，以及 `rules.pattern` 与旧 `scan()` 的**差分一致性**）。
+验收 `checks/test_builtin_tools.py`（49 项：真算法、三态 `rule_ids`、权限分级、审计、
+确定性、坐标映射、配置注入，以及 `rules.pattern` 与旧 `scan()` 的**差分一致性**）。
 算法本体不复制——`capabilities` 层不许 import `tools/`（ARCHITECTURE §3 第 3 条），
 所以由 `review.py` 在装配时注入函数。
 
@@ -153,14 +154,19 @@ ToolRegistry
 **共用同一个 `INVISIBLE_RE`**，只是多返回一张位置映射表；工具给出的 `start` / `end`
 是原文坐标。
 
-其余 4 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
+`matrix.match` 的卡点原本是「配置从哪来」：`build(..., cfg)` 本来就支持注入，
+但 `cfg=None` 时会自己去读 `config/match_matrix.yaml`。做法是把 `load_config`
+也当成注入项——工具拿到 `config` 就用，拿不到才让注入的加载器去读。
+另外「没有要求文件 → 没有矩阵」**不是错误**，工具返回 `ok=True` + `available=False` +
+一条 warning：不说出来的话，调用方会把「没对照过」当成「全满足」。
+
+其余 3 个**未迁**，原因逐条写在下面，不装作「批次 1 完成」：
 
 | 工具 | 卡在哪 |
 | --- | --- |
 | `text.lint` | `lint.run_lint(path)` 收的是**路径**（要读文件、跑 ruff/eslint），属有 IO |
 | `docx.format` | `run_all(info, ridset, spec)` 本身是纯的，但入参要 docx 解析产物（批次 2 的接口） |
 | `law.cite` | `check()` 内部 `law_index.load_all()`，要先改成索引注入 |
-| `matrix.match` | `build(..., cfg)` 可注入配置，但 `load_config()` 仍是文件 IO；需明确「谁负责读配置」 |
 
 `rules.classify` 与 `integrity.hash` 的权限是 **READ**——它们只查表/只算哈希，不读材料，
 不该要求 `ANALYZE`。权限收紧比放宽难，先按最小权限给。

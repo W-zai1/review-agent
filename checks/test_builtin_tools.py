@@ -54,7 +54,8 @@ class CapabilityRegistryTests(unittest.TestCase):
     def test_batch1_tools_are_registered(self):
         self.assertEqual(self.registry.names(),
                          ("integrity.hash", "logic.check", "math.check",
-                          "rules.classify", "rules.pattern", "text.regex"))
+                          "matrix.match", "rules.classify", "rules.pattern",
+                          "text.regex"))
 
     def test_describe_exposes_permission_and_arguments(self):
         described = {item["name"]: item for item in self.registry.describe()}
@@ -433,6 +434,60 @@ class TextRegexToolTests(unittest.TestCase):
     def test_empty_text_is_a_failure(self):
         result, _ = self._run(text="   ")
         self.assertFalse(result.ok)
+
+    def test_results_are_untrusted(self):
+        result, _ = self._run()
+        self.assertTrue(result.untrusted)
+
+
+PURPOSE_TEXT = (
+    "【目的文件：岗位要求】\n"
+    "1. 本科及以上学历\n"
+    "2. 三年以上相关经验\n"
+)
+CANDIDATE_TEXT = "候选人：硕士学历，五年 Python 开发经验。"
+
+
+class MatrixMatchToolTests(unittest.TestCase):
+    """要求侧 vs 候选侧的逐项对照（配置由注入的标准决定，不读磁盘）。"""
+
+    def setUp(self):
+        self.registry = review.build_capability_registry()
+
+    def _run(self, **over):
+        args = {"purpose_text": PURPOSE_TEXT, "target_text": CANDIDATE_TEXT}
+        args.update(over)
+        return run_tool(self.registry, "matrix.match", args)
+
+    def test_matrix_is_built_from_real_config(self):
+        result, _ = self._run()
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["available"])
+        coverage = result.data["coverage"]
+        self.assertGreater(coverage.get("total", 0), 0,
+                           "学历/经验两维至少应生成一项对照")
+        self.assertEqual(result.warnings, ())
+
+    def test_injected_config_wins(self):
+        """给了 config 就不该去读文件——版本号能证明用的是哪一份。"""
+        result, _ = self._run(config={"version": "v-injected", "max_items": 10,
+                                      "dims": []})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["matrix"]["config_version"], "v-injected")
+
+    def test_missing_purpose_is_reported_not_faked(self):
+        result, _ = self._run(purpose_text="这是一段没有要求块标记的普通文本")
+        self.assertTrue(result.ok, "没有要求文件不是错误")
+        self.assertFalse(result.data["available"])
+        self.assertEqual(len(result.warnings), 1,
+                         "「没对照过」必须说出来，否则会被当成「全满足」")
+
+    def test_empty_inputs_are_failures(self):
+        for field in ("purpose_text", "target_text"):
+            with self.subTest(field=field):
+                result, _ = self._run(**{field: "   "})
+                self.assertFalse(result.ok)
+                self.assertIn("为空", result.errors[0])
 
     def test_results_are_untrusted(self):
         result, _ = self._run()

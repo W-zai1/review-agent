@@ -1856,7 +1856,9 @@ def build_capability_registry(*, on_invoke=None):
             rule_counts=rule_exec.counts,
             sha256_bytes=integrity.sha256_bytes,
             pattern_scan_hits=pattern_rules.scan_hits,
-            strip_invisible_with_map=regex_check.strip_invisible_with_map):
+            strip_invisible_with_map=regex_check.strip_invisible_with_map,
+            matrix_build=match_matrix.build,
+            matrix_load_config=match_matrix.load_config):
         registry.register(tool)
     return registry
 

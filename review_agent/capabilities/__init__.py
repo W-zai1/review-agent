@@ -10,6 +10,8 @@ from .builtin_tools import (
     IntegrityHashTool,
     LogicCheckTool,
     MathCheckTool,
+    MatrixMatchArgs,
+    MatrixMatchTool,
     PatternScanTool,
     PatternScanArgs,
     RuleClassifyArgs,
@@ -48,4 +50,5 @@ __all__ = [
     "IntegrityHashTool", "LogicCheckTool", "MathCheckTool", "PatternScanTool",
     "PatternScanArgs", "RuleClassifyArgs", "RuleClassifyTool", "TextCheckArgs",
     "TextRegexArgs", "TextRegexTool", "batch1_tools",
+    "MatrixMatchArgs", "MatrixMatchTool",
 ]

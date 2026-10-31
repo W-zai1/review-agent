@@ -44,6 +44,18 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`matrix.match` 工具（批次 1 达 7/10）
+
+- **文件**：`review_agent/capabilities/builtin_tools.py`（`MatrixMatchTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `match_matrix.build` / `load_config`）、`checks/test_builtin_tools.py`（+5 项 → 49 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `matrix.match`（ANALYZE）工具：入参 `{purpose_text, target_text, config?}`，出参 `{matrix, coverage, available}`，标 `untrusted=True`。
+  2. 配置归属写死：**给了 `config` 就直接用**（纯函数式），不给才让注入的 `load_config()` 去读文件。读配置文件是装配层的活，工具不做 IO。
+  3. 「没有要求文件 → 没有矩阵」**不是错误**：返回 `ok=True` + `available=False` + 一条 warning。不说出来的话，调用方会把「没对照过」当成「全满足」。
+  4. 两个输入都为空时直接失败（`purpose_text` / `target_text` 各自报「为空」）。
+- **为什么**：`match_matrix.build(..., cfg)` 本来就支持注入，卡点只是「`cfg=None` 时会自己读文件」。把加载器也做成注入项之后，这个工具就没有隐式 IO 了。
+- **验证**：`python -m unittest discover -s checks` → **503 项 OK**（+5）。用例覆盖「真配置下学历/经验至少生成一项对照」「显式 `config` 的版本号能证明没去读文件」「没有要求块时 `available=False` 且给 warning」「空输入失败」。
+- **未做**：批次 1 还剩 3 个（`text.lint` 有文件 IO、`docx.format` 要解析产物、`law.cite` 要索引注入），卡点写在 TOOL_SPECIFICATION §7。
+
 ### 2026-10-31 · 新增 · `ModelClient` 端口：七问里最后一个「部分」转「是」
 
 - **文件**：`review_agent/domain/ports.py`（`ModelReply` + `ModelClient`）、`review_agent/domain/__init__.py`、`review_agent/adapters/model.py`（新增：`ChatClientAdapter` / `as_model_client` / `settings_for` / `ModelClientSettings`）、`review.py`（`make_llm_review_fn(..., model_client=...)`，真实供应商也走适配器）、`checks/test_model_client.py`（新增 14 项）、`checks/test_llm_review_fn.py`（假客户端改为满足端口）、`docs/ARCHITECTURE.md` §9、`docs/REFACTOR_PLAN.md` §10
