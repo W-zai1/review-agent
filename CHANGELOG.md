@@ -44,6 +44,17 @@
 
 # 2026-10-31
 
+### 2026-10-31 · 新增 · 阶段 3：`document.extract`（批次 2 第二项，工具总数 12）
+
+- **文件**：`review_agent/capabilities/builtin_tools.py`（`DocumentExtractTool`）、`review_agent/capabilities/__init__.py`、`review.py`（`import ingest` + 注入 `ingest.ingest_file`）、`checks/test_builtin_tools.py`（+7 项 → 79 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1
+- **改了什么**：
+  1. `document.extract`（READ）：入参 `{path, work_dir?}`，调用注入的 `ingest_file`，返回 `{kind, text, meta, outputs, chars}`。覆盖 txt / pdf / docx / 图片 / 压缩包。
+  2. **与 `knowledge.retrieve` 相反的口径**：这里抽出来的是**待审材料**，所以 `untrusted=True`；知识库那边是系统资产，`untrusted=False`。两者都写进了注释——被审对象零信任、自家资产不冒充外部输入。
+  3. 失败三分：调用抛异常 → 「材料解析失败」；`ok=False` → 带出 `reason`；`meta.warnings` → 提成 `ToolResult.warnings`。
+- **为什么**：`document.extract` 是 Agent 拿到材料的第一步。之前这条链路散在 `read_target_text`（文本/docx）与 `ingest`（pdf/图片/zip）两处，工具化之后「给路径 → 给结构化结果 + 明确失败」只有一个入口。
+- **验证**：`python -m unittest discover -s checks` → **533 项 OK**（+7）。用例覆盖「真 txt 提取」「真 docx 提取」「文件缺失给明确错误」「解析器返回 `ok=False` 时带出 reason」「meta 告警变成 warnings」「抽出的内容必须是 untrusted」。
+- **未做**：批次 2 只剩 `research.web`（联网核验要白名单 + 来源落库，是对外副作用，不适合在没有审计出口前接）。
+
 ### 2026-10-31 · 新增 · 阶段 3：`knowledge.retrieve`（批次 2 第一项，工具总数 11）
 
 - **文件**：`review_agent/capabilities/builtin_tools.py`（`KnowledgeRetrieveTool`）、`review_agent/capabilities/__init__.py`、`review.py`（注入 `law_index.search` / `retrieve.grep_knowledge` / `law_index.citation`）、`checks/test_builtin_tools.py`（+6 项 → 72 项）、`docs/TOOL_SPECIFICATION.md` §7、`docs/REFACTOR_PLAN.md` §1

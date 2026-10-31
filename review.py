@@ -44,6 +44,7 @@ import law_cite
 import fact_gap
 import lint
 import integrity
+import ingest
 import llm_client
 import llm_review
 import remediation
@@ -1866,7 +1867,8 @@ def build_capability_registry(*, on_invoke=None):
             lint_run=lint.run_lint,
             search_articles=law_index.search,
             grep_facts=retrieve.grep_knowledge,
-            cite_article=lambda hit: law_index.citation(hit, max_chars=400)):
+            cite_article=lambda hit: law_index.citation(hit, max_chars=400),
+            ingest_file=ingest.ingest_file):
         registry.register(tool)
     return registry
 

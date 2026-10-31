@@ -9,6 +9,8 @@ from __future__ import annotations
 from .builtin_tools import (
     DocxFormatArgs,
     DocxFormatTool,
+    DocumentExtractArgs,
+    DocumentExtractTool,
     IntegrityHashTool,
     KnowledgeRetrieveArgs,
     KnowledgeRetrieveTool,
@@ -61,4 +63,5 @@ __all__ = [
     "MatrixMatchArgs", "MatrixMatchTool", "LawCiteArgs", "LawCiteTool",
     "DocxFormatArgs", "DocxFormatTool", "TextLintArgs", "TextLintTool",
     "KnowledgeRetrieveArgs", "KnowledgeRetrieveTool",
+    "DocumentExtractArgs", "DocumentExtractTool",
 ]

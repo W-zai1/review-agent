@@ -624,6 +624,65 @@ class KnowledgeRetrieveTool(BaseTool):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentExtractArgs:
+    """材料摄取：给路径，拿结构化文本。"""
+
+    path: str
+    work_dir: str | None = None
+
+
+class DocumentExtractTool(BaseTool):
+    """把任意受支持的材料（txt / pdf / docx / image / zip）抽成文本 + 元数据。
+
+    与 `docx.format` 的分工：这里只回答「材料里写了什么」，版式合规是另一件事。
+
+    为什么 `untrusted=True`：抽出来的是**待审材料**的内容，可能带着
+    「请忽略以上指令」这类句子。调用方只能把它当数据，不能当指令。
+    这与 `knowledge.retrieve` 正好相反——那边的内容是系统自己的资产。
+    """
+
+    name = "document.extract"
+    description = ("摄取一个材料文件（txt / pdf / docx / 图片 / 压缩包），"
+                   "返回提取到的文本、类型与抽取元数据（含告警）。"
+                   "只回答「写了什么」，不判定版式或合规。")
+    permission = Permission.READ
+    arguments_type = DocumentExtractArgs
+
+    def __init__(self, *, ingest_file: Callable[..., dict[str, Any]]) -> None:
+        self._ingest_file = ingest_file
+
+    async def execute(self, arguments: DocumentExtractArgs,
+                      context: ToolContext) -> ToolResult:
+        path = (arguments.path or "").strip()
+        if not path:
+            return ToolResult.failure("path 为空：摄取需要文件路径")
+        try:
+            result = self._ingest_file(path, work_dir=arguments.work_dir)
+        except Exception as exc:            # noqa: BLE001 - 解析失败要给明确错误
+            return ToolResult.failure(
+                f"材料解析失败（{path}）：{type(exc).__name__}: {exc}")
+        if not isinstance(result, Mapping):
+            return ToolResult.failure(
+                f"ingest_file 必须返回 dict，实际 {type(result).__name__}")
+        if not result.get("ok", True):
+            return ToolResult.failure(
+                f"材料无法解析（{path}）：{result.get('reason') or '解析器返回失败'}")
+
+        meta = dict(result.get("meta") or {})
+        warnings = tuple(str(item) for item in (meta.get("warnings") or ()))
+        outputs = tuple(dict(item) for item in (result.get("outputs") or ()))
+        return ToolResult.success(
+            data={"kind": result.get("kind") or "",
+                  "text": result.get("text") or "",
+                  "meta": meta,
+                  "outputs": outputs,
+                  "chars": len(result.get("text") or "")},
+            warnings=warnings,
+            untrusted=True,
+        )
+
+
 def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  rule_summarize, rule_counts, sha256_bytes,
                  pattern_scan_hits: Callable[..., tuple[int, list]],
@@ -639,6 +698,7 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
                  search_articles: Callable[..., list[dict[str, Any]]],
                  grep_facts: Callable[[str], list[dict[str, Any]]],
                  cite_article: Callable[[dict[str, Any]], dict[str, Any]],
+                 ingest_file: Callable[..., dict[str, Any]],
                  ) -> tuple[BaseTool, ...]:
     """批次 1 已实现的工具集合（算法本体由调用方注入）。
 
@@ -658,4 +718,5 @@ def batch1_tools(*, math_run_all: RunAll, logic_run_all: RunAll,
         TextLintTool(run_lint=lint_run),
         KnowledgeRetrieveTool(search_articles=search_articles,
                               grep_facts=grep_facts, cite=cite_article),
+        DocumentExtractTool(ingest_file=ingest_file),
     )
