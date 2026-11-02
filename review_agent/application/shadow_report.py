@@ -70,6 +70,30 @@ def _coverage(state: RunState) -> dict[str, Any]:
         "analysis": artifacts.get("analysis_stats"),
         "semantic": (artifacts.get("semantic_stats") or {}).get("coverage"),
     }
+    semantic = coverage.get("semantic")
+    if isinstance(semantic, Mapping):
+        coverage["chars_reviewed"] = semantic.get("chars_reviewed", len(text))
+        coverage["text_coverage_pct"] = semantic.get(
+            "text_coverage_pct", 100 if text else 100)
+        coverage["complete"] = bool(semantic.get("complete", True))
+        coverage["chunks_attempted"] = semantic.get("chunks_attempted", 1)
+        coverage["chunks_succeeded"] = semantic.get("chunks_succeeded", 1)
+        coverage["input_truncated_dimensions"] = list(
+            semantic.get("input_truncated_dimensions") or ())
+        coverage["output_truncated_dimensions"] = list(
+            semantic.get("output_truncated_dimensions") or ())
+    else:
+        # 纯规则模式：没有语义审，不把「没调用模型」误读成覆盖不足。
+        coverage["chars_reviewed"] = len(text)
+        coverage["text_coverage_pct"] = 100 if text else 100
+        coverage["complete"] = True
+        coverage["chunks_attempted"] = 0
+        coverage["chunks_succeeded"] = 0
+        coverage["input_truncated_dimensions"] = []
+        coverage["output_truncated_dimensions"] = []
+    meta = state.artifacts.get("target_meta") or {}
+    if isinstance(meta, Mapping) and meta.get("source"):
+        coverage["source"] = meta.get("source")
     evidence_dropped = artifacts.get("evidence_dropped") or ()
     coverage["evidence_dropped"] = len(tuple(evidence_dropped))
     return coverage
@@ -84,7 +108,10 @@ def _limitations(state: RunState, *, coverage: Mapping[str, Any],
                  logs_hash: str | None,
                  law_library: Mapping[str, Any] | None = None,
                  research: Mapping[str, Any] | None = None,
-                 snapshot: Mapping[str, Any] | None = None) -> list[str]:
+                 snapshot: Mapping[str, Any] | None = None,
+                 scenario: Mapping[str, Any] | None = None,
+                 format_spec: Mapping[str, Any] | None = None,
+                 target_type: str | None = None) -> list[str]:
     """按「读者最需要先知道什么」排序，口径与旧报告的 limitations 对齐。
 
     旧报告的限制条目散在 run_one 里按场景拼；这里按**类别**给，规则固定：
@@ -119,6 +146,19 @@ def _limitations(state: RunState, *, coverage: Mapping[str, Any],
                          "本次未做法条级依据比对，涉及法律条款的结论仅为线索。")
     if _review_mode(state) == "rule-only":
         items.append("本次为纯规则审：未调用模型，语义类问题不在覆盖范围内")
+    if target_type == "contract":
+        items.append("合同审为关键词 + 否定语境预筛，不构成法律意见，"
+                     "需人工复核条款结构。")
+    source = coverage.get("source")
+    if isinstance(source, Mapping) and source.get("source_name"):
+        items.append(
+            f"待审文本由「{source.get('source_name')}」抽取生成"
+            f"（{source.get('kind') or '文档'}）；OCR/解析错误会改变审查对象，"
+            "关键内容请以原件为准。")
+    if scenario:
+        items.extend(str(x) for x in scenario.get("limitations") or ())
+    if format_spec:
+        items.extend(str(x) for x in format_spec.get("limitations") or ())
     # 库外核验：没做要说「没做」，做了要说「查到什么/查不到什么」。
     # 这一段以前是 `unsupported_blocks` 的一项，现在是同口径的 limitations。
     items.extend(research_limitations(research))
@@ -152,6 +192,14 @@ def build_shadow_report(
     logs_hash: str | None = None,
     law_library: Mapping[str, Any] | None = None,
     target_snapshot: Mapping[str, Any] | None = None,
+    scenario: Mapping[str, Any] | None = None,
+    format_spec: Mapping[str, Any] | None = None,
+    agent: Mapping[str, Any] | None = None,
+    active_rules: Sequence[Any] = (),
+    coverage_meta: Mapping[str, Any] | None = None,
+    target_type: str | None = None,
+    target_type_source: str | None = None,
+    rule_execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把 RunState 收敛成一份可读的影子报告（纯函数，不读文件、不看时间）。
 
@@ -167,8 +215,12 @@ def build_shadow_report(
     decision = state.decision
     meta = dict(target_meta or state.artifacts.get("target_meta") or {})
     text = state.artifacts.get("target_text") or ""
+    generated_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     snapshot = dict(target_snapshot or {}) or None
     coverage = _coverage(state)
+    if coverage_meta:
+        coverage.update(dict(coverage_meta))
+    resolved_type = target_type or meta.get("type")
     inputs = dict(integrity_inputs or {})
     # 库外核验块由 `FactCheckNode` 写进 artifacts（与旧报告同名同形）。
     # 这里不重新拼：块是**结论**，重拼就会多出一套口径。
@@ -197,9 +249,30 @@ def build_shadow_report(
         "review_id": state.review_id,
         "run_id": state.run_id,
         "review_mode": _review_mode(state),
+        "agent": dict(agent) if agent is not None else None,
+        "active_rules": list(active_rules),
+        "rule_execution": dict(rule_execution) if rule_execution is not None else None,
+        # 与 legacy 报告同形的索引字段：server 历史页/删除/排序都读它们。
+        "target_path": meta.get("path") or state.artifacts.get("target_path"),
+        "target_type": resolved_type,
+        "target_type_source": target_type_source or "auto",
+        "timestamp": generated_at,
+        "scenario": ({
+            "id": scenario["id"], "name": scenario["name"],
+            "version": scenario["version"], "desc": scenario["desc"],
+            "disabled_rules": [x["rule_id"] for x in scenario.get("skipped") or ()],
+            "disabled_detail": list(scenario.get("skipped") or ()),
+        } if scenario else None),
+        "format_spec": ({
+            "id": format_spec["id"], "name": format_spec["name"],
+            "version": format_spec["version"], "source": format_spec["source"],
+            "desc": format_spec["desc"], "criteria": format_spec["check"],
+            "disabled_rules": [x["rule_id"] for x in format_spec.get("skipped") or ()],
+            "disabled_detail": list(format_spec.get("skipped") or ()),
+        } if format_spec else None),
         "target": {
             "path": meta.get("path") or state.artifacts.get("target_path"),
-            "type": meta.get("type"),
+            "type": resolved_type,
             "type_confidence": meta.get("type_confidence"),
             "chars": meta.get("chars") or len(text),
             "hash": state.artifacts.get("target_hash"),
@@ -265,7 +338,9 @@ def build_shadow_report(
         "research": dict(research) if research is not None else None,
         "limitations": _limitations(state, coverage=coverage, logs_hash=logs_hash,
                                     law_library=law_library, research=research,
-                                    snapshot=snapshot),
+                                    snapshot=snapshot, scenario=scenario,
+                                    format_spec=format_spec,
+                                    target_type=resolved_type),
         "unsupported_blocks": [{"block": key, "reason": why}
                                for key, why in UNSUPPORTED_BLOCKS],
         "integrity": {
@@ -295,7 +370,7 @@ def build_shadow_report(
             "warnings": list(state.warnings),
             "completed_stages": [s.value for s in state.completed_stages],
         },
-        "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": generated_at,
     }
 
 

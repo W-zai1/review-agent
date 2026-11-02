@@ -59,13 +59,25 @@ class ReportService:
         self._order = tuple(name for name in order if name in self._roots)
 
     # ---- 定位 ----
+    def _ref(self, path: Path, source: str) -> ReportRef:
+        """legacy 根目录里也可能放 V1 正式报告，按报告 engine 纠正来源。"""
+        actual = source
+        if source == SOURCE_LEGACY:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("engine") == "architecture-v1":
+                    actual = SOURCE_V1
+            except (OSError, ValueError):
+                pass
+        return ReportRef(review_id=path.stem, source=actual, path=path)
+
     def locate(self, run_id: str) -> ReportRef | None:
         """按 run_id 找报告。run_id 必须是 `R-YYYYMMDD-NNN-RUNNN`。"""
         review_id, _seq = parse_run_id(run_id)
         for source in self._order:
             path = self._roots[source] / f"{review_id}.json"
             if path.is_file():
-                return ReportRef(review_id=review_id, source=source, path=path)
+                return self._ref(path, source)
         return None
 
     def locate_review(self, review_id: str) -> ReportRef | None:
@@ -73,7 +85,7 @@ class ReportService:
         for source in self._order:
             path = self._roots[source] / f"{review_id}.json"
             if path.is_file():
-                return ReportRef(review_id=review_id, source=source, path=path)
+                return self._ref(path, source)
         return None
 
     # ---- 读 ----
@@ -121,7 +133,8 @@ class ReportService:
                 if review_id in seen:
                     continue
                 seen.add(review_id)
-                row = {"review_id": review_id, "source": source,
+                ref = self._ref(path, source)
+                row = {"review_id": review_id, "source": ref.source,
                        "path": path.as_posix()}
                 row.update(self._summary(path))
                 rows.append(row)

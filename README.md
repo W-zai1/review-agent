@@ -1,7 +1,7 @@
 # 审查 Agent 项目（Demo v0.9.2）
 
 > 来源定义：`review-agent-framework.md`（已随仓库归档，审查 Agent 框架定义 v0.2，Demo 版）
-> 当前实现：v0.9.2 —— Architecture / Agent Runtime / Review Engine v1 落地：六节点 + 编排器 + 检查点、领域模型统一、工具注册表分发、影子报告与双跑比对、`--engine legacy|v1|shadow` 开关。上一版 v0.9.1 的控制台长任务超时、holdout 评测器、金标准回归判定保持有效。
+> 当前实现：v0.9.2 —— Architecture / Agent Runtime / Review Engine v1 落地：八阶段流水线、证据评估与关系图、编排器 + 检查点、领域模型统一、工具注册表分发、`--engine legacy|v1|shadow` 开关。**默认引擎已切到 `v1`**，`--engine legacy` 保留为回滚路径。
 > 定位：个人日常 / Demo。只读、独立裁判、可举证、可迭代。**跑通一次完整审查闭环**即可。
 >
 > 改动流水见 **`CHANGELOG.md`**（逐条登记增删改：文件 / 改了什么 / 为什么 / 怎么验的）。

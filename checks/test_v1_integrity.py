@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""checks/test_v1_integrity.py —— 影子报告的完整性：哈希 + 独立链。
+"""checks/test_v1_integrity.py —— V1 正式报告的完整性：哈希 + 审计链。
 
 报告是交付物，读者必须能验证「这份结论没被改过」。v1 之前没有这一层，
 是 `unsupported_blocks` 里最要命的一项（比缺 purpose 更严重：结论可被篡改而无人察觉）。
@@ -8,8 +8,8 @@
 验收四条：
     1. `integrity.report_hash` 可由文件本身复算出来（同一套 `compute_report_hash`）
     2. 改一个字段，哈希就对不上（能证伪）
-    3. `ledger/v1-chain.log` 是可校验的链：序号连续、prev 接得上
-    4. 独立成链：不污染官方 `ledger/chain.log`
+    3. `ledger/chain.log` 是可校验的链：序号连续、prev 接得上
+    4. V1 默认写官方链；影子模式才写 `ledger/v1-chain.log`
 """
 import json
 import sys
@@ -60,10 +60,10 @@ class V1ChainTests(unittest.TestCase):
             review.main()
 
     def reports(self):
-        return sorted((self.base / "outputs" / "v1").glob("*.json"))
+        return sorted((self.base / "outputs").glob("*.json"))
 
     def chain(self):
-        return self.base / "ledger" / "v1-chain.log"
+        return self.base / "ledger" / "chain.log"
 
     def test_report_hash_is_reproducible(self):
         self.run_v1()
@@ -89,10 +89,10 @@ class V1ChainTests(unittest.TestCase):
         self.assertEqual(records[1]["prev_hash"], records[0]["report_hash"])
         self.assertEqual(records[0]["engine"], "architecture-v1")
 
-    def test_official_chain_is_untouched(self):
+    def test_official_chain_is_written(self):
         self.run_v1()
-        self.assertFalse((self.base / "ledger" / "chain.log").exists(),
-                         "v1 不得写官方链")
+        self.assertTrue((self.base / "ledger" / "chain.log").exists(),
+                        "V1 默认必须写官方链")
 
     def test_integrity_block_has_all_fingerprints(self):
         self.run_v1()

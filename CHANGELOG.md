@@ -44,6 +44,17 @@
 
 # 2026-11-02
 
+### 2026-11-02 · 修改 · 默认引擎切到 V1，正式报告/控制台/进度收口
+
+- **文件**：`review.py`（`DEFAULT_ENGINE="v1"`；V1 写正式 `outputs/` 与 `ledger/chain.log`；消费 scenario / format-spec；补齐 agent、active_rules、rule_execution、coverage、open_discoveries、citation、watchlist、S1–S6 进度和 cost.json）、`server.py`（任务记录 engine=v1；历史/读取/删除/完整性/日志/恢复同时识别 V1 报告；V1 task 明细投影为控制台 steps）、`review_agent/application/reports.py`（按报告 engine 识别 V1 来源）、`review_agent/application/shadow_report.py`（V1 报告兼容字段）、`checks/test_engine_switch.py`、`checks/test_server_v1_reports.py`、`checks/test_v1_integrity.py`、`checks/test_shadow_report.py`、`docs/{AGENT_RUNTIME,V1-架构收口与整改方案}.md`、`README.md`
+- **改了什么**：
+  1. 不选引擎时默认运行八阶段 V1；`--engine legacy` 保留为回滚路径，`shadow` 仍双跑。
+  2. V1 默认报告写到正式 `outputs/`，审计链写 `ledger/chain.log`；`outputs/v1/` 与 `ledger/v1-chain.log` 留给影子/双跑。
+  3. V1 报告补齐控制台所需字段：`agent`、`active_rules`、`rule_execution`、`target_type/source`、`timestamp`、`coverage`、`open_discoveries`、LAW-001 `citation`、watchlist limitations、S1–S6 进度。
+  4. 服务端历史页/单份读取/收藏/删除/完整性/日志/任务恢复同时兼容 `outputs/` 与 `outputs/v1/`；V1 task 文件保留节点级明细，API 投影为 S1–S6。
+- **为什么**：用户明确要求切到 V1。只改默认值会让控制台看不到报告、删除失败、进度为空；因此同时补齐正式报告路径与展示层兼容，保证默认 V1 是可用模式而不是“命令行能跑、控制台失效”。
+- **验证**：公开不变量 **797 项 OK**；私有回归默认 V1 **642 项 OK**；`REVIEW_ENGINE=legacy` 回滚回归 **642 项 OK**；`compileall` OK。
+
 ### 2026-11-02 · 新增 · Cross Review 证据升级 + Evidence Graph + 引用定位（批次 3 / B4、B5）
 
 - **文件**：`review_agent/runtime/nodes/cross_review.py`（`review_findings(..., evidence=...)`；重复发现/证据不足争议）、`review_agent/runtime/nodes/evidence.py`（锚定时写 `char_start/char_end`）、`review_agent/application/graph.py`（新增 `build_graph`）、`review_agent/application/shadow_report.py`（报告 `graph` 段 + Markdown「证据关系」）、`review_agent/application/__init__.py`、`checks/test_cross_review_evidence.py`（7 项）、`checks/test_evidence_graph.py`（3 项）、`checks/test_evidence_assessor.py`（新增定位用例）、`docs/{AGENT_RUNTIME,V1-架构收口与整改方案}.md`

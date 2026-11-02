@@ -247,6 +247,18 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _legacy_task_view(task):
+    """把 V1 task.json 的节点明细投影成控制台认识的 S1–S6 steps。"""
+    if not isinstance(task, dict) or not task.get("steps_legacy"):
+        return task
+    out = dict(task)
+    out["steps_v1"] = task.get("steps")
+    out["steps"] = task.get("steps_legacy")
+    if out.get("final_status") == "completed":
+        out["final_status"] = "success"
+    return out
+
+
 # 审查子进程的错误分类行（review.py::_emit_error 写入 stderr）。
 # 用一行机器可读的 JSON 替代「拿正则去猜 stderr 里那句话是什么意思」：
 # 用户路径写错（input）与服务端坏了（system）要给完全不同的提示。
@@ -1199,7 +1211,8 @@ class Handler(BaseHTTPRequestHandler):
         rid = str((data or {}).get("id") or "")
         if not re.fullmatch(r"R-\d{8}-\d{3}", rid):
             return {"ok": False, "error": "报告 ID 格式不合法"}
-        if not (OUTPUTS / f"{rid}.json").exists():
+        if not ((OUTPUTS / f"{rid}.json").exists()
+                or (OUTPUTS / "v1" / f"{rid}.json").exists()):
             return {"ok": False, "error": f"未找到报告 {rid}"}
         want = (data or {}).get("favorite")
         if not isinstance(want, bool):
@@ -1224,28 +1237,37 @@ class Handler(BaseHTTPRequestHandler):
         """
         fav = set(self._favorites())
         items = []
-        for p in OUTPUTS.glob("R-*.json"):
+        paths = [*OUTPUTS.glob("R-*.json"), *(OUTPUTS / "v1").glob("R-*.json")]
+        by_id = {}
+        for p in paths:
             try:
                 r = _read_json(p)
             except Exception:
                 continue          # 坏掉的报告不该让整个列表 500
+            rid = str(r.get("review_id") or p.stem)
+            by_id[rid] = (p, r)
+
+        for rid, (p, r) in by_id.items():
             inc = r.get("integrity", {})
             mtime = p.stat().st_mtime
-            ts = str(r.get("timestamp") or "")
+            target = r.get("target") if isinstance(r.get("target"), dict) else {}
+            ts = str(r.get("timestamp") or r.get("generated_at") or "")
             if not ts:
                 # 老报告可能没写 timestamp：退回 mtime，但格式化成同一个口径再排
                 ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mtime))
-            rid = str(r.get("review_id") or p.stem)
+            target_path = r.get("target_path") or target.get("path")
             items.append({
                 "id": rid,
                 "verdict": r.get("verdict"),
-                "target_type": r.get("target_type"),
-                "target_path": r.get("target_path"),
-                "target_name": Path(r.get("target_path") or "").name,
+                "target_type": r.get("target_type") or target.get("type"),
+                "target_path": target_path,
+                "target_name": Path(target_path or "").name,
                 "review_mode": r.get("review_mode"),
                 "timestamp": ts,
                 "issues": len(r.get("issues", [])),
                 "stats": r.get("stats", {}),
+                "engine": r.get("engine") or (
+                    "architecture-v1" if p.parent.name == "v1" else "legacy"),
                 "report_hash": (inc.get("report_hash") or "")[:16],
                 "favorite": rid in fav,
                 "mtime": mtime,
@@ -1267,11 +1289,13 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": "报告 ID 格式不合法"}
         hit = OUTPUTS / f"{rid}.json"
         sidecar = OUTPUTS / f"{rid}.md"
+        v1_hit = OUTPUTS / "v1" / f"{rid}.json"
+        v1_sidecar = OUTPUTS / "v1" / f"{rid}.md"
         # 只认 .json 会留下"清不掉的孤儿"：删除是「先移 json 再移 md」两次文件操作，
         # 中途被打断（进程被杀 / 磁盘满）就只剩一个 .md，而 .json 已进回收站。
         # 此时再删会报"未找到报告"，那个 .md 就永远躺在 outputs/ 里没人能处理。
         # 所以判"找不到"要看两个文件都不在。
-        if not hit.exists() and not sidecar.exists():
+        if not any(p.exists() for p in (hit, sidecar, v1_hit, v1_sidecar)):
             return {"ok": False, "error": f"未找到报告 {rid}"}
 
         confirm = str((data or {}).get("confirm") or "")
@@ -1280,7 +1304,7 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "删除需要二次确认：请提交 confirm=<报告ID>"}
 
         report = None
-        for candidate in (OUTPUTS / "v1" / f"{rid}.json", hit):
+        for candidate in (v1_hit, hit):
             if candidate.is_file():
                 try:
                     report = _read_json(candidate)
@@ -1331,8 +1355,9 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": "缺少 id"}
         if not re.fullmatch(r"R-\d{8}-\d{3}", str(rid)):
             return {"ok": False, "error": "报告 ID 格式不合法"}
-        cand = OUTPUTS.glob(f"{rid}.json")
-        hit = next(cand, None)
+        hit = next(OUTPUTS.glob(f"{rid}.json"), None)
+        if hit is None:
+            hit = next((OUTPUTS / "v1").glob(f"{rid}.json"), None)
         if not hit:
             return {"ok": False, "error": f"未找到报告 {rid}"}
         return {"ok": True, "report": _read_json(hit)}
@@ -1400,7 +1425,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _logs(self, rid):
         dirs = sorted(
-            [p for p in LOG_DIR.glob("R-*") if p.is_dir()],
+            [p for p in LOG_DIR.glob("R-*") if p.is_dir()]
+            + [p for p in (LOG_DIR / "v1").glob("R-*") if p.is_dir()],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -1408,14 +1434,18 @@ class Handler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"R-\d{8}-\d{3}", str(rid)):
                 return {"ok": False, "error": "日志 ID 格式不合法"}
             folder = LOG_DIR / rid
+            if not folder.is_dir():
+                folder = LOG_DIR / "v1" / rid
         else:
             folder = dirs[0] if dirs else None
         if not folder or not folder.is_dir():
             # 区分「报告被删除（连同日志移入回收区）」与「日志从未存在」
-            if rid and (TRASH / f"{rid}_logs").is_dir():
+            if rid and ((TRASH / f"{rid}_logs").is_dir()
+                        or (TRASH / f"{rid}_v1logs").is_dir()):
                 return {"ok": False, "deleted": True,
                         "error": "该报告已被删除，日志已随报告移入 outputs/.trash/（可恢复）"}
-            if rid and not (OUTPUTS / f"{rid}.json").exists():
+            if rid and not ((OUTPUTS / f"{rid}.json").exists()
+                            or (OUTPUTS / "v1" / f"{rid}.json").exists()):
                 return {"ok": False, "deleted": True,
                         "error": "该报告已不存在（可能被删除或从未生成）"}
             return {"ok": False, "error": "未找到该次审查的日志"}
@@ -1450,7 +1480,7 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "ok": True,
             "id": folder.name,
-            "task": read_json("task.json"),
+            "task": _legacy_task_view(read_json("task.json")),
             "decisions": read_jsonl("decisions.jsonl"),
             "tools": read_jsonl("tools.jsonl"),
             "cost": read_json("cost.json"),
@@ -1479,7 +1509,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         report = None
         if job.get("status") == "done" and job.get("report_id"):
-            path = OUTPUTS / f"{job['report_id']}.json"
+            rid = job["report_id"]
+            path = OUTPUTS / f"{rid}.json"
+            if not path.exists():
+                path = OUTPUTS / "v1" / f"{rid}.json"
             if path.exists():
                 try:
                     report = _read_json(path)
@@ -1626,7 +1659,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=RunStatus.QUEUED.value,
                 stage=Stage.INTAKE.value,
                 target=str(file),
-                engine="legacy",
+                engine="v1",
                 profile_id=agent_opt,
                 purpose=(purpose_text or None),
                 idempotency_key=key,
@@ -1718,20 +1751,28 @@ class Handler(BaseHTTPRequestHandler):
                 "status": cancelled.status, "job": job_id or None}
 
     def _integrity(self):
-        ledger = LEDGER / "chain.log"
-        if not ledger.exists():
+        chains = [p for p in (LEDGER / "chain.log", LEDGER / "v1-chain.log")
+                  if p.exists()]
+        if not chains:
             return {"ok": False, "chain_ok": False, "entries": [],
                     "reports": [], "detail": "ledger 尚未生成（运行一次审查后才有）"}
         # 链的解读交给唯一实现：墓碑（独立行 / 历史原位行）不再被当作"坏行"，
         # 否则删过一份报告的用户会永远看到红叉（旧实现就是这样）。
-        view = ledger_store.entries_for_api(ledger)
+        views = [(path, ledger_store.entries_for_api(path)) for path in chains]
+        # V1 是默认链路；有 v1 链时以它作为主视图，legacy 链仍参与 chain_ok。
+        primary_path, view = next(
+            ((path, v) for path, v in views if path.name == "v1-chain.log"),
+            views[0],
+        )
         entries = view["entries"]
-        chain_ok = view["chain_ok"]
-        broken_at = view["broken_at"]
+        chain_ok = all(v["chain_ok"] for _, v in views)
+        broken_at = next((v["broken_at"] for _, v in views if not v["chain_ok"]), None)
 
         reports = []
         cur_rules_ver = integrity.rules_version()
-        for p in sorted(OUTPUTS.glob("R-*.json")):
+        report_paths = [*OUTPUTS.glob("R-*.json"),
+                        *(OUTPUTS / "v1").glob("R-*.json")]
+        for p in sorted(report_paths):
             try:
                 r = _read_json(p)
                 stored = r.get("integrity", {}).get("report_hash")
@@ -2086,7 +2127,7 @@ class Handler(BaseHTTPRequestHandler):
             TASKS.save(TaskRecord(
                 review_id=review_id, run_id=f"{review_id}-RUN01",
                 status=RunStatus.QUEUED.value, stage=Stage.INTAKE.value,
-                target=str(file), engine="legacy",
+                target=str(file), engine="v1",
                 profile_id=(data or {}).get("agent"),
                 purpose=(purpose_text or None),
                 created_at=stamp, updated_at=stamp))
@@ -2352,27 +2393,31 @@ def _mark_ledger_deleted(rid):
 
     两种形态都能被 `verify` 读：历史那批原位墓碑继续有效（`legacy_tombstone`）。
     """
-    chain = LEDGER / "chain.log"
-    if not chain.exists():
-        return False
-    try:
-        records = ledger_store.read_records(chain)
-    except ledger_store.LedgerError as exc:
-        print(f"[ledger] 删除墓碑跳过：{exc}", flush=True)
-        return False
-    target = next((r.get("seq") for r in ledger_store.report_records(records)
-                   if r.get("review_id") == rid and r.get("op") != "delete"), None)
-    if target is None:
-        return False
-    try:
-        ledger_store.tombstone(chain, int(target), actor="web",
-                               reason=f"删除报告 {rid}")
-    except ledger_store.LedgerError as exc:
-        # 重复删除、链异常都不该把 DELETE 变成 500：文件已经移进回收站了，
-        # 这里如实记一行日志并向调用方返回 False（前端会显示"墓碑未写入"）。
-        print(f"[ledger] 删除墓碑失败：{exc}", flush=True)
-        return False
-    return True
+    wrote = False
+    for chain in (LEDGER / "v1-chain.log", LEDGER / "chain.log"):
+        if not chain.exists():
+            continue
+        try:
+            records = ledger_store.read_records(chain)
+        except ledger_store.LedgerError as exc:
+            print(f"[ledger] 删除墓碑跳过：{exc}", flush=True)
+            continue
+        target = next(
+            (r.get("seq") for r in ledger_store.report_records(records)
+             if r.get("review_id") == rid and r.get("op") != "delete"),
+            None,
+        )
+        if target is None:
+            continue
+        try:
+            ledger_store.tombstone(chain, int(target), actor="web",
+                                   reason=f"删除报告 {rid}")
+            wrote = True
+        except ledger_store.LedgerError as exc:
+            # 重复删除、链异常都不该把 DELETE 变成 500：文件已经移进回收站了，
+            # 这里如实记一行日志并向调用方返回 False（前端会显示"墓碑未写入"）。
+            print(f"[ledger] 删除墓碑失败：{exc}", flush=True)
+    return wrote
 
 
 RESULT_MARKER = "REVIEW_RESULT "
@@ -2573,7 +2618,9 @@ def _find_recovered_report(events, outputs_dir, first_ts, last_ts):
                 break
 
     best = None
-    for path in Path(outputs_dir).glob("R-*.json"):
+    paths = [*Path(outputs_dir).glob("R-*.json"),
+             *(Path(outputs_dir) / "v1").glob("R-*.json")]
+    for path in paths:
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

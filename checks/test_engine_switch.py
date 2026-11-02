@@ -4,10 +4,8 @@
 
 切流前的刹车不是一个开关本身，而是三条语义：
 
-    1. **默认不变**：不选就是 legacy；非法值直接报错，绝不静默回退
-       （用户以为跑了新引擎、实际还是旧链路，是最坏的结果）
-    2. **v1 不写正式报告**：六节点流水线还没接语义审与报告写出，
-       往 `outputs/` 写一份同名报告等于让用户看到「看起来一样、实际少一半」的东西
+    1. **默认切到 v1**：不选就是 v1；非法值直接报错，绝不静默回退
+    2. **v1 写 outputs/v1**：不占用 legacy 的 outputs/ 命名空间
     3. **shadow 双跑**：旧报告照出，同时跑一遍新流水线并把差异写进 `state/double_run/`；
        未解释差异要能被列出来，而不是只打印一句「有差异」
 
@@ -41,11 +39,11 @@ class EngineParseTests(unittest.TestCase):
         engine, rest = review._take_engine(["--engine", "v1", "t.md"])
         self.assertEqual(rest, ["t.md"])
 
-    def test_default_is_legacy(self):
+    def test_default_is_v1(self):
         with mock.patch.dict("os.environ", {}, clear=False):
             import os
             os.environ.pop(review.ENGINE_ENV, None)
-            self.assertEqual(review._take_engine(["t.md"])[0], "legacy")
+            self.assertEqual(review._take_engine(["t.md"])[0], "v1")
 
     def test_env_is_read(self):
         with mock.patch.dict("os.environ", {review.ENGINE_ENV: "v1"}):
@@ -124,15 +122,36 @@ class EngineRunTests(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn("语义审", out)
         self.assertIn("纯规则审", out)
-        self.assertEqual(self.reports(), [])
+        self.assertEqual(len(self.reports()), 1)
 
-    def test_v1_writes_state_not_report(self):
+    def test_v1_writes_state_and_v1_report(self):
         code, out, err = self.run_main([TARGET, "--no-llm", "--engine", "v1"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("[v1]", out)
-        self.assertEqual(self.reports(), [], "v1 不写正式报告")
+        self.assertEqual(len(self.reports()), 1, "v1 必须写正式 outputs/ 报告")
         states = list((self.base / "state" / "runs").glob("*.state.json"))
         self.assertEqual(len(states), 1, "v1 必须落状态，否则恢复无从谈起")
+
+    def test_default_runs_v1(self):
+        code, out, err = self.run_main([TARGET, "--no-llm"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("[v1]", out)
+        self.assertEqual(len(self.reports()), 1)
+
+    def test_v1_records_scenario_and_index_fields(self):
+        code, out, err = self.run_main(
+            [TARGET, "--no-llm", "--scenario", "resume-screening"])
+        self.assertEqual(code, 0, out + err)
+        path = next((self.base / "outputs").glob("R-*.json"))
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(report["scenario"]["id"], "resume-screening")
+        self.assertEqual(report["target_path"], TARGET)
+        self.assertTrue(report["timestamp"])
+        self.assertEqual(report["agent"]["id"], "doc-review")
+        self.assertTrue(report["active_rules"])
+        self.assertIn("chars_reviewed", report["coverage"])
+        self.assertTrue(report["format_spec"] is None or
+                        isinstance(report["format_spec"], dict))
 
     def test_shadow_writes_report_and_diff(self):
         code, out, err = self.run_main([TARGET, "--no-llm", "--engine", "shadow"])

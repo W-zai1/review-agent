@@ -3597,7 +3597,9 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
                        semantic_review_fn=None, use_llm=False,
                        llm_meta_out=None, purpose_info=None,
                        integrity_out=None, token=None, research_enabled=False,
-                       research_cfg=None, research_web=True):
+                       research_cfg=None, research_web=True,
+                       scenario_id=None, format_spec=None,
+                       context_out=None, progress_path=None):
     """用新的六节点流水线跑一次审查，返回 (RunState, RunOutcome, Session)。
 
     失败时抛 UnreadableTargetError（与 run_one 同语义），调用方不必区分两套异常。
@@ -3632,17 +3634,42 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
     chosen_type = type_override or type_info["type"]
     target_rel = str(target_path.relative_to(ROOT)).replace("\\", "/")
 
-    agent, _reason = agent_spec.resolve(target_path, text, agent_id=agent_id)
+    agent, agent_reason = agent_spec.resolve(target_path, text, agent_id=agent_id)
     rules = merge_agent_rules(rules, agent)
+    scenario_info = None
+    if scenario_id:
+        scenario_info = scenario_mod.apply(scenario_id, rules)
+        rules = scenario_info["rules"]
+    format_info = None
+    if target_path.suffix.lower() in (".docx", ".docm"):
+        chosen_spec = format_spec or format_spec_mod.load()["default"]
+        format_info = format_spec_mod.apply(chosen_spec, rules)
+        rules = format_info["rules"]
     set_rule_index(rules)
-    active = [r for r in rules if r.get("enabled", True)]
     dims = agent.dims_for(chosen_type)
+    active = [r for r in rules
+              if r.get("enabled", True) and r.get("dimension") in dims]
+    try:
+        fact_assertions = retrieve.load_facts().get("assertions", []) or []
+    except Exception:                              # noqa: BLE001 - UI coverage only
+        fact_assertions = []
+    matched_assertions = sum(
+        1 for item in fact_assertions
+        if (str(item.get("entity") or "") and str(item["entity"]) in text)
+        or (str(item.get("attr") or "") and str(item["attr"]) in text)
+    )
+    try:
+        source_meta = load_source_meta(target_path)
+    except Exception:                              # noqa: BLE001 - UI metadata only
+        source_meta = None
 
     run_id = domain_ids.format_run_id(review_id, 1)
-    session = Session(review_id, target_rel, chosen_type)
+    session = Session(review_id, target_rel, chosen_type,
+                      progress_path=progress_path)
     session.type_confidence = float(type_info.get("confidence") or 0.6)
     legacy_ctx = {"target_path": target_path, "target_type": chosen_type,
-                  "agent": agent, "format_spec": None}
+                  "agent": agent,
+                  "format_spec": (format_info or {}).get("check")}
 
     registry = build_rule_registry(session, text, active, legacy_ctx, run_id, agent)
     _rule_executor = rule_executor_from(registry, review_id, run_id)
@@ -3700,6 +3727,36 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
         "checks": list(agent.checks),
     }
     outcome = asyncio.run(app.run(state, ports, config=config))
+    if context_out is not None:
+        context_out.update({"scenario": scenario_info,
+                            "format_spec": format_info,
+                            "agent": {
+                                "id": agent.id, "name": agent.name,
+                                "version": agent.version,
+                                "selected_by": agent_reason,
+                                "dimensions": agent.dimension_meta(),
+                                "checked_dimensions": list(dims),
+                                "checks": list(agent.checks),
+                                "rule_sources": _agent_rule_sources(agent),
+                                "boundaries": list(agent.boundaries),
+                            },
+                            "active_rules": list(active),
+                            "rule_execution": rule_exec.summarize(active),
+                            "coverage_meta": {
+                                "fact_assertions_total": len(fact_assertions),
+                                "fact_assertions_matched": matched_assertions,
+                                "fact_coverage_pct": round(
+                                    matched_assertions / len(fact_assertions) * 100)
+                                if fact_assertions else 0,
+                                "active_rules": len(active),
+                                "declared_rules": len([
+                                    r for r in rules_store.load_all_rules()
+                                    if r.get("dimension") in dims
+                                ]),
+                                **({"source": source_meta} if source_meta else {}),
+                            },
+                            "target_type": chosen_type,
+                            "target_type_source": "manual" if type_override else "auto"})
     return outcome.state, outcome, session
 
 
@@ -4160,13 +4217,13 @@ RULE_BY_ID = rule_index(rules_store.load_all_rules())
 
 ENGINE_ENV = "REVIEW_ENGINE"
 ENGINES = ("legacy", "v1", "shadow")
-DEFAULT_ENGINE = "legacy"
+DEFAULT_ENGINE = "v1"
 
 
 def _take_engine(args):
-    """从 argv 里取出 `--engine X` / `--engine=X`，缺省读环境变量，再缺省 legacy。
+    """从 argv 里取出 `--engine X` / `--engine=X`，缺省读环境变量，再缺省 v1。
 
-    返回 (engine, 剩余 args)。非法值直接报错退出——静默回退到 legacy 是最坏的结果：
+    返回 (engine, 剩余 args)。非法值直接报错退出——静默回退到另一条链路是最坏的结果：
     用户以为跑了新引擎，实际还是旧链路。
     """
     engine = None
@@ -4225,7 +4282,8 @@ def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     # 双跑也留一份影子报告：差异要能对着「新链路自己怎么说」看，而不是只看计数
     _write_shadow_report(state, outcome, integrity_inputs=integrity_inputs,
-                         session=session, purpose_info=purpose_info)
+                         session=session, purpose_info=purpose_info,
+                         official=False)
     if diff["ok"]:
         print(f"[shadow] {report['review_id']} 双跑一致："
               f"verdict={diff['verdict_new']}，提及折叠 {len(diff['folded'])} 条")
@@ -4455,24 +4513,28 @@ def _record_research_egress(review_id, claim):
 
 def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
             use_llm=False, purpose=None, purpose_max=None, review_id=None,
-            research_enabled=False):
-    """只跑六节点流水线（影子）：**不写正式报告**，只落状态并打印摘要。
-
-    为什么不写报告：v1 还没有接报告写出（哈希链 / ledger / limitations）。
-    此时往 `outputs/` 写一份同名报告，等于让用户看到一份「看起来一样、实际少一半」的东西。
-    """
+            research_enabled=False, purpose_notes=None, scenario=None,
+            format_spec=None, progress_path=None):
+    """运行 V1 八阶段流水线，写正式 `outputs/` 报告、状态和审计链。"""
     purpose_info = None
     if purpose and str(purpose).strip():
         purpose_info = purpose_mod.parse(str(purpose), max_chars=purpose_max)
     llm_meta: dict = {}
     integrity_inputs: dict = {}
+    context_out: dict = {}
     try:
         state, outcome, session = run_typed_pipeline(
             target_path, rules, review_id=review_id,
             agent_id=agent_id, type_override=type_override,
             store=STATE / "runs", use_llm=use_llm, llm_meta_out=llm_meta,
             purpose_info=purpose_info, integrity_out=integrity_inputs,
-            research_enabled=research_enabled)
+            research_enabled=research_enabled,
+            scenario_id=scenario, format_spec=format_spec,
+            context_out=context_out, progress_path=progress_path)
+    except UnreadableTargetError as e:
+        print(f"目标不可读：{e}")
+        _emit_domain_error(e)
+        sys.exit(1)
     except ConfigError as e:
         print(f"[v1] {e}")
         _emit_domain_error(e)
@@ -4499,10 +4561,30 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
     elif research_enabled:
         print("[v1] 库外核验：本次维度不含事实审，未执行")
     verdict = state.decision.verdict.value if state.decision else "-"
+    if progress_path:
+        steps = _v1_progress_steps(
+            outcome, purpose_info=purpose_info,
+            research_enabled=bool((state.artifacts.get("research") or {}).get("enabled")),
+            active_rules=context_out.get("active_rules") or (),
+            coverage_meta=context_out.get("coverage_meta"),
+        )
+        with open(progress_path, "a", encoding="utf-8") as handle:
+            for step in steps:
+                handle.write(json.dumps(step, ensure_ascii=False) + "\n")
     report_path = _write_shadow_report(state, outcome,
                                        integrity_inputs=integrity_inputs,
                                        session=session,
-                                       purpose_info=purpose_info)
+                                       purpose_info=purpose_info,
+                                       purpose_notes=purpose_notes,
+                                       scenario=context_out.get("scenario"),
+                                       format_spec=context_out.get("format_spec"),
+                                       agent=context_out.get("agent"),
+                                       active_rules=context_out.get("active_rules") or (),
+                                       coverage_meta=context_out.get("coverage_meta"),
+                                       official=True,
+                                       target_type=context_out.get("target_type"),
+                                       target_type_source=context_out.get("target_type_source"),
+                                       rule_execution=context_out.get("rule_execution"))
     try:
         shown = report_path.relative_to(ROOT).as_posix()
     except ValueError:
@@ -4510,7 +4592,7 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
         shown = report_path.as_posix()
     print(f"[v1] {state.review_id} 流水线完成：verdict={verdict} | "
           f"发现 {len(state.findings)} 条 | 证据 {len(state.evidence)} 条 | "
-          f"影子报告：{shown} | "
+          f"报告：{shown} | "
           f"状态：state/runs/{state.run_id}.state.json")
     _emit_result(state.review_id, report_path, verdict=verdict,
                  report_id=state.review_id)
@@ -4576,7 +4658,54 @@ def _integrity_inputs(target_path, rules, active, agent):
     }
 
 
-def _write_v1_logs(session, outcome, review_id):
+def _v1_progress_steps(outcome, *, purpose_info=None, research_enabled=False,
+                       active_rules=(), coverage_meta=None):
+    """把 V1 节点执行投影成旧控制台认识的 S1–S6 进度行。"""
+    state = outcome.state
+    meta = state.artifacts.get("target_meta") or {}
+    semantic = state.artifacts.get("semantic_stats") or {}
+    mode = "rule+llm" if semantic else "rule-only"
+    anchored = sum(
+        1 for ev in state.evidence if ev.verification.value == "anchored")
+    details = {
+        "S1": {"类型判定": meta.get("type") or "-",
+               "字符数": len(state.artifacts.get("target_text") or ""),
+               "编码": meta.get("encoding") or "-"},
+        "S2": {"生效规则": (coverage_meta or {}).get(
+            "active_rules", len(active_rules))},
+        "S3": {"审查模式": mode,
+               "各维结果": "未调用模型（纯规则审）" if mode == "rule-only"
+                           else "见 semantic_stats 各维统计"},
+        "S4": {"quote 可回溯": f"{anchored}/{len(state.evidence)}",
+               "证据数": len(state.evidence)},
+        "S5": {"争议": len(state.disputes)},
+        "S6": {"裁定": state.decision.verdict.value if state.decision else "-"},
+    }
+    if purpose_info:
+        details["S5.5"] = {"目的比对": "已执行"}
+    if research_enabled:
+        details["S5.6"] = {"库外核验": "已执行"}
+    steps = [
+        ("S1", "接收解析"), ("S2", "规则匹配"), ("S3", "分维审查"),
+        ("S4", "证据锚定"), ("S5", "交叉复核"),
+    ]
+    if purpose_info:
+        steps.append(("S5.5", "目的比对"))
+    if research_enabled:
+        steps.append(("S5.6", "库外核验"))
+    steps.append(("S6", "裁定汇总"))
+    status = "success" if outcome.ok else "failed"
+    ts = now_iso()
+    return [
+        {"step": step, "name": name, "status": status, "ts": ts,
+         "latency_ms": 0,
+         "detail": {**details.get(step, {}), "engine": "v1"}}
+        for step, name in steps
+    ]
+
+
+def _write_v1_logs(session, outcome, review_id, *, purpose_info=None,
+                   active_rules=(), coverage_meta=None):
     """把审计事件流写成 `logs/v1/<review_id>/`，返回目录哈希。
 
     旧报告会对 `logs/<review_id>/` 取哈希进 `integrity.logs_hash`。v1 之前没有这一层，
@@ -4599,6 +4728,12 @@ def _write_v1_logs(session, outcome, review_id):
     )
     write_audit_stream(log_dir / "events.jsonl", stream)
     legacy = audit_to_legacy(stream)
+    steps = _v1_progress_steps(
+        outcome, purpose_info=purpose_info,
+        research_enabled=bool((outcome.state.artifacts.get("research") or {}).get("enabled")),
+        active_rules=active_rules,
+        coverage_meta=coverage_meta,
+    )
     for name, items in (("decisions.jsonl", legacy["decisions"]),
                         ("tools.jsonl", legacy["tools"])):
         log_dir.joinpath(name).write_text(
@@ -4609,8 +4744,29 @@ def _write_v1_logs(session, outcome, review_id):
         "engine": "architecture-v1",
         "final_status": outcome.status,
         "errors": list(outcome.errors),
+        # 文件里保留 V1 节点级明细（audit_stream 的既有契约）；
+        # API 层再把 steps_legacy 投影成 S1–S6 给控制台。
         "steps": legacy["steps"],
+        "steps_legacy": steps,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
+    tool_logs = list(getattr(session, "tool_logs", ()) or ())
+    tool_ok = sum(1 for row in tool_logs if row.get("status") == "success")
+    cost = {
+        "total_latency_ms": 0,
+        "llm_tokens": {
+            "input": int(getattr(session, "llm_usage", {}).get("input", 0)),
+            "output": int(getattr(session, "llm_usage", {}).get("output", 0)),
+        },
+        "llm_model": None,
+        "llm_calls": int(getattr(session, "llm_usage", {}).get("calls", 0)),
+        "llm_failures": int(getattr(session, "llm_usage", {}).get("failures", 0)),
+        "tool_calls": len(tool_logs),
+        "tool_success": tool_ok,
+        "tool_failures": len(tool_logs) - tool_ok,
+        "success_rate": round(tool_ok / len(tool_logs), 3) if tool_logs else 1.0,
+    }
+    log_dir.joinpath("cost.json").write_text(
+        json.dumps(cost, ensure_ascii=False, indent=2), encoding="utf-8")
     return integrity.sha256_dir(str(log_dir))
 
 
@@ -4713,25 +4869,31 @@ def _write_target_snapshot(state):
 
 
 def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
-                         purpose_info=None):
-    """把影子报告写到 `outputs/v1/`，并给它补上可校验的完整性链。
+                         purpose_info=None, purpose_notes=None,
+                         scenario=None, format_spec=None,
+                         agent=None, active_rules=(), coverage_meta=None,
+                         official=False, target_type=None,
+                         target_type_source=None, rule_execution=None):
+    """把 V1 报告写到正式 `outputs/` 或影子 `outputs/v1/`，并补完整性链。
 
     为什么 v1 也要哈希链：报告是交付物，读者必须能验证「这份结论没被改过」。
-    为什么单独一条链（`ledger/v1-chain.log`）：v1 报告在 `outputs/v1/`，
-    混进官方 `ledger/chain.log` 会让 `integrity verify` 找不到对应报告文件。
-    切流时两条链合并（或 v1 链转正），那是发布动作，不能顺手做。
+    `official=True` 时报告进 `outputs/`、链进 `ledger/chain.log`；
+    双跑/影子模式仍写 `outputs/v1/` 与 `ledger/v1-chain.log`，两者不混。
 
     幂等：同一次运行（相同 `run_id`）第二次调用直接返回已有路径——
     不重写报告、不重写日志、不往链上追加第二条记录。否则「恢复后重跑一次」
     会在审计链里留下两条同一份结论的记录，链就没法用来证明「跑了几次」。
     """
-    out_dir = OUTPUTS / "v1"
+    out_dir = OUTPUTS if official else OUTPUTS / "v1"
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{state.review_id}.json"
     if _report_already_written(json_path, state.run_id):
         return json_path
 
-    logs_hash = (_write_v1_logs(session, outcome, state.review_id)
+    logs_hash = (_write_v1_logs(session, outcome, state.review_id,
+                                purpose_info=purpose_info,
+                                active_rules=active_rules,
+                                coverage_meta=coverage_meta)
                  if session is not None else None)
     # 法条库：与旧报告共用 `law_library_block()`，保证「同一个 session → 同一个块」。
     # session 为 None（测试里直接造 state）时给 None，报告里照实自报"未接入"。
@@ -4747,10 +4909,68 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
         logs_hash=logs_hash,
         law_library=law_lib,
         target_snapshot=snapshot,
+        scenario=scenario,
+        format_spec=format_spec,
+        agent=agent,
+        active_rules=active_rules,
+        coverage_meta=coverage_meta,
+        target_type=target_type,
+        target_type_source=target_type_source,
+        rule_execution=rule_execution,
     )
     _attach_purpose(report, purpose_info, state.artifacts.get("target_text"))
+    if purpose_notes:
+        report["limitations"] = [
+            *(str(x) for x in purpose_notes if str(x).strip()),
+            *(report.get("limitations") or []),
+        ]
+    if session is not None:
+        by_id = {
+            str(item.get("issue_id")): item
+            for item in getattr(session, "issues", ()) or ()
+            if item.get("issue_id")
+        }
+        for issue in report.get("issues") or ():
+            source = by_id.get(str(issue.get("issue_id")))
+            if not source:
+                continue
+            for key in ("citation", "citations", "open_discovery",
+                        "rule_text", "fix", "consequence"):
+                if key in source and key not in issue:
+                    issue[key] = source[key]
+    open_items = [
+        {"rule_id": i.get("rule_id"), "severity": i.get("severity"),
+         "quote": (i.get("quote") or "")[:120],
+         "confidence": i.get("confidence"), "source": "model"}
+        for i in report.get("issues") or () if i.get("open_discovery")
+    ]
+    report["open_discoveries"] = open_items
+    if open_items:
+        report["limitations"].append(
+            f"模型另报 {len(open_items)} 条「规则清单外发现」（rule_id 以 OPEN- 开头）："
+            "来源=模型推测、未经规则库定义、不参与规则覆盖率统计，须人工确认后再采信。")
+    try:
+        facts = retrieve.load_facts()
+        watch = [str(x.get("entity") or "") for x in facts.get("watchlist") or []]
+        seen_watch = [name for name in watch
+                      if name and name in (state.artifacts.get("target_text") or "")]
+        if seen_watch:
+            report["limitations"].append(
+                f"文中出现的库外高频实体：{'、'.join(seen_watch[:6])}——"
+                "其数字/日期**未做真伪判定**（不是已核验通过）。")
+    except Exception:                              # noqa: BLE001 - 报告增强不应阻断
+        pass
+    raw_target = report.get("target_path")
+    if raw_target:
+        try:
+            target_rel = Path(str(raw_target)).resolve().relative_to(ROOT).as_posix()
+            report["target_path"] = target_rel
+            if isinstance(report.get("target"), dict):
+                report["target"]["path"] = target_rel
+        except (ValueError, OSError):
+            pass
     _attach_action_plan(report)      # 必须早于 report_hash：哈希要覆盖整改建议
-    ledger_path = LEDGER / "v1-chain.log"
+    ledger_path = LEDGER / ("chain.log" if official else "v1-chain.log")
     lock = _acquire_ledger_lock()
     try:
         prev, seq_no = ledger_store.chain_state(ledger_path)
@@ -4846,7 +5066,7 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None):
                 error=f"已取消：{token.reason}")
         report_path = _write_shadow_report(
             state, outcome, integrity_inputs=integrity_inputs,
-            session=session, purpose_info=purpose_info)
+            session=session, purpose_info=purpose_info, official=True)
         return TaskOutcome(
             status=RunStatus.COMPLETED, stage=state.stage,
             verdict=state.decision.verdict.value if state.decision else None,
@@ -4902,7 +5122,7 @@ def main():
     scenario = None
     research_enabled = False
     review_id_opt = None          # `--review-id`：服务端预先发的号（见 _emit_result）
-    # 引擎选择：默认旧链路；v1 = 只跑六节点流水线（影子）；shadow = 两条都跑并比对。
+    # 引擎选择：默认 v1 八阶段流水线；legacy = 旧链路回滚；shadow = 两条都跑并比对。
     engine, args = _take_engine(args)
     if engine == "off":
         return
@@ -5110,8 +5330,8 @@ def main():
               "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）；"
               "--research 对事实库外的数字/日期主张联网检索来源并核验（默认关闭）；"
               "--no-research 强制关闭联网核验；"
-              "--engine legacy|v1|shadow 选择执行引擎（legacy 默认；v1 跑六节点流水线、"
-              "写影子报告 outputs/v1/ 并落状态，不改旧报告；shadow 出旧报告并双跑比对，"
+              "--engine legacy|v1|shadow 选择执行引擎（v1 默认；v1 跑八阶段流水线、"
+              "写报告 outputs/v1/ 并落状态；legacy 为旧链路回滚；shadow 出旧报告并双跑比对，"
               "差异写 state/double_run/；shadow 需配合 --no-llm，v1 可带 --llm）；"
               "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return
@@ -5129,10 +5349,22 @@ def main():
         _emit_error("--engine shadow 需要 --no-llm", kind="input", http_status=400)
         sys.exit(2)
     if engine == "v1":
-        _run_v1(target_path, rules, type_override=type_override,
-                agent_id=agent_id, use_llm=use_llm,
-                purpose=purpose, purpose_max=purpose_max,
-                review_id=review_id_opt, research_enabled=research_enabled)
+        try:
+            _run_v1(target_path, rules, type_override=type_override,
+                    agent_id=agent_id, use_llm=use_llm,
+                    purpose=purpose, purpose_max=purpose_max,
+                    review_id=review_id_opt, research_enabled=research_enabled,
+                    purpose_notes=purpose_notes,
+                    scenario=scenario, format_spec=format_spec,
+                    progress_path=progress_path)
+        except scenario_mod.ScenarioError as e:
+            print(f"审查情境错误：{e}")
+            _emit_domain_error(ConfigError(f"审查情境错误：{e}"))
+            sys.exit(2)
+        except format_spec_mod.FormatSpecError as e:
+            print(f"格式规格错误：{e}")
+            _emit_domain_error(ConfigError(f"格式规格错误：{e}"))
+            sys.exit(2)
         return
     try:
         report = run_one(target_path, rules, use_llm=use_llm,

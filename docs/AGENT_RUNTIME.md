@@ -109,7 +109,7 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
 * **影子流水线**（2026-10-30）：`review.run_typed_pipeline()` 用六节点 + 编排器
   跑一次 rule-only 审查，`review.compare_with_report()` 与旧报告双跑比对。
   四个目标语料上「未解释差异 = 0」。语义审入队仍是 Session 语义，尚未接入。
-* **引擎开关**（2026-10-30）：CLI `--engine legacy|v1|shadow`（也认 `REVIEW_ENGINE`）。
+* **引擎开关**（2026-11-02）：CLI `--engine legacy|v1|shadow`（也认 `REVIEW_ENGINE`）；缺省已切到 `v1`，`legacy` 仅作回滚。
   `v1` 跑六节点流水线、落状态（`state/runs/`）并写影子报告（`outputs/v1/`），
   **不写旧链路的正式报告**；`--llm` 已接真模型（语义审经 `SemanticExecutor` 注入）。
   `shadow` 出旧报告 + 双跑差异（`state/double_run/<review_id>.json`），**强制 `--no-llm`**——
@@ -307,7 +307,7 @@ class RunState:
    旧流程的 `detect_type_detail` 已改为委托；读文件经 `reader` 端口注入。
    六节点全部就位。Application Service 也已落地（`application/service.py`：组装 + 执行
    + 落盘 + 恢复，`checks/test_application_service.py`），因此下一步不是「接线」而是
-   **切流**：清零 `unsupported_blocks` → 在线双跑 → `DEFAULT_ENGINE` 改 `v1`。
+**切流**：`unsupported_blocks` 已清零；`DEFAULT_ENGINE` 已于 2026-11-02 改为 `v1`，保留 `--engine legacy` 回滚。
    逐项验收见 `docs/V1-架构收口与整改方案.md`。
 4. **开关**：`REVIEW_ENGINE=v1` 环境变量切换新链路；默认仍是旧链路，直到双跑连续
    一周零未解释差异。

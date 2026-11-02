@@ -233,7 +233,7 @@ class EngineShadowReportTests(unittest.TestCase):
     @unittest.skipUnless(PRIVATE_OK,
                          "私有审查资产缺失（targets/ 样本或 agents/ 定义不在公开仓库），"
                          "跳过 CLI 影子报告端到端用例")
-    def test_v1_writes_shadow_report(self):
+    def test_v1_writes_official_report(self):
         import io
         from contextlib import redirect_stdout
         from unittest import mock
@@ -258,12 +258,12 @@ class EngineShadowReportTests(unittest.TestCase):
                         "--purpose", "这是给客户的合同，找出对我方不利的条款",
                 ]), redirect_stdout(out):
                     review.main()
-                files = sorted((base / "outputs" / "v1").iterdir())
+                files = sorted((base / "outputs").glob("R-*"))
                 names = [p.name for p in files]
                 self.assertEqual(len([n for n in names if n.endswith(".json")]), 1)
                 self.assertEqual(len([n for n in names if n.endswith(".md")]), 1)
                 payload = json.loads(
-                    (base / "outputs" / "v1").glob("*.json").__next__()
+                    (base / "outputs").glob("R-*.json").__next__()
                     .read_text(encoding="utf-8"))
                 self.assertEqual(payload["engine"], "architecture-v1")
                 self.assertIn("action_plan", payload)
@@ -276,8 +276,8 @@ class EngineShadowReportTests(unittest.TestCase):
                 self.assertTrue(purpose.get("evidence"), "目的比对应带原文证据")
                 self.assertNotIn("purpose",
                                  [b["block"] for b in payload["unsupported_blocks"]])
-                self.assertEqual(self._reports(base), [],
-                                 "v1 不应写正式报告")
+                self.assertEqual(len(self._reports(base)), 1,
+                                 "v1 默认应写正式报告")
             finally:
                 for name, value in saved.items():
                     setattr(review, name, value)
