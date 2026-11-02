@@ -44,6 +44,16 @@
 
 # 2026-11-02
 
+### 2026-11-02 · 新增 · Cross Review 证据升级 + Evidence Graph + 引用定位（批次 3 / B4、B5）
+
+- **文件**：`review_agent/runtime/nodes/cross_review.py`（`review_findings(..., evidence=...)`；重复发现/证据不足争议）、`review_agent/runtime/nodes/evidence.py`（锚定时写 `char_start/char_end`）、`review_agent/application/graph.py`（新增 `build_graph`）、`review_agent/application/shadow_report.py`（报告 `graph` 段 + Markdown「证据关系」）、`review_agent/application/__init__.py`、`checks/test_cross_review_evidence.py`（7 项）、`checks/test_evidence_graph.py`（3 项）、`checks/test_evidence_assessor.py`（新增定位用例）、`docs/{AGENT_RUNTIME,V1-架构收口与整改方案}.md`
+- **改了什么**：
+  1. B4：Cross Review 接收到 evidence 后，新增 `DUPLICATE_FINDING`（同维度/同规则/同引用）与 `INSUFFICIENT_EVIDENCE`（blocker 不到 VERIFIED、major 不到 PARTIAL）争议；不传 evidence 时逐字段保持历史差分不变。
+  2. B5：新增纯函数 `build_graph(state)`，把 Finding、Evidence、Rule、Dispute、Decision 投影为 `nodes / edges / answers`；报告新增 `graph` 顶层键，Markdown 增加「证据关系」段，回答规则、材料、外部来源、产出节点、复核节点与裁定。
+  3. 引用定位：`anchor_findings()` 在 quote 逐字命中时写入字符区间，避免评估节点把所有可回查引用都判成 PARTIAL，从而减少闸门开启后的误封顶。
+- **为什么**：B1–B3 只做到“证据强度能算、裁定能读”；B4 让交叉复核真正消费证据，B5 让报告读者不用自己遍历 JSON 就能追踪“这条结论凭什么成立”。字符定位是把 B2/B3 从“字段存在”变成“可实用”的必要补丁。
+- **验证**：`checks/test_cross_review_evidence.py` **7 项 OK**、`checks/test_evidence_graph.py` **3 项 OK**、`checks/test_evidence_assessor.py` **8 项 OK**；公开不变量 **791 项 OK**；私有回归 **642 项 OK**；`compileall` OK。
+
 ### 2026-11-02 · 新增 · 证据评估节点 + 证据闸门（批次 3 / B2、B3）
 
 - **文件**：`review_agent/runtime/nodes/evidence_assess.py`（新增 `EvidenceAssessorNode` / `assess_evidence`）、`review_agent/runtime/node.py`（`NodeResult.evidence_revisions` + 按 id 替换与悬空校验）、`review_agent/runtime/nodes/__init__.py`、`review_agent/application/service.py`（workflow 插入评估节点）、`review_agent/domain/policy.py`（`EvidenceGate` / `evidence_gate` / `cap_verdict` / `DecisionPolicy.evidence_gate_enabled`）、`review_agent/domain/__init__.py`、`review_agent/runtime/nodes/decision.py`（闸门封顶 + 反证争议）、`checks/test_evidence_assessor.py`（8 项）、`checks/test_evidence_gate.py`（7 项）、`docs/{AGENT_RUNTIME,ARCHITECTURE,V1-架构收口与整改方案}.md`

@@ -8,6 +8,7 @@ from .audit import (
     to_legacy as audit_to_legacy,
     write_stream as write_audit_stream,
 )
+from .graph import build_graph
 from .reports import (
     DEFAULT_ORDER,
     SOURCE_LEGACY,
@@ -46,6 +47,7 @@ __all__ = [
     # 影子报告
     "ENGINE", "LOGS_HASH_LIMITATION", "SCHEMA_VERSION", "UNSUPPORTED_BLOCKS",
     "build_shadow_report", "render_shadow_md",
+    "build_graph",
     # 任务
     "TASK_SCHEMA", "FileTaskStore", "RecoveryReport", "Runner", "TaskOutcome",
     "TaskRecord", "TaskService", "TaskStore",

@@ -36,7 +36,7 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
 | Semantic Reviewer | analysis | 目标文本、任务书、维度 | `findings`（模型类）+ `llm_meta` | **用** | `semantic_review` 1843、`llm_review`、`llm_client` |
 | Evidence Analyzer | evidence | findings、原文、知识库 | `evidence`、`evidence_dropped` | 混合（检索可算法，判断可模型） | S4 锚定 2517、`law_cite`、`retrieve`、`law_index` |
 | Evidence Assessor | evidence | evidence 集合 | 修订后的 `evidence.strength` / `assessment` | **不用**（确定性规则） | B2；`evidence_assess.py` |
-| Cross Reviewer | cross_review | findings（全维度） | `disputes`、折叠/降权决策 | 可选（先规则，复杂冲突再用模型） | `cross_review` 1359、`aggregate_repeats` 1401、`drop_covered_comp004` |
+| Cross Reviewer | cross_review | findings（全维度）、evidence | `disputes`、重复/证据不足争议、降权决策 | 可选（先规则，复杂冲突再用模型） | `cross_review` 1359、`aggregate_repeats` 1401、`drop_covered_comp004` |
 | Decision Engine | decision | findings、disputes、coverage、研究兜底 | `decision` | **不用** | S6 裁定 2639–2686 + `remediation.attach` |
 | Review Supervisor | 全部 | RunState | 新 RunState / 终止原因 | 不用 | `run_one` 的控制流 2292–3270 |
 
@@ -57,6 +57,11 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
 * Evidence Gate 已落地（B3，缺省关闭）：`domain/policy.py::evidence_gate` +
   `DecisionPolicy(evidence_gate_enabled=True)`。开启后弱证据/部分证据把裁定封顶为
   warn，反证生成 `DisputeKind.CONTRADICTION`；单测：`checks/test_evidence_gate.py`。
+* Cross Review 证据升级（B4）：`review_findings(..., evidence=...)` 增加重复发现与
+  证据不足争议；不传证据时逐字段保持历史行为。单测：`checks/test_cross_review_evidence.py`。
+* Evidence Graph（B5）：`application/graph.py::build_graph(state)` 把
+  Finding / Evidence / Rule / Dispute / Decision 投影成 `nodes / edges / answers`，
+  报告新增 `graph` 段；单测：`checks/test_evidence_graph.py`。
 * Cross Reviewer 已落地：`review_agent/runtime/nodes/cross_review.py`
   （节点 + `review_findings`）。旧流程 S5 已改成「编成领域对象 → 节点复核 → 回写」；
   降权通过 `NodeResult.revisions` 表达（见 §4 规则 6）。

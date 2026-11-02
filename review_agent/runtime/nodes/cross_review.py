@@ -33,13 +33,15 @@ from ...domain import (
     Dispute,
     DisputeKind,
     DisputeStatus,
+    Evidence,
+    EvidenceStrength,
     Finding,
     Severity,
     Stage,
     ids,
 )
 from ..node import NodeContext, NodeResult, surviving_findings
-from .text import quote_overlap
+from .text import normalize_quote, quote_overlap
 
 NAME: Final = "cross-reviewer"
 
@@ -83,8 +85,15 @@ def review_findings(
     *,
     run_id: str,
     first_dispute_seq: int = 1,
+    evidence: Sequence[Evidence] = (),
 ) -> CrossReviewResult:
-    """交叉复核（纯函数）：找出跨维度冲突，产出争议与降权后的发现。"""
+    """交叉复核（纯函数）：找出跨维度冲突、重复发现与证据不足。
+
+    `evidence=()` 时只跑旧规则（跨维度严重度冲突 + 降权），历史差分逐字段不变。
+    传入证据后额外做两件事：
+      * 同维度/同规则/同引用的重复发现 → `DUPLICATE_FINDING`；
+      * blocker 证据不到 VERIFIED、major 证据不到 PARTIAL → `INSUFFICIENT_EVIDENCE`。
+    """
     working = {f.id: f.confidence for f in findings}
     disputes: list[Dispute] = []
     seq = int(first_dispute_seq)
@@ -115,6 +124,73 @@ def review_findings(
                         max(CONFIDENCE_FLOOR, working[f.id] - CONFIDENCE_STEP), 2)
                     if f.id not in touched:
                         touched.append(f.id)
+
+    if evidence:
+        existing_pairs = {
+            frozenset(d.issue_ids) for d in disputes if len(d.issue_ids) == 2
+        }
+        for i, a in enumerate(findings):
+            for b in findings[i + 1:]:
+                if a.id == b.id or a.dimension != b.dimension:
+                    continue
+                if a.severity is not b.severity:
+                    continue
+                if normalize_quote(a.quote) != normalize_quote(b.quote):
+                    continue
+                rule_a = a.rule.rule_id if a.rule else ""
+                rule_b = b.rule.rule_id if b.rule else ""
+                if rule_a != rule_b or not rule_a:
+                    continue
+                pair = frozenset((a.id, b.id))
+                if pair in existing_pairs:
+                    continue
+                existing_pairs.add(pair)
+                disputes.append(Dispute(
+                    id=ids.format_dispute_id(seq), run_id=run_id,
+                    point=(f"{a.id}/{b.id} 同维度、同规则、同引用："
+                           f"{a.quote[:40]}… — 疑似重复发现"),
+                    issue_ids=(a.id, b.id),
+                    kind=DisputeKind.DUPLICATE_FINDING,
+                    status=DisputeStatus.OPEN,
+                    between=(f"{a.dimension}-reviewer", f"{a.dimension}-reviewer"),
+                    resolution_hint="合并为一条，或说明两条结论为何必须分开保留。",
+                ))
+                seq += 1
+
+        by_finding: dict[str, list[Evidence]] = {}
+        for item in evidence:
+            for fid in item.finding_ids:
+                by_finding.setdefault(fid, []).append(item)
+        insufficient_ids = {
+            iid for d in disputes
+            if d.kind is DisputeKind.INSUFFICIENT_EVIDENCE
+            for iid in d.issue_ids
+        }
+        for finding in findings:
+            if finding.severity not in (Severity.BLOCKER, Severity.MAJOR):
+                continue
+            rows = by_finding.get(finding.id, [])
+            if not rows and not str(finding.quote or "").strip():
+                continue
+            strength = (min((e.strength for e in rows), key=lambda s: s.rank)
+                        if rows else EvidenceStrength.UNASSESSED)
+            required = (EvidenceStrength.VERIFIED
+                        if finding.severity is Severity.BLOCKER
+                        else EvidenceStrength.PARTIAL)
+            if strength.rank >= required.rank or finding.id in insufficient_ids:
+                continue
+            insufficient_ids.add(finding.id)
+            disputes.append(Dispute(
+                id=ids.format_dispute_id(seq), run_id=run_id,
+                point=(f"{finding.id} 为 {finding.severity.value}，但支撑证据"
+                       f"仅为「{strength.label}」，低于该严重度要求"),
+                issue_ids=(finding.id,),
+                kind=DisputeKind.INSUFFICIENT_EVIDENCE,
+                status=DisputeStatus.OPEN,
+                between=("evidence-assessor", f"{finding.dimension}-reviewer"),
+                resolution_hint="补强证据、降级结论，或转人工复核后再定稿。",
+            ))
+            seq += 1
 
     revisions = tuple(
         replace(f, confidence=working[f.id])
@@ -152,7 +228,11 @@ class CrossReviewerNode:
                 f"{NAME} 只处理 cross_review 阶段，当前状态在 {state.stage.value}")
         result = review_findings(
             surviving_findings(state), run_id=state.run_id,
-            first_dispute_seq=int(ctx.config.get("first_dispute_seq", 1)),
+            first_dispute_seq=max(
+                int(ctx.config.get("first_dispute_seq", 1)),
+                max((ids.parse_dispute_id(d.id) for d in state.disputes), default=0) + 1,
+            ),
+            evidence=state.evidence,
         )
         warnings: tuple[str, ...] = ()
         if result.disputes:

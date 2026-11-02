@@ -34,6 +34,7 @@ from ...domain import (
     Evidence,
     EvidenceKind,
     Finding,
+    Location,
     Stage,
     Verification,
     ids,
@@ -128,9 +129,17 @@ def anchor_findings(
         if verdict is Verification.UNANCHORED:
             dropped.append(finding)
             continue
+        location = finding.location
+        if verdict is Verification.ANCHORED:
+            start = text.find(quote)
+            if start >= 0:
+                location = Location(
+                    label=location.label, sentence=location.sentence,
+                    char_start=start, char_end=start + len(quote),
+                )
         evidence.append(Evidence(
             id=ids.format_evidence_id(seq), run_id=run_id,
-            kind=EvidenceKind.QUOTE, quote=quote, location=finding.location,
+            kind=EvidenceKind.QUOTE, quote=quote, location=location,
             verification=verdict,
             verified_by=(ANCHOR_TOOL if verdict is Verification.ANCHORED else None),
             finding_ids=(finding.id,),

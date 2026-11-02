@@ -27,6 +27,7 @@ from ..adapters.issue_codec import EncodedIssue, decode_issue
 from ..domain import Severity
 from ..runtime import RunState, surviving_findings
 from ..runtime.nodes.research import research_limitations
+from .graph import build_graph
 
 SCHEMA_VERSION = "1.0-v1-shadow"
 ENGINE = "architecture-v1"
@@ -252,6 +253,8 @@ def build_shadow_report(
              "status": d.status.value, "between": list(d.between)}
             for d in state.disputes
         ],
+        # B5：关系图只做一次纯投影；报告读者不需要自己遍历 findings/evidence。
+        "graph": build_graph(state),
         "coverage": coverage,
         "purpose": None,            # 由调用方挂（需要目的解析结果）；没填目的就是 None
         "action_plan": None,        # 由调用方挂（需要整改模块与事实库），没挂就是 None
@@ -417,4 +420,16 @@ def render_shadow_md(report: Mapping[str, Any]) -> str:
         lines.append(f"## 争议（共 {len(disputes)} 处，待人工裁定）")
         for dispute in disputes:
             lines.append(f"- {dispute.get('point')}")
+    answers = (report.get("graph") or {}).get("answers") or {}
+    if answers:
+        lines.append("")
+        lines.append("## 证据关系")
+        for fid, answer in answers.items():
+            materials = "、".join(answer.get("materials") or []) or "无"
+            external = "、".join(answer.get("external") or []) or "无"
+            lines.append(
+                f"- `{fid}`：规则 {answer.get('rule') or '—'}；"
+                f"证据 {materials}；外部 {external}；"
+                f"节点 {answer.get('produced_by') or '—'} → "
+                f"{answer.get('reviewed_by') or '—'}")
     return "\n".join(lines) + "\n"

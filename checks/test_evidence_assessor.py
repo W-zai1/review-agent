@@ -14,14 +14,22 @@ from review_agent.domain import (  # noqa: E402
     Evidence,
     EvidenceKind,
     EvidenceStrength,
+    Finding,
+    FindingOrigin,
     Location,
     ReviewProfile,
+    RuleRef,
+    Severity,
     SourceRef,
     Stage,
     Verification,
 )
 from review_agent.runtime import NodeContext, RunState, advance  # noqa: E402
-from review_agent.runtime.nodes import EvidenceAssessorNode, assess_evidence  # noqa: E402
+from review_agent.runtime.nodes import (  # noqa: E402
+    EvidenceAssessorNode,
+    anchor_findings,
+    assess_evidence,
+)
 
 REVIEW_ID = "R-20261102-101"
 RUN_ID = f"{REVIEW_ID}-RUN01"
@@ -77,6 +85,19 @@ class AssessRuleTests(unittest.TestCase):
     def test_idempotent(self):
         first = assess_evidence(quote())
         self.assertEqual(assess_evidence(first), first)
+
+    def test_anchor_writes_character_position(self):
+        item = Finding(
+            id="ISS-0001", run_id=RUN_ID, dimension="fact",
+            severity=Severity.MAJOR, quote="原文一句话",
+            location=Location("第 1 句", 1), confidence=0.8,
+            origin=FindingOrigin.RULE,
+            rule=RuleRef(rule_id="FACT-001", dimension="fact"),
+        )
+        result = anchor_findings([item], "前文。原文一句话。后文",
+                                 run_id=RUN_ID)
+        location = result.evidence[0].location
+        self.assertEqual((location.char_start, location.char_end), (3, 8))
 
 
 class NodeTests(unittest.TestCase):
