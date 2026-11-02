@@ -12,6 +12,15 @@ import json
 import hashlib
 import glob
 
+# 台账校验只有一套实现（含墓碑处理）。`tools/` 里的脚本既可能被 `review.py`
+# 以模块方式导入（ROOT 已在 sys.path），也可能被直接 `python tools/integrity.py`
+# 执行（此时 sys.path[0] 是 tools/）——所以这里自己补一次，且不重复插。
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from review_agent.infrastructure import ledger as ledger_store  # noqa: E402
+
 
 def sha256_bytes(b):
     return hashlib.sha256(b).hexdigest()
@@ -93,23 +102,17 @@ def compute_report_hash(report):
 
 
 def verify_ledger(ledger_path):
-    if not os.path.exists(ledger_path):
-        return (False, "ledger 不存在")
-    prev = "0" * 64
-    seq = 0
-    with open(ledger_path, encoding="utf-8") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            rec = json.loads(raw)
-            seq += 1
-            if rec.get("seq") != seq:
-                return (False, f"序号不连续 @line{seq}")
-            if rec.get("prev_hash") != prev:
-                return (False, f"链条断裂 @seq{rec.get('seq')}: prev_hash 不匹配")
-            prev = rec.get("report_hash", "")
-    return (True, f"ledger 校验通过，共 {seq} 条记录，链完整")
+    """校验台账：链完整 + 序号连续 + 墓碑指向有效。
+
+    实现已收进 `review_agent.infrastructure.ledger.verify`：删除报告现在追加一条
+    独立墓碑行（不再是整文件重写），而旧实现把每一行都当成链上记录，
+    于是**任何一条墓碑都会让这里报"序号不连续"**——删过报告的用户从此看到红字。
+    两种墓碑形态（新版独立行 / 历史原位 `op=delete`）都由那一个实现兼容。
+
+    返回值保持 `(ok, message)`：调用方（CLI / server / 测试）都按这个形状读。
+    """
+    ok, message, _stats = ledger_store.verify(ledger_path)
+    return (ok, message)
 
 
 def rules_version(root=None):

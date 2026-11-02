@@ -1,0 +1,126 @@
+{
+  "id": "doc-review",
+  "name": "文档审查 Agent",
+  "version": "1.4.0",
+  "auto": true,
+  "description": "面向文本类对象（LLM 回答 / 提示词 / 合同 / 政策文本 / 代码片段 / Word 文档）的通用审查：事实、逻辑、安全红线、合规、风格、格式六维。默认 Agent。",
+  "match": {
+    "ext": [
+      ".txt",
+      ".md",
+      ".markdown",
+      ".py",
+      ".js",
+      ".ts",
+      ".jsx",
+      ".tsx",
+      ".go",
+      ".java",
+      ".cpp",
+      ".c",
+      ".json",
+      ".yaml",
+      ".yml",
+      ".xml",
+      ".html",
+      ".css",
+      ".csv",
+      ".log",
+      ".ini",
+      ".conf",
+      ".docx",
+      ".docm"
+    ]
+  },
+  "rules": [
+    "rules"
+  ],
+  "dimensions": [
+    {
+      "id": "fact",
+      "label": "事实",
+      "color": "#f59e0b",
+      "handler": "builtin:fact"
+    },
+    {
+      "id": "safety",
+      "label": "安全",
+      "color": "#dc2626",
+      "handler": "builtin:safety"
+    },
+    {
+      "id": "style",
+      "label": "风格",
+      "color": "#059669",
+      "handler": "builtin:style"
+    },
+    {
+      "id": "compliance",
+      "label": "合规",
+      "color": "#2563eb",
+      "handler": "builtin:compliance"
+    },
+    {
+      "id": "logic",
+      "label": "逻辑",
+      "color": "#7c3aed",
+      "handler": "builtin:logic"
+    },
+    {
+      "id": "format",
+      "label": "格式",
+      "color": "#0891b2",
+      "handler": "builtin:format"
+    }
+  ],
+  "dims_by_type": {
+    "llm_response": [
+      "fact",
+      "logic",
+      "safety",
+      "style",
+      "compliance"
+    ],
+    "prompt": [
+      "fact",
+      "logic",
+      "safety",
+      "style",
+      "compliance"
+    ],
+    "contract": [
+      "fact",
+      "logic",
+      "safety",
+      "compliance",
+      "style"
+    ],
+    "code": [
+      "safety",
+      "style"
+    ],
+    "docx": [
+      "fact",
+      "logic",
+      "safety",
+      "style",
+      "compliance",
+      "format"
+    ]
+  },
+  "default_dims": [
+    "fact",
+    "safety",
+    "style",
+    "compliance"
+  ],
+  "checks": [
+    "builtin:static_scan",
+    "builtin:arith",
+    "builtin:law_cite",
+    "builtin:pattern",
+    "builtin:comp004_dedupe"
+  ],
+  "charter": {},
+  "boundaries": []
+}

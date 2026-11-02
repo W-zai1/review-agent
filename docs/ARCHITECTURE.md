@@ -1,20 +1,24 @@
 # Review Agent 架构 v1
 
-> 状态（2026-10-30，随 `v0.9.2-arch-v1` 更新）：**六层骨架全部落地，旧流程仍是默认路径**。
-> `review_agent/` 已提供领域模型、运行时（六节点 + 编排器 + 检查点）、Application Service、
-> 工具注册表与适配器；但 `--engine` 缺省仍是 `legacy`，`tools/` 的 42 个模块尚未逐个迁移。
-> 逐段迁移的顺序与验收标准见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)。
+> 状态（2026-11-01，批次 1「工程底线」）：**六层骨架全部落地，旧流程仍是默认路径**。
+> `review_agent/` 已提供领域模型、运行时（六节点 + 编排器 + 检查点）、Application Service
+> （含 Task / Report / Audit）、工具注册表与适配器；但 `--engine` 缺省仍是 `legacy`，
+> `tools/` 的 43 个模块尚未逐个迁移。
+> 逐段迁移的顺序与验收标准见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)；
+> 切流（V1 接管）+ 证据可信度 + 工程闭环的排期见
+> [V1-架构收口与整改方案.md](V1-架构收口与整改方案.md)。
 
 ## 1. 要解决的是什么
 
-先看事实，不看口号（数字来自 [PHASE0_INVENTORY.md](PHASE0_INVENTORY.md)，可复现）：
+先看事实，不看口号（2026-11-01 实测；口径 = 含注释与空行的总行数）：
 
 | 事实 | 数值 | 说明 |
 | --- | --- | --- |
-| 全仓 Python | 114 个文件 / 34,638 行 | 其中测试 12,271 行 |
-| 主流程 | `review.py` 3,574 行（有效代码） | `run_one` 一个函数 2,292–3,270 行，约 980 行 |
-| 状态载体 | `Session`（`review.py:402`）持有 10+ 个可变字段 | quote / 证据 / 争议 / 决策 / 日志全部可被任何函数改写 |
-| 能力实现 | `tools/` 平铺 42 个模块，13,274 行 | 靠 `sys.path` 注入互相 import，无注册表、无权限、无统一审计 |
+| 全仓 Python | 123 个文件 / 38,029 行 | 不含 `tests/`、`targets/` |
+| 主流程 | `review.py` 4,833 行（非空非注释 3,998 行） | `run_one` 一个函数 2,469–3,549 行，约 1,081 行 |
+| 状态载体 | `Session`（`review.py:474`）持有 10+ 个可变字段 | quote / 证据 / 争议 / 决策 / 日志全部可被任何函数改写 |
+| 能力实现 | `tools/` 平铺 43 个模块，15,434 行 | 靠 `sys.path` 注入互相 import，无注册表、无权限、无统一审计 |
+| 新架构 | `review_agent/` 39 个文件 / 7,378 行 | 与它的测试（`checks/` 37 文件 / 7,827 行）体量相当 |
 | 结论格式 | 报告 dict 40+ 个顶层键，12 种历史变体 | 无 schema，字段靠约定 |
 
 三个症状：
@@ -36,7 +40,7 @@
 不做微服务，不做多个 Agent 自由对话，不引入消息队列。理由是可验证的约束，不是审美：
 
 * 部署面是 Windows 单机 + `start-console.bat`，没有容器与编排；微服务只会增加启动路径故障点。
-* 当前瓶颈是职责混乱（980 行函数、42 个平铺模块），不是吞吐。引入分布式组件解决不了任何现存问题。
+* 当前瓶颈是职责混乱（1,081 行函数、43 个平铺模块），不是吞吐。引入分布式组件解决不了任何现存问题。
 * 审查结论必须可复现。多个 Agent 自由对话会产生不可复现的推理路径，与「证据驱动」直接冲突。
 
 ## 3. 六层与依赖规则
@@ -72,10 +76,10 @@
 
 | 旧资产 | 现状职责 | 迁移目标 | 阶段 |
 | --- | --- | --- | --- |
-| `run_one`（`review.py:2292`） | 一次审查的全部流程 | Application 用例 + 8 个阶段节点 | 2 |
-| `Session`（`review.py:402`） | 可变状态包 | `runtime.RunState`（不可变）+ 端口 | 2 |
-| `_h_*` 处理器 + `pack_handlers`（`review.py:1516`） | 维度分发 | `capabilities.ToolRegistry` | 3 |
-| `tools/*.py`（42 个） | 能力实现 | `BaseTool` 子类，按批次注册 | 3 |
+| `run_one`（`review.py:2469`） | 一次审查的全部流程 | Application 用例 + 8 个阶段节点 | 2 |
+| `Session`（`review.py:474`） | 可变状态包 | `runtime.RunState`（不可变）+ 端口 | 2 |
+| `_h_*` 处理器 + `pack_handlers`（`review.py:1568`） | 维度分发 | `capabilities.ToolRegistry` | 3 |
+| `tools/*.py`（43 个） | 能力实现 | `BaseTool` 子类，按批次注册 | 3 |
 | 报告 dict（40+ 键） | 对外结论 | 领域聚合 + `extra` 旁路 + `ReportStore` | 3 |
 | `integrity` / `ledger`（`tools/integrity.py`） | 哈希链与校验 | 基础设施实现 `ReportStore` / 审计端口 | 4 |
 
@@ -105,7 +109,7 @@
 ### ADR-002 单 Supervisor + 固定节点，不做自由多 Agent
 
 * 节点是**固定拓扑**：Document Analyzer → Rule Analyzer → Semantic Reviewer → Evidence Analyzer
-  → Cross Reviewer → Decision Engine，由 Supervisor 按阶段推进。
+  → Evidence Assessor → Cross Reviewer → Decision Engine，由 Supervisor 按阶段推进。
 * 不做「Agent 之间自由讨论、互相评分」：结论不可复现，且无法给每条结论定位到确定的责任节点。
 * 详见 [AGENT_RUNTIME.md](AGENT_RUNTIME.md)。
 
@@ -153,28 +157,32 @@
 ```
 review-agent/
 ├── review.py                 # 旧主流程（CLI）：S6 裁定已改为调用领域策略
-├── server.py                 # 旧控制台后端（stdlib http.server），未改
-├── tools/                    # 旧能力实现（42 个模块）
-├── rules/ agents/ knowledge/ config/   # 数据与配置
+├── server.py                 # 旧控制台后端（stdlib http.server）
+├── tools/                    # 旧能力实现（43 个模块）
+├── rules/ agents/ knowledge/ config/   # 数据与配置（agents/ 必须入库，见批次 1）
 ├── outputs/ logs/ ledger/ state/       # 运行产物
 ├── review_agent/             # 新架构（本文件描述的对象）
 │   ├── domain/               # 枚举 / 模型 / 策略 / 状态机 / 端口（零第三方依赖）
+│   ├── application/          # ReviewApplication / TaskService / ReportService / 审计流 / 影子报告
+│   ├── runtime/              # RunState / Node / NodeResult / Orchestrator / 检查点 / 取消令牌
+│   ├── runtime/nodes/        # 八个节点（Document / Planner / Rule / Semantic / Fact Check / Evidence / Cross / Decision）
 │   ├── profiles/             # ReviewProfile 合成（manifest + scenario + format_spec）
 │   ├── adapters/             # 历史报告只读映射（迁移期边界层）
-│   ├── runtime/              # RunState / Node / NodeResult / advance
-│   └── capabilities/         # BaseTool / ToolRegistry / 权限
+│   └── capabilities/         # BaseTool / ToolRegistry / 权限 / 内建工具
 ├── checks/                   # 公开不变量（CI 必跑，含新架构守护测试）
 └── docs/                     # 本组文档
 ```
 
-目标（阶段 2~4 逐步出现）：
+目标（批次 1~3 逐步出现；**不建 `engine/`**——六节点已在 `runtime/nodes/`，改名只会多一套词汇）：
 
 ```
 review_agent/
-├── application/     # ReviewService / TaskService / ReportService
-├── infrastructure/  # SQLite/PG 仓储、文件存储、LLM 客户端、审计出口
-└── engine/          # 六个节点 + Supervisor
+├── infrastructure/  # 只放适配器：ledger（追加式台账）/ retention（保留期）
+└── （其余保持在 domain / application / runtime / capabilities / adapters / profiles）
 ```
+
+目录口径的取舍理由见 [V1-架构收口与整改方案.md](V1-架构收口与整改方案.md) §4.6：
+目录表达**位置**，依赖方向由 `checks/test_architecture_guard.py` 守。
 
 ## 7. 产品形态与当前实现
 
@@ -183,11 +191,11 @@ review_agent/
 
 | 界面 | 需要的数据 | 当前来源 | v1 缺口 |
 | --- | --- | --- | --- |
-| 审查工作台 | 任务、材料、Profile、目的 | `server.py` 上传 + `review.py` CLI 参数 | Profile 解析器（阶段 2） |
-| Agent 执行中心 | 当前阶段、节点、工具调用 | `logs/<id>/task.json` + `tools.jsonl`（事后） | 实时事件流（阶段 4） |
-| 证据审查中心 | Finding ↔ 原文 ↔ 证据 | 报告 `issues[].quote` + `target_text` | Evidence 对象与前端（阶段 3） |
-| 风险与裁定中心 | 争议、风险等级、人工复核 | 报告 `disputes[]` + `verdict` | Decision 对象 + 复核动作（阶段 2~4） |
-| 审计中心 | 运行轨迹、模型版本、历史 | `steps` / `decisions.jsonl` / `ledger/chain.log` | 统一 `AuditEvent` 流（阶段 4） |
+| 审查工作台 | 任务、材料、Profile、目的 | `server.py` 上传 + `review.py` CLI 参数 | Profile 解析器 **已就位**（`profiles/resolver.py`）；缺的是任务落盘（`state/tasks/`）接进 server |
+| Agent 执行中心 | 当前阶段、节点、工具调用 | `logs/<id>/task.json` + `tools.jsonl`（事后） | 统一事件流已建（`application/audit.py`）；缺实时推送 |
+| 证据审查中心 | Finding ↔ 原文 ↔ 证据 | 报告 `issues[].quote` + `target_text` | `evidence[]` 已随报告输出；缺证据强度（批次 3）与前端 |
+| 风险与裁定中心 | 争议、风险等级、人工复核 | 报告 `disputes[]` + `verdict` | `Decision` 已对象化（含 `requires_human_review`）；缺复核动作接线 |
+| 审计中心 | 运行轨迹、模型版本、历史 | `steps` / `decisions.jsonl` / `ledger/chain.log` | `AuditEvent` 流已建（`logs/v1/<id>/events.jsonl`）；缺前端 |
 
 设计稿只作信息架构参考：它展示的「Moderate risk」「Source grounded」等标签，
 在 v1 里必须落到 `RiskLevel` 与 `Evidence.verification` 字段，不允许只存在于前端文案。
@@ -206,9 +214,9 @@ review_agent/
 | --- | --- | --- |
 | 能否追踪一次审查的完整生命周期？ | 旧：`steps` + 三份 jsonl；新：`RunState` 阶段链 + `AuditEvent` + `state/runs/` 落盘 | `checks/test_domain_v1.py::RuntimeStateTests`、`checks/test_orchestrator.py` |
 | 能否单独替换 LLM？ | **是**：节点层经 `SemanticExecutor` 注入执行器；模型层经 `ModelClient` 端口注入客户端（`review.make_llm_review_fn(model_client=...)`），真实供应商也走同一条适配缝（`adapters/model.py`） | `checks/test_semantic_node.py`、`checks/test_model_client.py` |
-| 能否单独测试每个审查节点？ | **是**：六节点各有独立用例（Decision 16 / Evidence 16 / Cross 17 / Rule 17 / Semantic 21 / Document 15），另有 Planner 8、编排器 21 | `checks/test_*_node.py`、`checks/test_planner_node.py` |
-| 能否在中断后恢复执行？ | **状态层是**：`FileRunStore` 落盘 → 读回 → 从断点阶段续跑；「杀进程后自动续跑」仍需入口侧接线 | `checks/test_state_serialization.py`、`checks/test_orchestrator.py::test_resume_does_not_rerun_completed_stages` |
-| 能否追溯每条 Finding 的证据？ | **是**：`Evidence` + `verification` + `verified_by`，报告自 schema 1.2 起带 `evidence[]` | `checks/test_legacy_adapter.py`、`checks/test_report_evidence.py` |
+| 能否单独测试每个审查节点？ | **是**：各节点独立用例（Decision 16 / Evidence 16 / Cross 17 / Rule 18 / Semantic 21 / Document 15 / Fact Check 34），另有 Planner 8、编排器 27、Application 9、Task 32 | `checks/test_*_node.py`、`checks/test_planner_node.py`、`checks/test_research_v1.py`、`checks/test_task_service.py` |
+| 能否在中断后恢复执行？ | **状态层是**：`FileRunStore` 落盘 → 读回 → 从断点阶段续跑；**任务层已能给结论**：`TaskService.recover()` 按「running + 有检查点 + 无活执行者」分出 `resumable` / `orphaned`（废任务就地标 FAILED 并写明原因）。缺的是入口侧自动续跑（批次 2 随 server 整合一起做） | `checks/test_state_serialization.py`、`checks/test_task_lifecycle.py::RecoveryTests` |
+| 能否追溯每条 Finding 的证据？ | **是**：`Evidence` 两根轴——`verification`（引用在不在原文里）+ `strength`（够不够支撑结论，批次 3 / B1），另有 `verified_by` / `source_ref` / `source`；报告自 schema 1.2 起带 `evidence[]`，外部来源证据为 `kind=external_source`（A2）；双向索引由 `advance()` 校验；报告带 `target_text` + 原文快照 `state/text/<sha256>.txt`（B1） | `checks/test_legacy_adapter.py`、`checks/test_report_evidence.py`、`checks/test_research_v1.py`、`checks/test_evidence_strength.py` |
 | 能否证明最终裁定符合规则？ | **是**：`DecisionPolicy` 纯函数 + `consistency_issues` 复算；全量历史重放仅 5 份已登记偏差 | `checks/test_domain_v1.py::PolicyTests`、`checks/test_decision_node.py` |
 | 能否不破坏其他模块地增加 Profile？ | **是**：`ReviewProfile` + `profiles/resolver.py`（四份配置叠加的唯一实现） | `checks/test_profile_resolver.py` |
 

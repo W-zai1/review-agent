@@ -4,6 +4,8 @@
 #           cache（state/research_cache）→ 公开网页（按 providers 顺序）
 # 离线/涉密环境：把 providers 改成 [local]，或运行时加 --no-research。
 providers: [local, so360_m, sogou_m, bing]
+# 抓取目标只允许公网 http(s) 80/443；回环、私网、链路本地地址和 userinfo
+# 会被拒绝，重定向目标也会重新校验（SSRF 防护）。
 max_claims_per_doc: 3          # 每份文档最多核验几条库外主张
 max_results: 8                 # 每个搜索引擎取几条结果
 timeout_seconds: 8             # 单个引擎/单页超时

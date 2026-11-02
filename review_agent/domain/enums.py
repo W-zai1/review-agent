@@ -88,18 +88,28 @@ class RunStatus(StrEnum):
 
     AWAITING_DECISION 是「分析做完了、等裁定/等人工复核」的显式停点：
     旧实现把「跑完」和「裁定完」混在一个状态里，中断恢复时无法判断该不该重跑分析。
+
+    QUEUED / CANCELLED 是 2026-11-01 补的（此前「已提交」与「正在跑」是同一个
+    `running`：用户取消不了，也说不清「在排队还是已开始」）。
+
+    **「可恢复」刻意没有做成状态**：它是「`running` + 有检查点 + 没有活着的执行者」
+    的三元判断（见 `transitions.recoverable`）。做成状态就会出现
+    「记录说可恢复、检查点已被清理」两套真相，而恢复逻辑只能信其中一套。
     """
 
     CREATED = "created"
+    QUEUED = "queued"
     RUNNING = "running"
     AWAITING_DECISION = "awaiting_decision"
     COMPLETED = "completed"
     FAILED = "failed"
     ABORTED = "aborted"
+    CANCELLED = "cancelled"
 
     @property
     def is_terminal(self) -> bool:
-        return self in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.ABORTED)
+        return self in (RunStatus.COMPLETED, RunStatus.FAILED,
+                        RunStatus.ABORTED, RunStatus.CANCELLED)
 
 
 class Stage(StrEnum):
@@ -193,17 +203,85 @@ class EvidenceKind(StrEnum):
 
 
 class Verification(StrEnum):
-    """证据校验结果。
+    """证据校验结果（第一根轴：**这句话在不在原文里**）。
 
     ANCHORED = quote 逐字命中原文（review.py S4 已实现的硬校验）；
     PLACEHOLDER = 「（文档首段）」这类无原文可回查的占位引用（缺失型问题）；
     UNANCHORED = 声称引了原文但回查不到（S4 会丢弃，理论上不应出现在报告里）。
+
+    **这一根轴回答不了「这句话够不够证明这条结论」**——那是 `EvidenceStrength` 的事。
+    两者正交、不得合并：把「引用命中」当成「证据成立」，正是历史报告里
+    `verification=anchored` 被读成「证据充分」的那个坑。
     """
 
     ANCHORED = "anchored"
     PLACEHOLDER = "placeholder"
     UNANCHORED = "unanchored"
     NOT_CHECKED = "not_checked"
+
+
+class EvidenceStrength(StrEnum):
+    """证据强度（第二根轴）：**这条证据够不够支撑结论**。
+
+    与 `Verification` 正交：
+        Verification      说「引用在不在原文里」（锚定）
+        EvidenceStrength  说「这条证据能不能当依据」（强度）
+    一条 `verification=anchored` 的证据可以是 `PARTIAL`（引文确实在原文里，
+    但它证明不了这条结论），也可以是 `CONTRADICTED`（原文这么写，外部来源给出相反数值）。
+
+    取值语义（与 V1 方案 §3.2 一致）：
+
+        UNASSESSED    未评估（**缺省值**：历史报告导入后即此值）
+        UNVERIFIED    声称有来源但无从核验（无快照 / 无域名 / 抓取失败）
+        PARTIAL       只核验了部分（如仅主体匹配、时间口径不明）
+        VERIFIED      四项匹配全过且无相反证据
+        CONTRADICTED  存在相反证据（必须进冲突处理，不能靠降权了事）
+
+    为什么缺省是 `UNASSESSED` 而不是 `UNVERIFIED`：历史报告没有这根轴，
+    标成 `UNVERIFIED` 等于**凭空断言它们不可靠**；标成 `UNASSESSED` 才是「没评估过」。
+    闸门（批次 3）对两者都压裁定强度，但报告措辞与复算口径必须能区分
+    「没评」与「评了但不足」。
+    """
+
+    UNASSESSED = "unassessed"
+    UNVERIFIED = "unverified"
+    PARTIAL = "partial"
+    VERIFIED = "verified"
+    CONTRADICTED = "contradicted"
+
+    @property
+    def rank(self) -> int:
+        """强度序（越大越强），供「最弱一环」规则使用。
+
+        `CONTRADICTED` 是 -1：它不是「弱」，而是**反证**——任何一条反证都要让整条
+        结论进冲突处理，不能靠比大小把它盖过去（见批次 3 的 G3）。所以先判反证再比大小。
+        """
+        return _STRENGTH_RANK[self]
+
+    @property
+    def label(self) -> str:
+        return _STRENGTH_LABEL[self]
+
+    @classmethod
+    def ordered(cls) -> tuple["EvidenceStrength", ...]:
+        """弱 → 强（不含 `CONTRADICTED`：它不是同一根轴上的刻度）。"""
+        return (cls.UNASSESSED, cls.UNVERIFIED, cls.PARTIAL, cls.VERIFIED)
+
+
+_STRENGTH_RANK = {
+    EvidenceStrength.CONTRADICTED: -1,
+    EvidenceStrength.UNASSESSED: 0,
+    EvidenceStrength.UNVERIFIED: 1,
+    EvidenceStrength.PARTIAL: 2,
+    EvidenceStrength.VERIFIED: 3,
+}
+_STRENGTH_LABEL = {
+    EvidenceStrength.UNASSESSED: "未评估",
+    EvidenceStrength.UNVERIFIED: "未核验",
+    EvidenceStrength.PARTIAL: "部分核验",
+    EvidenceStrength.VERIFIED: "已核验",
+    EvidenceStrength.CONTRADICTED: "被反证",
+}
 
 
 class DisputeKind(StrEnum):

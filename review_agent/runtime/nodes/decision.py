@@ -30,17 +30,23 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Final
 
 from ...domain import (
     DEFAULT_POLICY,
+    Dispute,
+    DisputeKind,
+    EvidenceGate,
     Coverage,
     Decision,
     DecisionPolicy,
-    Dispute,
     Finding,
     Stage,
+    Verdict,
+    cap_verdict,
     consistency_issues,
+    evidence_gate,
     ids,
 )
 from ..node import NodeContext, NodeResult, surviving_findings
@@ -57,6 +63,7 @@ def build_decision(
     coverage: Coverage | None = None,
     rationale: str = "",
     policy: DecisionPolicy = DEFAULT_POLICY,
+    extra_reasons: Sequence[str] = (),
     decision_seq: int = 1,
     decided_at: datetime.datetime | None = None,
 ) -> Decision:
@@ -69,20 +76,44 @@ def build_decision(
         findings, disputes=disputes,
         external_unverified=external_unverified, coverage=coverage,
     )
-    text = str(rationale or "").strip() or "；".join(draft.reasons)
+    reasons = (*draft.reasons, *(str(x) for x in extra_reasons if str(x).strip()))
+    text = str(rationale or "").strip() or "；".join(reasons)
     return Decision(
         id=ids.format_decision_id(decision_seq),
         run_id=run_id,
         verdict=draft.verdict,
         rationale=text,
         risk_level=draft.risk_level,
-        reasons=draft.reasons,
+        reasons=reasons,
         rule_refs=draft.rule_refs,
         finding_ids=draft.finding_ids,
         requires_human_review=draft.requires_human_review,
         policy_id=draft.policy_id,
         decided_at=decided_at or datetime.datetime.now().astimezone(),
     )
+
+
+def gate_disputes(findings: Sequence[Finding], gate: EvidenceGate, *,
+                  run_id: str, first_seq: int = 1) -> tuple[Dispute, ...]:
+    """把被反证的 finding 变成确定性争议（B3/G3）。"""
+    by_id = {finding.id: finding for finding in findings}
+    out: list[Dispute] = []
+    seq = int(first_seq)
+    for finding_id in gate.contradicted:
+        finding = by_id.get(finding_id)
+        if finding is None:
+            continue
+        out.append(Dispute(
+            id=ids.format_dispute_id(seq),
+            run_id=run_id,
+            point=f"证据被反证：{finding_id} 的支撑证据不足以维持原结论",
+            issue_ids=(finding_id,),
+            kind=DisputeKind.CONTRADICTION,
+            between=("evidence-assessor",),
+            resolution_hint="补充/替换证据，或把结论降级为待人工确认。",
+        ))
+        seq += 1
+    return tuple(out)
 
 
 class DecisionEngineNode:
@@ -114,22 +145,52 @@ class DecisionEngineNode:
             coverage = Coverage(complete=bool(ctx.config["coverage_complete"]))
 
         try:
+            findings = surviving_findings(state)
+            gate = evidence_gate(
+                findings, state.evidence,
+                enabled=bool(getattr(self.policy, "evidence_gate_enabled", False)))
+            capped = set(gate.capped)
+            gated_findings = tuple(f for f in findings if f.id not in capped)
+            used_dispute_seq = 0
+            for existing in state.disputes:
+                try:
+                    used_dispute_seq = max(used_dispute_seq,
+                                           ids.parse_dispute_id(existing.id))
+                except Exception:
+                    continue
+            new_disputes = gate_disputes(
+                findings, gate, run_id=state.run_id,
+                first_seq=used_dispute_seq + 1)
+            disputes = (*state.disputes, *new_disputes)
             decision = build_decision(
-                surviving_findings(state),
+                gated_findings,
                 run_id=state.run_id,
-                disputes=state.disputes,
+                disputes=disputes,
                 external_unverified=self._flag(ctx, "external_unverified"),
                 coverage=coverage,
                 rationale=str(ctx.config.get("rationale") or ""),
                 policy=self.policy,
+                extra_reasons=gate.reasons,
             )
+            if gate.enabled and gate.cap is Verdict.WARN:
+                capped_verdict = cap_verdict(decision.verdict, gate.cap)
+                decision = replace(
+                    decision,
+                    verdict=capped_verdict,
+                    reasons=(*decision.reasons,
+                             "证据闸门将裁定封顶为 warn"),
+                    requires_human_review=True,
+                )
+            elif gate.needs_human:
+                decision = replace(decision, requires_human_review=True)
         except Exception as e:                          # noqa: BLE001 - 节点边界统一转 NodeResult
             return NodeResult.fail(f"裁定无法生成：{type(e).__name__}: {e}")
 
         # 自检：拿同一份输入复算一遍。算不回来的裁定不允许进入报告。
         problems = consistency_issues(
-            state.findings, decision.verdict, policy=self.policy,
-            external_unverified=self._flag(ctx, "external_unverified"))
+            gated_findings, decision.verdict, policy=self.policy,
+            external_unverified=self._flag(ctx, "external_unverified"),
+            evidence_cap=gate.cap if gate.enabled else None)
         if problems:
             return NodeResult.fail(
                 *problems,
@@ -140,4 +201,7 @@ class DecisionEngineNode:
         if decision.requires_human_review:
             warnings = (f"裁定 {decision.verdict.value} 需人工复核："
                         f"{'；'.join(decision.reasons)}",)
-        return NodeResult.ok(decision=decision, warnings=warnings)
+        if gate.enabled and gate.cap is Verdict.WARN:
+            warnings = (*warnings, "证据闸门：裁定封顶为 warn，需人工复核")
+        return NodeResult.ok(decision=decision, disputes=new_disputes,
+                             warnings=warnings)

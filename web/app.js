@@ -48,6 +48,7 @@ const state = {
   formatSpec: "",
   llm: null,
   llmHistory: [],
+  backendDown: false,
   providers: [],
   providerChanged: false,
   integrity: null,
@@ -72,12 +73,46 @@ function api(path, opts) {
   options.headers = Object.assign(
     { "X-Review-Console": "1" }, (opts && opts.headers) || {});
   return fetch(API_BASE + path, options).then(async (res) => {
+    state.backendDown = false;
     try {
       return await res.json();
     } catch (e) {
       return { ok: false, error: `响应解析失败（HTTP ${res.status}）` };
     }
+  }, () => {
+    // 后端进程没在跑时浏览器只抛一句 "Failed to fetch"，而它出现在哪个
+    // 面板上就像是哪个面板配置错了——LLM 弹窗里报这句会让用户去翻 Key。
+    // 请求根本没到后端，这里直接说清是「控制台没启动」。
+    markBackendDown(path);
+    throw new Error(`无法连接控制台后端（${path}）`);
   });
+}
+
+// 后端不可达时的界面状态：药丸、横幅、弹窗状态行统一改成「控制台未连接」，
+// 避免把「读不到配置」误读成「配置填错了」。
+let backendWarnAt = 0;
+function markBackendDown(path) {
+  state.backendDown = true;
+  const text = $("#llmText");
+  if (text) text.textContent = "控制台未连接";
+  const dot = $("#llmDot");
+  if (dot) dot.className = "status-dot dot-gray";
+  const bannerText = $("#llmBannerText");
+  if (bannerText) {
+    bannerText.textContent =
+      "⚠️ 无法连接控制台后端（服务已退出），「运行审查」不可用。请重新运行 start-console.bat。";
+  }
+  const line = $("#llmStatusLine");
+  if (line) {
+    line.textContent =
+      "无法连接控制台后端：Key / 模型配置没被读取（先重新运行 start-console.bat，不是重新填 Key）";
+    line.className = "llm-status bad";
+  }
+  const now = Date.now();
+  if (now - backendWarnAt > 8000) {
+    backendWarnAt = now;
+    toast(`无法连接控制台后端（${path}）：请重新运行 start-console.bat`, true);
+  }
 }
 
 let toastTimer = null;
@@ -2669,11 +2704,14 @@ function updateRunState() {
   const running = !!(state.job && state.job.status === "running");
   const hasFile = !!state.selected;
   const llmOk = !!(state.llm && state.llm.available);
+  const down = !!state.backendDown;
   btn.disabled = !hasFile || !llmOk || running;
   if (running) btn.textContent = "审查中…";
+  else if (down) btn.textContent = "运行审查（控制台未连接）";
   else if (!llmOk) btn.textContent = "运行审查（需配置 LLM）";
   else btn.textContent = "运行审查";
-  btn.title = !llmOk ? "请先配置 LLM" : !hasFile ? "请先选择或上传文件" : "";
+  btn.title = down ? "无法连接控制台后端：请重新运行 start-console.bat"
+    : !llmOk ? "请先配置 LLM" : !hasFile ? "请先选择或上传文件" : "";
   if (example) example.disabled = running;
 }
 
@@ -2943,6 +2981,20 @@ async function loadLlmStatus() {
     state.llm = null;
   }
   const ok = !!(state.llm && state.llm.available);
+  if (state.backendDown) {
+    // 这次也没读到状态：保留「控制台未连接」，不要退回「LLM 未配置」
+    markBackendDown("/api/llm/status");
+    $("#llmBanner").classList.remove("hidden");
+    document.body.classList.add("has-banner");
+    syncViewportMetrics();
+    updateRunState();
+    return;
+  }
+  const bannerText = $("#llmBannerText");
+  if (bannerText) {
+    bannerText.textContent =
+      "⚠️ 检测到 LLM 模型未配置，「运行审查」按钮已暂停使用。配置后即可开始审查。";
+  }
   $("#llmDot").className = "status-dot " + (ok ? "dot-green" : "dot-gray");
   $("#llmText").textContent = ok ? `LLM · ${state.llm.model}` : "LLM 未配置";
   $("#llmBanner").classList.toggle("hidden", ok);
@@ -2950,6 +3002,9 @@ async function loadLlmStatus() {
   // 否则横幅在的时候三栏底部会被挤出屏幕（CSS 变量见 style.css 的 :root）
   document.body.classList.toggle("has-banner", !ok);
   syncViewportMetrics();
+  // 状态拉到新值后顺手刷一次弹窗状态行：否则断线期间留下的「无法连接」
+  // 会一直停在那儿，等用户关掉再打开弹窗才消失。
+  renderLlmStatusLine();
   updateRunState();
 }
 
@@ -2963,6 +3018,13 @@ function refreshKeyPlaceholder() {
 
 function renderLlmStatusLine() {
   const line = $("#llmStatusLine");
+  if (state.backendDown) {
+    // 后端不可达时「配置状态未知」同样会被读成配置有问题，直接点名真实原因
+    line.textContent =
+      "无法连接控制台后端：Key / 模型配置没被读取（先重新运行 start-console.bat，不是重新填 Key）";
+    line.className = "llm-status bad";
+    return;
+  }
   if (!state.llm) {
     line.textContent = "配置状态未知";
     line.className = "llm-status bad";

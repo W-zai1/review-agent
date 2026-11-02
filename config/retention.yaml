@@ -1,0 +1,21 @@
+# 运行数据保留期（retention）
+#
+# 由 `python -m review_agent.infrastructure.retention` 读取；缺本文件时用
+# `review_agent/infrastructure/retention.py` 里的 DEFAULT_DAYS（两者必须一致）。
+#
+# 口径：天数从**文件修改时间**算；0 表示"下一次清理就删"。
+# 没有"全清"选项——清理工具不该有一个把审计凭据一起抹掉的开关。
+#
+# 永不清理（不在任何类别里，写在这里是给人看的）：
+#   ledger/         审计台账（chain.log / v1-chain.log）：删了就再也证明不了发生过什么
+#   state/tasks/    里**未结束**的任务记录：删了就没有「这个号存在过」的证据
+#   rules/ agents/ knowledge/ config/   判定依据本身
+
+outputs: 365    # outputs/R-*.json / .md / v1/*：正式报告，含原文全文
+trash: 30       # outputs/.trash/：删报告时搬进来的副本
+logs: 180       # logs/R-<id>/：每次审查的日志目录（含 decisions/tools/cost）
+runs: 90        # state/runs/*.state.json：检查点状态，删了只能整单重跑
+text: 90        # state/text/<sha256>.txt：原文快照（按内容寻址，多份报告共用一份）
+tasks: 365      # state/tasks/*.json：任务记录（非终态永不删）
+jobs: 7         # logs/.jobs/*.jsonl：进度事件
+cache: 30       # cache/llm、state/research_cache、state/double_run、state/gap_log.jsonl

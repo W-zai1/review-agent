@@ -20,10 +20,13 @@
 from __future__ import annotations
 
 import abc
+import asyncio
+import json
 import re
 import time
+import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
@@ -49,25 +52,37 @@ class DuplicateToolError(ToolError):
     """同名工具重复注册（会导致「调到的不是想调的那个」）。"""
 
 
+class ToolBudgetError(ToolError):
+    """本次运行的工具调用次数超过预算。
+
+    为什么不复用 ToolError：调用方要区分「工具自己失败（该重试/该降级）」
+    与「被配额拦住（该换策略或结束）」——两者对报告 limitations 的措辞不同。
+    """
+
+
 class Permission(StrEnum):
     """工具权限等级。
 
     READ    读取材料          默认允许
     ANALYZE 分析材料          默认允许
+    RESEARCH 出网检索         默认**不**允许（要走白名单 + 来源留档）
     WRITE   修改审查数据      受控（需要显式授权）
     APPROVE 批准结果          只能由人持有，任何自动流程都不得授予
     """
 
     READ = "read"
     ANALYZE = "analyze"
+    RESEARCH = "research"
     WRITE = "write"
     APPROVE = "approve"
 
 
 # 默认策略：分析类工具开箱即用，写入必须显式授权，批准永远要人。
+# RESEARCH 单独成档：出网等于把材料送到第三方，不能因为"它也算分析"就默认放行。
 DEFAULT_POLICY: Mapping[Permission, bool] = MappingProxyType({
     Permission.READ: True,
     Permission.ANALYZE: True,
+    Permission.RESEARCH: False,
     Permission.WRITE: False,
     Permission.APPROVE: False,
 })
@@ -111,6 +126,9 @@ class ToolResult:
 
     untrusted=True 表示结果内容来自待审文档（外部不可信输入）：
     调用方只能把它当**数据**，不得当指令执行，也不得据此提升权限。
+
+    `invocation_id` 由注册表在执行时填（工具自己不用管）：它让「报告里这条发现
+    是哪个工具产出的」与「审计里那一次调用」对上号。
     """
 
     ok: bool
@@ -118,6 +136,7 @@ class ToolResult:
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     untrusted: bool = False
+    invocation_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", MappingProxyType(dict(self.data)))
@@ -169,7 +188,12 @@ class BaseTool(abc.ABC):
 
 @dataclass(frozen=True, slots=True)
 class ToolInvocation:
-    """一条工具调用审计记录（trace 的最小单元）。"""
+    """一条工具调用审计记录（trace 的最小单元）。
+
+    `invocation_id`：把「审计里的一行」与「结果里的那一次调用」对上。
+    没有它就只能按 (tool, actor, latency) 猜，而同一工具在同一毫秒内被调两次
+    是很常见的（规则分发一阶段跑十几个处理器）。
+    """
 
     tool: str
     permission: Permission
@@ -181,21 +205,34 @@ class ToolInvocation:
     latency_ms: int
     argument_keys: tuple[str, ...]
     dry_run: bool = False
+    invocation_id: str = ""
 
 
 class ToolRegistry:
     """工具注册表 + 统一执行管线。
 
     管线顺序（少一步都出过事）：
-        存在性 → 权限校验 → schema 校验 → 执行 → 结果校验 → 审计
+        存在性 → 权限校验 → **调用预算** → schema 校验 → 执行(超时) → 结果校验(大小) → 审计
     权限放在 schema 之前：无权执行的主体不该拿到「你这个入参写错了」这种
     关于工具内部形状的反馈。反过来，同一主体的合法调用仍会在执行前被 schema 拦住
     （`checks/test_tool_registry.py::test_argument_validation_happens_before_execution`）。
+
+    三个执行约束（批次 2，C7）都**缺省关闭**，不改变既有行为：
+        max_calls  本次运行最多调多少次工具（超出抛 ToolBudgetError）
+        timeout    单次调用上限（秒）；超时按"工具失败"返回，不抛给调用方
+        max_bytes  单次结果序列化上限；超出按"工具失败"返回，防止把整篇文档塞进状态
     """
 
-    def __init__(self, *, on_invoke: Callable[[ToolInvocation], None] | None = None):
+    def __init__(self, *, on_invoke: Callable[[ToolInvocation], None] | None = None,
+                 max_calls: int | None = None,
+                 timeout: float | None = None,
+                 max_bytes: int | None = None):
         self._tools: dict[str, BaseTool] = {}
         self._on_invoke = on_invoke
+        self._max_calls = max_calls
+        self._timeout = timeout
+        self._max_bytes = max_bytes
+        self._calls = 0
 
     def register(self, tool: BaseTool) -> None:
         name = getattr(tool, "name", "")
@@ -216,6 +253,11 @@ class ToolRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
 
+    @property
+    def calls(self) -> int:
+        """本次运行已执行的工具调用次数（审计与配额都要它）。"""
+        return self._calls
+
     def describe(self) -> tuple[dict[str, Any], ...]:
         """给 Agent / UI 的工具清单（不含实现）。"""
         return tuple({
@@ -232,9 +274,15 @@ class ToolRegistry:
             raise ToolPermissionError(
                 f"工具 {name} 需要 {tool.permission.value} 权限，"
                 f"当前主体 {context.actor} 没有该权限")
+        if self._max_calls is not None and self._calls >= self._max_calls:
+            raise ToolBudgetError(
+                f"本次运行的工具调用已达上限 {self._max_calls} 次（{name} 被拒绝）；"
+                "继续调用会让审查变成「用配额堆结论」，请先看覆盖率与限制")
         validated = tool.validate_arguments(arguments)
+        invocation_id = uuid.uuid4().hex[:12]
         started = time.perf_counter()
-        result = await tool.execute(validated, context)
+        self._calls += 1
+        result = await self._invoke(tool, name, validated, context, invocation_id)
         latency = int((time.perf_counter() - started) * 1000)
         if not isinstance(result, ToolResult):
             raise ToolError(f"工具 {name} 返回了 {type(result).__name__}，必须是 ToolResult")
@@ -243,7 +291,47 @@ class ToolRegistry:
             review_id=context.review_id, run_id=context.run_id, ok=result.ok,
             error_count=len(result.errors), latency_ms=latency,
             argument_keys=tuple(sorted(arguments)), dry_run=context.dry_run,
+            invocation_id=invocation_id,
         )
         if self._on_invoke is not None:
             self._on_invoke(invocation)
         return result, invocation
+
+    async def _invoke(self, tool: BaseTool, name: str, validated: Any,
+                      context: ToolContext, invocation_id: str) -> ToolResult:
+        """执行 + 两道护栏（超时 / 输出大小），失败都折成 ToolResult 而不是抛异常。
+
+        为什么折成结果而不是抛：调用方（规则执行器）已经按 `result.ok` 分支处理，
+        抛异常会让"某个工具慢"升级成"整条审查崩"。工具的慢是**可解释的失败**，
+        应该出现在报告 limitations 里，而不是让用户看到 500。
+        """
+        call = tool.execute(validated, context)
+        try:
+            if self._timeout is None:
+                result = await call
+            else:
+                result = await asyncio.wait_for(call, timeout=self._timeout)
+        except TimeoutError:
+            return ToolResult.failure(
+                f"工具 {name} 超时（超过 {self._timeout:g}s 未返回）",
+                untrusted=True)
+        except Exception as exc:                    # noqa: BLE001 - 工具边界
+            return ToolResult.failure(
+                f"工具 {name} 抛异常：{type(exc).__name__}: {exc}",
+                untrusted=getattr(exc, "untrusted", False))
+        if not isinstance(result, ToolResult):
+            # 类型不对由 `execute` 统一报错（同一句文案只在那一处）
+            return result
+        result = replace(result, invocation_id=invocation_id)
+        if self._max_bytes is not None:
+            try:
+                size = len(json.dumps(dict(result.data), ensure_ascii=False,
+                                      default=str).encode("utf-8"))
+            except (TypeError, ValueError):
+                size = 0
+            if size > self._max_bytes:
+                return ToolResult.failure(
+                    f"工具 {name} 输出过大（{size} 字节 > 上限 {self._max_bytes}）；"
+                    "过大的中间结果不能进状态：它会让报告与检查点一起膨胀",
+                    untrusted=result.untrusted)
+        return result

@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from ...domain import (
@@ -147,6 +147,10 @@ def evidence_to_report(evidence: Sequence[Evidence]) -> list[dict[str, Any]]:
     为什么报告里要有它：`issues[].quote` 只说「我引了这句」，不回答「这句核过没有」。
     有了 `verification`，读者能区分「逐字命中原文」「占位式引用（原文确实没有）」
     与「未校验」——这正是「证据可追溯」在产品层面的落地。
+
+    **这一段（旧报告 / legacy 口径）保持逐字节不变**：它是历史报告并排比对的基线，
+    加字段会让 202 份历史报告无法逐键对比。第二根轴 `strength` 只出现在 v1 影子
+    报告的 `evidence[]` 里（见 `application/shadow_report.py`）。
     """
     return [
         {
@@ -160,6 +164,52 @@ def evidence_to_report(evidence: Sequence[Evidence]) -> list[dict[str, Any]]:
         }
         for ev in evidence
     ]
+
+
+def backfill_evidence_ids(findings: Sequence[Finding],
+                          evidence: Sequence[Evidence]) -> tuple[Finding, ...]:
+    """把「证据指向发现」补成**双向索引**：回填 `Finding.evidence_ids`。
+
+    为什么需要回填：证据是 analysis / evidence 阶段才产出的，而 Finding 不可变、
+    构造时就写了 `evidence_ids`——晚到的证据没法再改它。不补的后果是
+    `Finding.evidence_ids` 在 v1 路径上**恒为空**：报告里每条结论都说不出
+    「我有哪些证据」，查一次就得全表扫证据。
+
+    做法与交叉复核降权一致：不可变对象只通过 `NodeResult.revisions` 修订，
+    由 `advance()` 按 id 替换——不允许节点偷改上游对象。
+    """
+    by_finding: dict[str, list[str]] = {}
+    for item in evidence:
+        for fid in item.finding_ids:
+            by_finding.setdefault(fid, []).append(item.id)
+    revisions: list[Finding] = []
+    for finding in findings:
+        new_ids = by_finding.get(finding.id)
+        if not new_ids:
+            continue
+        # 合并而不是覆盖：上游阶段（例如库外核验）可能已经挂过证据
+        merged = tuple(dict.fromkeys((*finding.evidence_ids, *new_ids)))
+        if merged == finding.evidence_ids:
+            continue
+        revisions.append(replace(finding, evidence_ids=merged))
+    return tuple(revisions)
+
+
+def next_evidence_seq(state: Any, *, floor: int = 1) -> int:
+    """本阶段可用的证据起始号：**已有证据之后**，且不低于 `floor`。
+
+    证据编号是 Run 级资源。analysis 阶段的库外核验也会产出证据
+    （`EXTERNAL_SOURCE`），如果证据阶段仍从 1 起号，两个阶段会各发一条
+    `EV-0001`——报告里「这条证据指向哪个发现」当场变成掷硬币，
+    而且没有任何异常会提醒你。
+    """
+    best = 0
+    for item in getattr(state, "evidence", ()) or ():
+        try:
+            best = max(best, ids.parse_evidence_id(item.id))
+        except Exception:                          # noqa: BLE001 - 脏 id 不参与编号
+            continue
+    return max(best + 1, int(floor))
 
 
 class EvidenceAnalyzerNode:
@@ -182,7 +232,8 @@ class EvidenceAnalyzerNode:
 
         result = anchor_findings(
             state.findings, text, run_id=state.run_id,
-            first_evidence_seq=int(ctx.config.get("first_evidence_seq", 1)),
+            first_evidence_seq=next_evidence_seq(
+                state, floor=int(ctx.config.get("first_evidence_seq", 1))),
         )
         dropped = tuple({
             "finding_id": f.id,
@@ -191,12 +242,17 @@ class EvidenceAnalyzerNode:
             "reason": DROP_REASON,
         } for f in result.dropped)
 
+        # 双向索引：证据指向发现的这一侧由 `anchor_findings` 写好，
+        # 发现指向证据的那一侧在这里补（`Finding` 不可变 → 走 revisions）。
+        revisions = backfill_evidence_ids(state.findings, result.evidence)
+
         warnings: tuple[str, ...] = ()
         if result.dropped:
             warnings = (f"丢弃 {len(result.dropped)} 条 quote 不可回溯的发现："
                         f"{'、'.join(result.dropped_ids[:5])}",)
         return NodeResult.ok(
             evidence=result.evidence,
+            revisions=revisions,
             output={"evidence_dropped": dropped},
             warnings=warnings,
         )

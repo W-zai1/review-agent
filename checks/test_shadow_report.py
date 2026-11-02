@@ -82,11 +82,39 @@ class BuildTests(unittest.TestCase):
         report = build_shadow_report(state())
         blocks = [item["block"] for item in report["unsupported_blocks"]]
         self.assertEqual(blocks, [key for key, _ in UNSUPPORTED_BLOCKS])
-        self.assertIn("law_library", blocks)
-        self.assertIn("research", blocks)
-        # 哈希链、整改单、目的比对都已接入，不再算「未支持」
-        for done in ("integrity.chain", "action_plan", "purpose"):
+        # 2026-11-01：两块都接入了，未支持清单清零（切流判据之一）。
+        #   law_library —— 与旧报告共用 law_library_block()
+        #   research    —— FactCheckNode + research.web，报告段共用 build_block()
+        self.assertEqual(blocks, [], "切流判据要求未支持清单为空")
+        for done in ("research", "law_library", "integrity.chain",
+                     "action_plan", "purpose"):
             self.assertNotIn(done, blocks)
+        # 但「没做」必须照实说在 limitations 里，不能因为清单空了就不提
+        self.assertTrue(any("未做库外事实核验" in item
+                            for item in report["limitations"]))
+
+    def test_law_library_block_is_reported_when_injected(self):
+        lib = {"available": True, "articles_total": 98,
+               "laws": [{"id": "labor-contract", "name": "劳动合同法",
+                         "status": "现行有效", "effective_date": "2013-07-01",
+                         "articles": 98, "source_url": "x", "retrieved_at": "y"}],
+               "cited": [], "skipped": []}
+        report = build_shadow_report(state(), law_library=lib)
+        self.assertEqual(report["law_library"]["articles_total"], 98)
+        self.assertEqual(report["law_library"]["laws"][0]["id"], "labor-contract")
+        # limitations 必须自报"依据只有这几部法"，否则一条"依据：第十九条"
+        # 会被读成"全部法律都查过了"
+        self.assertTrue(any("法律依据仅限已收录的法条库" in item
+                            for item in report["limitations"]))
+
+    def test_law_library_none_says_not_integrated(self):
+        report = build_shadow_report(state())
+        self.assertIsNone(report["law_library"])
+
+    def test_law_library_unavailable_is_explained(self):
+        report = build_shadow_report(state(), law_library={"available": False,
+                                                           "error": "库损坏"})
+        self.assertTrue(any("法条库不可用" in item for item in report["limitations"]))
 
     def test_limitations_mention_missing_logs_hash(self):
         report = build_shadow_report(state())
@@ -99,7 +127,8 @@ class BuildTests(unittest.TestCase):
             profile=base.profile, completed_stages=base.completed_stages,
             warnings=("节点告警一条",))
         report = build_shadow_report(warned)
-        self.assertTrue(any("law_library" in item for item in report["limitations"]))
+        self.assertTrue(any("未做库外事实核验" in item
+                            for item in report["limitations"]))
         self.assertTrue(any("节点告警一条" in item for item in report["limitations"]))
 
     def test_dropped_findings_do_not_appear(self):
@@ -151,7 +180,7 @@ class RenderTests(unittest.TestCase):
         text = render_shadow_md(report)
         self.assertIn("warn", text)
         self.assertIn("边界（这份报告没有做什么）", text)
-        self.assertIn("law_library", text)
+        self.assertIn("research", text)
         self.assertIn("ISS-0001", text)
 
     def test_markdown_flags_empty_result_honestly(self):

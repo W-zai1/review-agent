@@ -25,8 +25,14 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 
-from .enums import FindingOrigin, RiskLevel, Severity, Verdict
-from .models import Coverage, Dispute, Finding, RunStats
+from .enums import (
+    EvidenceStrength,
+    FindingOrigin,
+    RiskLevel,
+    Severity,
+    Verdict,
+)
+from .models import Coverage, Dispute, Evidence, Finding, RunStats
 
 POLICY_ID = "review-decision-v1"
 
@@ -45,6 +51,84 @@ class DecisionDraft:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceGate:
+    """证据闸门的确定性结论（B3，缺省关闭）。"""
+
+    enabled: bool = False
+    cap: Verdict = Verdict.PASS
+    capped: tuple[str, ...] = ()
+    contradicted: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+    needs_human: bool = False
+
+
+def evidence_gate(findings: Sequence[Finding],
+                  evidence: Sequence[Evidence],
+                  *, enabled: bool = False) -> EvidenceGate:
+    """按证据强度封顶裁定。
+
+    规则与 V1 方案 §3.4 对齐：
+      G1  一条 finding 的支撑强度取所有证据的最弱一环；
+      G2  blocker/major + UNASSESSED/UNVERIFIED → 不计入 fail，cap=WARN；
+      G3  任一证据 CONTRADICTED → 全局 cap=WARN，并进入争议；
+      G4  PARTIAL → cap=WARN，保留原严重度但需人工确认；
+      G5  enabled=False → 与今天的裁定完全一致。
+
+    没有证据的「缺失型问题」（quote 为空）不在这里被罚：它本来就不需要
+    引用原文，证据节点不会为它造证据。非空 quote 却没有证据，按 UNASSESSED
+    处理——这正是需要拦下的情况。
+    """
+    if not enabled:
+        return EvidenceGate()
+
+    by_finding: dict[str, list[Evidence]] = {}
+    for item in evidence:
+        for fid in item.finding_ids:
+            by_finding.setdefault(fid, []).append(item)
+
+    capped: list[str] = []
+    contradicted: list[str] = []
+    reasons: list[str] = []
+    needs_human = False
+    for finding in findings:
+        rows = by_finding.get(finding.id, [])
+        if not rows and not str(finding.quote or "").strip():
+            continue
+        if any(e.strength is EvidenceStrength.CONTRADICTED for e in rows):
+            contradicted.append(finding.id)
+            reasons.append(f"{finding.id} 的支撑证据被反证，不得作为确定性结论")
+            needs_human = True
+            continue
+        if rows:
+            strength = min((e.strength for e in rows), key=lambda s: s.rank)
+        else:
+            strength = EvidenceStrength.UNASSESSED
+        if strength in (EvidenceStrength.UNASSESSED, EvidenceStrength.UNVERIFIED):
+            if finding.severity in (Severity.BLOCKER, Severity.MAJOR):
+                capped.append(finding.id)
+                reasons.append(
+                    f"{finding.id} 的 {finding.severity.value} 证据强度为"
+                    f"「{strength.label}」，不计入 fail 判定")
+                needs_human = True
+        elif strength is EvidenceStrength.PARTIAL:
+            capped.append(finding.id)
+            reasons.append(
+                f"{finding.id} 的支撑证据仅「{strength.label}」，结论强度封顶为 warn")
+            needs_human = True
+
+    if not capped and not contradicted:
+        return EvidenceGate(enabled=True)
+    return EvidenceGate(
+        enabled=True,
+        cap=Verdict.WARN,
+        capped=tuple(dict.fromkeys(capped)),
+        contradicted=tuple(dict.fromkeys(contradicted)),
+        reasons=tuple(dict.fromkeys(reasons)),
+        needs_human=needs_human,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionPolicy:
     """策略参数。改参数 = 改口径，必须升 version 并留 ADR。"""
 
@@ -56,6 +140,9 @@ class DecisionPolicy:
     review_on_incomplete_coverage: bool = False
     critical_blocker_count: int = 3
     version: str = "1"
+    # 证据闸门：缺省关闭，开启后必须配合 B2 评估节点；否则证据全是 UNASSESSED，
+    # 所有 blocker/major 都会被封顶为 warn。
+    evidence_gate_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence_threshold <= 1.0:
@@ -161,17 +248,27 @@ DEFAULT_POLICY = DecisionPolicy()
 
 def consistency_issues(findings: Iterable[Finding], verdict: Verdict,
                        *, policy: DecisionPolicy = DEFAULT_POLICY,
-                       external_unverified: bool = False) -> tuple[str, ...]:
+                       external_unverified: bool = False,
+                       evidence_cap: Verdict | None = None) -> tuple[str, ...]:
     """复算裁定，返回与给定 verdict 不一致的说明。
 
     这是「能否证明最终裁定符合规则」这条验收标准的实现：不信任报告里的 verdict，
     用同一套策略重算一遍。
     """
     draft = policy.decide(list(findings), external_unverified=external_unverified)
-    if draft.verdict is Verdict(verdict):
+    expected = draft.verdict
+    if evidence_cap is not None:
+        expected = cap_verdict(expected, evidence_cap)
+    if expected is Verdict(verdict):
         return ()
-    return (f"报告裁定 {verdict}，策略复算为 {draft.verdict}"
+    return (f"报告裁定 {verdict}，策略复算为 {expected}"
             f"（{'；'.join(draft.reasons)}）",)
+
+
+def cap_verdict(verdict: Verdict, cap: Verdict) -> Verdict:
+    """把裁定限制在 cap 以内（PASS < WARN < FAIL）。"""
+    order = {Verdict.PASS: 0, Verdict.WARN: 1, Verdict.FAIL: 2}
+    return verdict if order[verdict] <= order[cap] else cap
 
 
 def finding_violations(findings: Iterable[Finding],

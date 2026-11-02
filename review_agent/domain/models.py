@@ -29,6 +29,7 @@ import datetime
 import hashlib
 import json
 import re
+import urllib.parse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -41,6 +42,7 @@ from .enums import (
     DisputeKind,
     DisputeStatus,
     EvidenceKind,
+    EvidenceStrength,
     FindingOrigin,
     FindingStatus,
     RiskLevel,
@@ -83,6 +85,14 @@ def _hash(value: Any, field_name: str) -> str | None:
 
 def _frozen(mapping: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return MappingProxyType(dict(mapping or {}))
+
+
+def _domain_of(url: str) -> str:
+    """从 URL 里取主机名（`SourceRef` 不要求调用方自己填 domain）。"""
+    try:
+        return (urllib.parse.urlparse(str(url or "")).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def _enum(enum_cls, value, field_name: str):
@@ -329,12 +339,134 @@ class ReviewProfile:
 # ---------------------------------------------------------------------------
 # 证据 / 发现
 # ---------------------------------------------------------------------------
+# 「四项匹配」的固定类型。为什么固定：证据强度是**可复算**的（ADR-003），
+# 让 kind 变成自由字符串，强度判定就会退化成一家之言——今天多一项、
+# 明天少一项，「四项全过」这四个字就没有意义了。
+MATCH_KINDS: tuple[str, ...] = ("source_identity", "subject", "metric", "period")
+_MATCH_LABEL = {
+    "source_identity": "来源身份",
+    "subject": "主体",
+    "metric": "指标",
+    "period": "时间口径",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRef:
+    """外部来源的元数据（比 `Evidence.source_ref` 那个字符串多出来的部分）。
+
+    为什么两者都留：`source_ref` 是 URL 字符串，历史报告与前端已经在读它；
+    `SourceRef` 承载「哪个域、算不算官方、什么时候抓的、抓下来的正文哈希」——
+    没有这几项就无法回答「半年后还能不能复核这条外部证据」。
+    """
+
+    url: str
+    domain: str = ""
+    official: bool = False
+    fetched_at: datetime.datetime | None = None
+    # 抓取正文的 sha256。为空 = 只见过搜索摘要，没见过正文：
+    # 这类来源**最多只能是 PARTIAL**（见 Evidence 的不变量）。
+    snapshot_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        url = _text(self.url, "source.url")
+        _require(bool(url), "source.url 不能为空")
+        _require(url.lower().startswith(("http://", "https://")),
+                 f"source.url 必须是 http(s) 地址：{url!r}")
+        domain = _text(self.domain, "source.domain") or _domain_of(url)
+        # 允许调用方不传 domain：从 url 推比让它自己填更不容易错
+        object.__setattr__(self, "domain", domain.lower())
+        _require(bool(domain), f"source.domain 无法从 URL 推出：{url!r}")
+        object.__setattr__(self, "url", url)
+
+    @property
+    def is_snapshot(self) -> bool:
+        """有没有正文快照（决定它能不能被核到 VERIFIED）。"""
+        return bool(_text(self.snapshot_hash))
+
+
+@dataclass(frozen=True, slots=True)
+class MatchCheck:
+    """一项匹配核验：主体 / 指标 / 时间 / 来源身份。
+
+    `ok=None` 是「无法判定」——**不得当作通过**。这个三态是刻意的：
+    把「不知道」写成 False 会让报告说「已核验为错」，写成 True 就是伪造核验。
+    """
+
+    kind: str
+    ok: bool | None = None
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        _require(self.kind in MATCH_KINDS,
+                 f"match.kind 必须是 {MATCH_KINDS} 之一，实际 {self.kind!r}")
+        _require(self.ok is None or isinstance(self.ok, bool),
+                 f"match.ok 必须是 True / False / None，实际 {self.ok!r}")
+
+    @property
+    def label(self) -> str:
+        return _MATCH_LABEL.get(self.kind, self.kind)
+
+    @property
+    def passed(self) -> bool:
+        """明确通过（`None` 不算通过）。"""
+        return self.ok is True
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAssessment:
+    """一次证据评估的结果（谁评的、四项各是什么结论）。
+
+    为什么带 `assessed_by`：强度必须是**可复算**的。没有评估者与评估时间，
+    「VERIFIED」就成了一个谁都能写上去的标签（不变量会拦住没有评估者的 VERIFIED）。
+    """
+
+    checks: tuple[MatchCheck, ...] = ()
+    assessed_by: str = ""
+    assessed_at: datetime.datetime | None = None
+
+    def __post_init__(self) -> None:
+        for check in self.checks:
+            _require(isinstance(check, MatchCheck),
+                     f"assessment.checks 只能是 MatchCheck，实际 {type(check).__name__}")
+        if self.checks:
+            _require(bool(_text(self.assessed_by)),
+                     "有匹配项的评估必须记录 assessed_by（谁评的）")
+        seen = [c.kind for c in self.checks]
+        _require(len(seen) == len(set(seen)),
+                 f"同一项匹配不能出现两次：{seen}")
+
+    def by_kind(self) -> dict[str, MatchCheck]:
+        return {c.kind: c for c in self.checks}
+
+    @property
+    def covers_all(self) -> bool:
+        """四项是否都评过（缺一项就不能称 VERIFIED）。"""
+        return set(self.by_kind()) == set(MATCH_KINDS)
+
+    @property
+    def all_passed(self) -> bool:
+        """四项是否**都明确通过**（`None` 不算）。"""
+        return self.covers_all and all(c.passed for c in self.checks)
+
+    @property
+    def failed(self) -> tuple[str, ...]:
+        """明确不通过的项（`None` 不算）。"""
+        return tuple(c.label for c in self.checks if c.ok is False)
+
+
 @dataclass(frozen=True, slots=True)
 class Evidence:
     """证据：支撑一条 Finding 的最小可校验单元。
 
     旧报告只有 issue.quote + issue.evidence 两个字符串，无法表达
-    「引的是原文 / 还是外部来源 / 校验过没有」。Evidence 把这三件事拆开。
+    「引的是原文 / 还是外部来源 / 校验过没有」。Evidence 把这几件事拆开。
+
+    两根轴（2026-11-01 起，批次 3 / B1）：
+        `verification`  引用在不在原文里（四值，历史报告已有）
+        `strength`      这条证据够不够支撑结论（五值，新增，缺省 UNASSESSED）
+    两条轴不合并：合并会让 202 份历史报告的 `verification` 语义一起变，
+    等于批量重写历史结论（违反 ADR-007）。
     """
 
     id: str
@@ -354,6 +486,13 @@ class Evidence:
     # Finding.evidence_ids 保留为「我引用了哪些证据」的反向索引，两者由
     # runtime.advance() 校验不出现悬空指向。
     finding_ids: tuple[str, ...] = ()
+    # ---- 批次 3 / B1 新增（全部带默认值，历史 JSON 原样可读）----
+    strength: EvidenceStrength = EvidenceStrength.UNASSESSED
+    assessment: EvidenceAssessment | None = None
+    # 反证它的证据编号（`CONTRADICTED` 必须非空：一条反证都不指出，等于让
+    # 读者自己去猜"凭什么说它错了"）
+    contradicted_by: tuple[str, ...] = ()
+    source: SourceRef | None = None
 
     def __post_init__(self) -> None:
         ids.parse_evidence_id(self.id)
@@ -362,11 +501,50 @@ class Evidence:
             _require(bool(_text(self.quote)), "quote 类证据必须有原文片段")
         if self.kind is EvidenceKind.EXTERNAL_SOURCE:
             _require(bool(_text(self.source_ref)), "外部来源证据必须有 source_ref")
+            _require(self.source is not None,
+                     "外部来源证据必须有 source（域名/官方域/抓取时间），"
+                     "否则「外部核验过」是一句无法复核的自我声明")
         if self.verification is Verification.ANCHORED:
             _require(bool(_text(self.verified_by)),
                      "已锚定的证据必须记录 verified_by（谁校验的）")
         for fid in self.finding_ids:
             ids.parse_finding_id(fid)
+        for cid in self.contradicted_by:
+            ids.parse_evidence_id(cid)
+
+        # ---- 三条硬不变量（V1 方案 §3.2）----
+        # 它们的作用不是"校验格式"，是让「强度」**写不出来**：
+        # 想标 VERIFIED，就必须有评估者、四项匹配全过；
+        # 想标 CONTRADICTED，就必须指出反证；标了 UNASSESSED，就不许带评估结果。
+        if self.strength is EvidenceStrength.VERIFIED:
+            _require(bool(_text(self.verified_by)) or self.assessment is not None,
+                     "VERIFIED 必须记录评估者（verified_by 或 assessment.assessed_by）")
+            _require(self.assessment is not None and self.assessment.all_passed,
+                     "VERIFIED 必须四项匹配（来源身份/主体/指标/时间）全部明确通过；"
+                     "缺项或「无法判定」都不能称已核验")
+            _require(not self.contradicted_by,
+                     "有反证的证据不能同时是 VERIFIED")
+            if self.kind is EvidenceKind.EXTERNAL_SOURCE:
+                # 没有正文快照的外部来源，最多只能到 PARTIAL：
+                # 只见过搜索摘要，就无法证明「来源原文确实这么说」。
+                _require(self.source is not None and self.source.is_snapshot,
+                         "外部来源证据要标 VERIFIED 必须有正文快照"
+                         "（source.snapshot_hash）；只有摘要的来源最多到 PARTIAL")
+        elif self.strength is EvidenceStrength.CONTRADICTED:
+            _require(bool(self.contradicted_by),
+                     "CONTRADICTED 必须指出反证证据编号（contradicted_by 不能为空）")
+        elif self.strength is EvidenceStrength.UNASSESSED:
+            _require(self.assessment is None,
+                     "UNASSESSED 不许带评估结果：要么评出结论，要么别评")
+        elif self.strength is EvidenceStrength.PARTIAL:
+            # PARTIAL 必须说明「部分」在哪一项上——否则读者无法判断能用到什么程度
+            _require(self.assessment is not None,
+                     "PARTIAL 必须带 assessment（哪一项过了、哪一项没过/没判）")
+
+    @property
+    def is_sufficient(self) -> bool:
+        """这条证据够不够当确定性依据（只有 VERIFIED 算）。"""
+        return self.strength is EvidenceStrength.VERIFIED
 
 
 @dataclass(frozen=True, slots=True)

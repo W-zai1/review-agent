@@ -1,0 +1,85 @@
+{
+  "id": "security-audit",
+  "name": "安全审查 Agent",
+  "version": "1.0.1",
+  "auto": false,
+  "description": "面向代码 / 配置 / 提示词的安全审查：凭据泄露、注入面（SQL/命令/代码执行/反序列化/模板/路径）、危险配置（调试、CORS、容器）、依赖锁定。只判「写法是否存在风险」，不判「是否可被实际利用」。",
+  "rules": [
+    "rules/safety.yaml",
+    "agents/security-audit/rules"
+  ],
+  "dimensions": [
+    {
+      "id": "secret",
+      "label": "凭据",
+      "color": "#b45309",
+      "handler": "pack:secret"
+    },
+    {
+      "id": "injection",
+      "label": "注入",
+      "color": "#dc2626",
+      "handler": "pack:injection"
+    },
+    {
+      "id": "config",
+      "label": "配置",
+      "color": "#7c3aed",
+      "handler": "pack:config"
+    },
+    {
+      "id": "dependency",
+      "label": "依赖",
+      "color": "#0d9488",
+      "handler": "pack:dependency"
+    },
+    {
+      "id": "safety",
+      "label": "内容红线",
+      "color": "#e11d48",
+      "handler": "builtin:safety"
+    }
+  ],
+  "dims_by_type": {
+    "code": [
+      "secret",
+      "injection",
+      "config",
+      "dependency",
+      "safety"
+    ],
+    "prompt": [
+      "injection",
+      "secret",
+      "safety"
+    ]
+  },
+  "default_dims": [
+    "secret",
+    "injection",
+    "config",
+    "dependency",
+    "safety"
+  ],
+  "checks": [],
+  "charter": {
+    "purpose": "在代码合入前找出可被利用的安全写法：凭据泄露、注入面、危险默认配置、依赖未锁定",
+    "audience": "研发与安全评审人",
+    "consequence": "high",
+    "strictness": "strict",
+    "focus": [
+      "外部输入是否进入了 SQL / shell / eval / 模板 / 文件路径",
+      "凭据是否以明文形式存在于代码或配置",
+      "生产默认配置是否安全（调试开关、CORS、证书校验、容器权限）",
+      "依赖是否可复现（是否锁定版本与来源）"
+    ],
+    "notes": "这是静态写法审查：命中代表「存在该风险写法」，是否可利用需结合运行时上下文判断；不要因为本 Agent 未报就认为代码安全。"
+  },
+  "boundaries": [
+    "只做静态写法匹配，不做数据流跟踪：跨函数/跨文件把外部输入带进危险调用的链路查不出来",
+    "不解析 AST，不做类型推断：别名赋值（如 f = eval 后再调用）不会被识别",
+    "不做依赖漏洞比对（无 CVE 库），只查「是否锁定版本与来源」",
+    "不覆盖运行时配置与基础设施：K8s RBAC、云 IAM、网络策略不在范围内",
+    "不覆盖业务逻辑越权（IDOR / 水平越权）——需要结合接口设计人工判断"
+  ]
+}

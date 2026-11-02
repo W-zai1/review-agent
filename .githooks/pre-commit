@@ -18,4 +18,5 @@ else
   PY=python
 fi
 
+"$PY" tools/secret_scan.py --staged || exit 1
 exec "$PY" tools/changelog_guard.py --staged

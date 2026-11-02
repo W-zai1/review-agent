@@ -31,6 +31,14 @@ from .builtin_tools import (
     TextRegexTool,
     batch1_tools,
 )
+from .research import (  # noqa: F401 - 能力层公共出口
+    NAME as RESEARCH_TOOL_NAME,
+)
+from .research import (
+    ResearchClaimArgs,
+    ResearchWebTool,
+    research_tools,
+)
 from .semantic_ingest import (  # noqa: F401 - 能力层公共出口
     Candidate,
     IngestContext,
@@ -64,4 +72,5 @@ __all__ = [
     "DocxFormatArgs", "DocxFormatTool", "TextLintArgs", "TextLintTool",
     "KnowledgeRetrieveArgs", "KnowledgeRetrieveTool",
     "DocumentExtractArgs", "DocumentExtractTool",
+    "RESEARCH_TOOL_NAME", "ResearchClaimArgs", "ResearchWebTool", "research_tools",
 ]

@@ -29,8 +29,10 @@ import argparse
 import datetime
 import hashlib
 import html as html_mod
+import ipaddress
 import json
 import re
+import socket
 import sys
 import time
 import urllib.parse
@@ -109,7 +111,26 @@ def _cache_path(claim):
     return CACHE_DIR / f"{_cache_key(claim)}.json"
 
 
-def cache_get(claim):
+def cache_touch(claim, owner):
+    """记录某次审查用过这条检索缓存；删除报告时据此判断引用。"""
+    if not owner:
+        return
+    p = _cache_path(claim)
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        owners = list(data.get("_owners") or [])
+        if owner not in owners:
+            owners.append(owner)
+            data["_owners"] = owners
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+
+def cache_get(claim, owner=None):
     p = _cache_path(claim)
     if not p.exists():
         return None
@@ -119,14 +140,25 @@ def cache_get(claim):
         ttl = int(data.get("ttl_days") or 30)
         if datetime.datetime.now().astimezone() - ts > datetime.timedelta(days=ttl):
             return None
+        cache_touch(claim, owner)
         return data
     except Exception:                                       # noqa: BLE001
         return None
 
 
-def cache_put(claim, verdict, ttl_days):
+def cache_put(claim, verdict, ttl_days, owner=None):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     payload = dict(verdict)
+    if owner:
+        owners = []
+        try:
+            old = json.loads(_cache_path(claim).read_text(encoding="utf-8"))
+            owners = list(old.get("_owners") or [])
+        except (OSError, ValueError):
+            pass
+        if owner not in owners:
+            owners.append(owner)
+        payload["_owners"] = owners
     payload["claim"] = {k: claim.get(k) for k in
                         ("entity", "metric", "kind", "value", "unit", "year", "quote")}
     payload["checked_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -278,14 +310,83 @@ def html_to_text(raw):
     return text.strip()
 
 
-def fetch_url(url, timeout=12, max_bytes=2_000_000):
+class UnsafeURLError(ValueError):
+    """联网抓取地址不满足安全边界。"""
+
+
+def validate_fetch_url(url, *, allow_private=False):
+    """校验抓取目标，阻止 SSRF 与明文凭据。
+
+    - 只接受 http/https；
+    - 外部地址只允许 80/443，且解析后的所有 IP 必须是公网地址；
+    - 拒绝 userinfo、回环、私网、链路本地、组播、未指定地址；
+    - 重定向目标也要重新过这一关（见 `SafeRedirectHandler`）。
+
+    `allow_private=True` 只给测试/显式本地来源使用；生产路径默认关闭。
+    DNS 解析与 urllib 实际连接之间仍有理论上的 rebinding 窗口；这里先保证
+    「搜索摘要/页面里随便写一个内网 URL」不能直接打到本机服务。
+    """
+    raw = str(url or "").strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError as exc:
+        raise UnsafeURLError(f"URL 格式不合法：{exc}") from exc
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeURLError("只允许 http/https URL")
+    if parts.username or parts.password:
+        raise UnsafeURLError("URL 不允许包含 userinfo")
+    host = parts.hostname
+    if not host:
+        raise UnsafeURLError("URL 缺少主机名")
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise UnsafeURLError(f"URL 端口不合法：{exc}") from exc
+    if port not in (80, 443) and not allow_private:
+        raise UnsafeURLError("外部抓取只允许 80/443 端口")
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UnsafeURLError(f"无法解析主机：{host}") from exc
+    addresses = {info[4][0].split("%", 1)[0] for info in infos}
+    if not addresses:
+        raise UnsafeURLError(f"主机没有可用地址：{host}")
+    for raw_ip in addresses:
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError as exc:
+            raise UnsafeURLError(f"无法识别解析地址：{raw_ip}") from exc
+        if ip.is_multicast or ip.is_unspecified:
+            raise UnsafeURLError(f"禁止访问特殊地址：{raw_ip}")
+        if not allow_private and not ip.is_global:
+            raise UnsafeURLError(f"禁止访问本机/内网地址：{raw_ip}")
+    return raw
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """每次重定向都重新校验，避免公网页面 302 到本机服务。"""
+
+    def __init__(self, *, allow_private=False):
+        super().__init__()
+        self.allow_private = bool(allow_private)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_fetch_url(newurl, allow_private=self.allow_private)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_url(url, timeout=12, max_bytes=2_000_000, *, allow_private=False):
+    url = validate_fetch_url(url, allow_private=allow_private)
     req = urllib.request.Request(
         url, headers={
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"),
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
         })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    opener = urllib.request.build_opener(
+        SafeRedirectHandler(allow_private=allow_private))
+    with opener.open(req, timeout=timeout) as r:
         ctype = (r.headers.get("Content-Type") or "").lower()
         data = r.read(max_bytes)
     if "html" in ctype or data[:200].lstrip().startswith(b"<"):
@@ -970,8 +1071,98 @@ def local_verdict(claim, cfg):
     return None
 
 
+# ---------------------------------------------------------------------------
+# 判定链与报告块：**旧链路与 v1 共同的唯一实现**
+#
+# 为什么单独抽出来：v1 的 FactCheckNode 要产出同一份 `research` 段与同一套
+# 「支持/反驳/未找到」判定，但它跑在异步流水线里、没有 Session。如果两处各写
+# 一遍循环，最先漂移的就是 `needs_confirm`（单一来源反驳必须进人工确认）与
+# 缓存的 TTL——而这两样都不会报错，只会让两份报告"看着差不多、结论不一样"。
+# 抽出来之后：算法（judge/verify）与条目形状只有一份，两条链路只负责
+# 「谁去调检索」和「结论写进哪里」。
+# ---------------------------------------------------------------------------
+def lookup_verdict(claim, cfg, owner=None):
+    """能不能不联网就判出来：本地来源 → 已学断言 → 检索缓存。
+
+    返回 `(verdict, method)`；都没命中返回 `(None, None)`，此时调用方才去检索。
+    顺序不能变：本地来源库是人工/已审核沉淀，新补一页就该覆盖旧的检索结论；
+    「上次学到的值」次之；缓存最后（缓存只省一次网络，不代表口径更新）。
+    """
+    local = local_verdict(claim, cfg)
+    if local:
+        return local, "local"
+    learned = learned_lookup(claim)
+    if learned:
+        return learned, "learned"
+    cached = cache_get(claim, owner=owner)
+    if cached:
+        return cached, "cache"
+    return None, None
+
+
+def remember_verdict(claim, verdict, owner=None):
+    """检索结论落缓存 + 沉淀为「已学断言」（口径与旧实现一致：支持/反驳 90 天）。"""
+    ttl = 90 if verdict.get("status") in ("supported", "refuted") else 1
+    cache_put(claim, verdict, ttl, owner=owner)
+    learn_verdict(claim, verdict)
+    return verdict
+
+
+def item_from_verdict(claim, verdict, method):
+    """一条主张在报告 `research.items[]` 里的形状（键名与历史报告逐字一致）。
+
+    `needs_confirm` 在这里判而不是在调用方的循环里：v1 与旧链路都要这个标记，
+    两处各写一遍迟早对不上，而对不上的后果是「单一来源的推测进了整改单」。
+    """
+    srcs = verdict.get("sources") or []
+    item = {
+        "quote": claim["quote"], "entity": claim["entity"], "metric": claim["metric"],
+        "kind": claim["kind"], "value": claim["value"], "unit": claim["unit"],
+        "status": verdict.get("status"), "reason": verdict.get("reason"),
+        "display": verdict.get("display"),
+        "query": verdict.get("query"), "method": method,
+        "providers": verdict.get("providers") or [],
+        "sources": srcs[:2],
+    }
+    if (item["status"] == "refuted"
+            and float(verdict.get("confidence") or 0) < 0.8):
+        # 单一来源反驳：只进「待人工确认」，不进整改单。搜索摘要里的口径
+        # （累计/单季、全球/中国）经常与原文不同，直接写成 major 会把
+        # 「可能错」冒充成「确定错」。
+        item["needs_confirm"] = True
+    return item
+
+
+def build_block(items, *, claims_found, cache_hits=0, learned_hits=0,
+                local_hits=0, providers=(), errors=(), latency_ms=0,
+                stopped_early=False, enabled=True, reason=None):
+    """把逐条条目收敛成报告 `research` 段（键名/分类与旧版一致）。"""
+    if not enabled:
+        return {"enabled": False,
+                "reason": reason or "本次未启用库外事实核验（--research 开启）"}
+    items = list(items)
+    block = {
+        "enabled": True, "claims_found": int(claims_found),
+        "checked": len(items),
+        "supported": [it for it in items if it.get("status") == "supported"],
+        "refuted": [it for it in items if it.get("status") == "refuted"],
+        "unverified": [it for it in items
+                       if it.get("status") not in ("supported", "refuted")],
+        "cache_hits": int(cache_hits), "learned_hits": int(learned_hits),
+        "local_hits": int(local_hits),
+        "needs_confirm": [it for it in items if it.get("needs_confirm")],
+        "providers": list(providers or ()),
+        "errors": list(errors), "items": items,
+    }
+    if stopped_early:
+        # 超时截断必须自报：否则「只核了 2 条」会被读成「只发现 2 条主张」
+        block["stopped_early"] = True
+    block["latency_ms"] = int(latency_ms)
+    return block
+
+
 def review_claims(s, text, sentences, assertions, enabled=True, web=True,
-                  provider=None, max_claims=None):
+                  provider=None, max_claims=None, owner=None):
     """在报告定稿前跑一遍；返回 report["research"] 块。"""
     cfg = load_config()
     if not enabled:
@@ -979,66 +1170,34 @@ def review_claims(s, text, sentences, assertions, enabled=True, web=True,
     limit = int(max_claims if max_claims is not None
                 else cfg.get("max_claims_per_doc") or 3)
     claims = extract_claims(sentences, assertions, max_claims=limit)
-    block = {
-        "enabled": True, "claims_found": len(claims), "checked": 0,
-        "supported": [], "refuted": [], "unverified": [],
-        "cache_hits": 0, "learned_hits": 0, "local_hits": 0,
-        "needs_confirm": [],
-        "providers": cfg.get("providers") or [],
-        "errors": [], "items": [],
-    }
+    items = []
+    cache_hits = learned_hits = local_hits = 0
+    stopped_early = False
     t0 = time.perf_counter()
     for c in claims:
         if time.perf_counter() - t0 > float(cfg.get("max_seconds") or 60):
-            block["stopped_early"] = True
+            stopped_early = True
             break
-        local = local_verdict(c, cfg)
-        learned = None if local else learned_lookup(c)
-        cached = None if (local or learned) else cache_get(c)
-        if local:
-            verdict = local
-            block["local_hits"] += 1
-            method = "local"
-        elif learned:
-            verdict = learned
-            block["learned_hits"] += 1
-            method = "learned"
-        elif cached:
-            verdict = cached
-            block["cache_hits"] += 1
-            method = "cache"
-        else:
+        verdict, method = lookup_verdict(c, cfg, owner=owner)
+        if verdict is None:
             verdict = verify(c, cfg, web=web, provider=provider)
             method = "search"
-            ttl = (90 if verdict.get("status") in ("supported", "refuted")
-                   else 1)
-            cache_put(c, verdict, ttl)
-            learn_verdict(c, verdict)
-        block["checked"] += 1
+            remember_verdict(c, verdict, owner=owner)
+        if method == "local":
+            local_hits += 1
+        elif method == "learned":
+            learned_hits += 1
+        elif method == "cache":
+            cache_hits += 1
         srcs = verdict.get("sources") or []
-        item = {
-            "quote": c["quote"], "entity": c["entity"], "metric": c["metric"],
-            "kind": c["kind"], "value": c["value"], "unit": c["unit"],
-            "status": verdict.get("status"), "reason": verdict.get("reason"),
-            "display": verdict.get("display"),
-            "query": verdict.get("query"), "method": method,
-            "providers": verdict.get("providers") or [],
-            "sources": srcs[:2],
-        }
-        block["items"].append(item)
+        item = item_from_verdict(c, verdict, method)
+        items.append(item)
         if verdict.get("status") == "refuted":
-            block["refuted"].append(item)
             got = verdict.get("value")
             unit = c.get("unit") or ""
             label = (verdict.get("display")
                      or (f"{got:.6g}{unit}" if isinstance(got, (int, float)) else str(got)))
-            authoritative = float(verdict.get("confidence") or 0) >= 0.8
-            if not authoritative:
-                # 单一来源：只进「待人工确认」，不进整改单。
-                # 搜索摘要里的口径（累计/单季、全球/中国）经常和原文不同，
-                # 直接写成 major 会把「可能错」冒充成「确定错」。
-                item["needs_confirm"] = True
-                block["needs_confirm"].append(item)
+            authoritative = not item.get("needs_confirm")
             if authoritative:
                 fix = {
                     "action": "replace", "where": f"第 {c['sentence_index']} 句",
@@ -1098,15 +1257,16 @@ def review_claims(s, text, sentences, assertions, enabled=True, web=True,
                         if authoritative else
                         "单一来源反驳，已转入待人工确认，不进整改单"))
         elif verdict.get("status") == "supported":
-            block["supported"].append(item)
             s.verified_facts.append(
                 f"{c['entity']}{c['metric']} {c.get('raw')}"
                 f"（外部核验：{(srcs[0].get('title') if srcs else '来源')[:40]}"
                 f"，{srcs[0].get('url') if srcs else ''}）")
-        else:
-            block["unverified"].append(item)
-    block["errors"] = list(cfg.get("_errors") or [])
-    block["latency_ms"] = round((time.perf_counter() - t0) * 1000)
+    block = build_block(
+        items, claims_found=len(claims), cache_hits=cache_hits,
+        learned_hits=learned_hits, local_hits=local_hits,
+        providers=cfg.get("providers") or (),
+        errors=cfg.get("_errors") or (), stopped_early=stopped_early,
+        latency_ms=round((time.perf_counter() - t0) * 1000))
     # 已核验的句子不再重复报「无出处/无口径」：用户要的是「是否属实」，
     # 不是「这句话没有引用」。数据不丢，进 suppressed 并写明由哪条核验吸收。
     if block["checked"]:

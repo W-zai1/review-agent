@@ -3,11 +3,13 @@
 """checks/test_architecture_guard.py —— 依赖方向的可执行约束。
 
 架构文档里的「六层依赖规则」如果只写在 markdown 里，三个月后一定失效。
-这里用 AST 扫 review_agent/ 的 import，把三条硬规则变成测试：
+这里用 AST 扫 review_agent/ 的 import，把四条硬规则变成测试：
 
-    domain         不得依赖 runtime / capabilities / 第三方库 / 旧代码
-    capabilities   不得依赖 runtime / 旧代码
-    runtime        不得依赖 capabilities / 旧代码
+    domain          不得依赖 runtime / capabilities / application / infrastructure / 旧代码
+    capabilities    不得依赖 runtime / application / infrastructure / 旧代码
+    runtime         不得依赖 capabilities / application / infrastructure / 旧代码
+    infrastructure  不得依赖 runtime / capabilities / application / 旧代码
+                    （它只实现领域端口：向下依赖 domain 是允许的）
 
 只查 import 方向，不查调用关系（动态 import 不在覆盖范围；真需要时再补）。
 """
@@ -29,7 +31,15 @@ FORBIDDEN = {
                      "review_agent.infrastructure", "review_agent.engine",
                      "review", "server", "tools"),
     "runtime": ("review_agent.capabilities", "review_agent.application",
-                "review_agent.engine", "review", "server", "tools"),
+                "review_agent.infrastructure", "review_agent.engine",
+                "review", "server", "tools"),
+    # 基础设施层只实现领域端口：它向下依赖 domain，**不得**反向依赖运行时/能力/
+    # 应用层，更不得 import 旧代码。没有这条，`infrastructure/ledger.py` 迟早会
+    # "顺手" import 一下 review.py 的常量，然后整套依赖方向就散了。
+    "infrastructure": ("review_agent.runtime", "review_agent.capabilities",
+                       "review_agent.application", "review_agent.profiles",
+                       "review_agent.adapters", "review_agent.engine",
+                       "review", "server", "tools", "agent_spec"),
 }
 
 STDLIB = set(sys.stdlib_module_names)

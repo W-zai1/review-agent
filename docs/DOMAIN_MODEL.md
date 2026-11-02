@@ -111,15 +111,34 @@ Run 的 `review_id` 必须等于本 Review 的 id；Run 序号连续。
 | `note` | str \| None | 备注 |
 | `created_at` | datetime \| None | 产生时间 |
 | `finding_ids` | tuple[str] | 这条证据支撑哪些发现（一对多：同一句可同时支撑多条规则） |
+| `strength` | `EvidenceStrength` | unassessed / unverified / partial / verified / contradicted（**第二根轴**，缺省 `unassessed`） |
+| `assessment` | `EvidenceAssessment` \| None | 四项匹配（来源身份/主体/指标/时间）+ 评估者 + 评估时间 |
+| `contradicted_by` | tuple[str] | 反证它的证据编号；`CONTRADICTED` 时必填 |
+| `source` | `SourceRef` \| None | 外部来源元数据：url / domain / official / fetched_at / snapshot_hash |
 
-**硬不变量**：`ANCHORED` ⇒ `verified_by` 非空；`EXTERNAL_SOURCE` ⇒ `source_ref` 非空；
+**硬不变量**：`ANCHORED` ⇒ `verified_by` 非空；`EXTERNAL_SOURCE` ⇒ `source_ref` 非空**且** `source` 非空；
 `finding_ids` 里的每个 id 必须格式合法，且运行时必须指向本 Run 真实存在的发现
 （`runtime.advance()` 校验，防止「报告上看起来有证据、点进去是一条不存在的 ISS 号」）。
+反向索引同理：新产生/新修订的 `Finding.evidence_ids` 必须指向本次运行里存在的证据。
+
+**证据强度的四条不变量**（2026-11-01，批次 3 / B1）——它们的作用是让「强度」**写不出来**：
+
+| 规则 | 内容 | 为什么 |
+| --- | --- | --- |
+| 1 | `VERIFIED` ⇒ 有评估者，且四项匹配**全部明确通过** | 「四项全过」是可复算的；缺一项或「无法判定」都不算核验过 |
+| 2 | `VERIFIED` 且 `EXTERNAL_SOURCE` ⇒ `source.snapshot_hash` 非空 | 只见过搜索摘要的外部来源最多到 `PARTIAL` |
+| 3 | `CONTRADICTED` ⇒ `contradicted_by` 非空 | 一条反证都不指出，等于让读者自己猜「凭什么说它错了」 |
+| 4 | `UNASSESSED` ⇒ `assessment is None`；`PARTIAL` ⇒ `assessment` 非空 | 不许「评估了但没结论」，也不许「说部分核验却不说哪部分」 |
+
+**两根轴为什么不能合并**：`verification` 回答「这句话在不在原文里」，`strength` 回答
+「这句话够不够证明这条结论」。合并会让 202 份历史报告的 `verification` 语义一起变，
+等于批量重写历史结论（违反 ADR-007）。同一条 `anchored` 证据完全可以是 `PARTIAL`
+（引文在原文里，但证明不了这条结论）或 `CONTRADICTED`（原文这么写，外部来源给出相反数值）。
 
 **为什么证据自己记 `finding_ids`**：证据是**分析之后**才产出的（evidence 阶段），
 而 `Finding` 不可变、构造时就得写 `evidence_ids`——晚到的证据没法再回填。
-`Finding.evidence_ids` 因此只保留为「我引用了哪些证据」的反向索引，
-由「构造发现时证据已存在」的路径（历史报告导入）填写。
+所以 evidence 阶段会用 `NodeResult.revisions` 回填 `Finding.evidence_ids`（双向索引），
+`runtime.advance()` 校验两侧都不出现悬空指向。
 
 「逐字命中原文」的校验规则沿用旧实现 S4（`review.py:2517-2557`）：非空 quote 回查不到原文
 即丢弃；`（文档首段）` 这类占位引用属于缺失型问题，保留并标记 `PLACEHOLDER`。

@@ -13,7 +13,9 @@ from .node import (
     stage_requirements,
     surviving_findings,
 )
+from .cancel import Cancelled, CancellationToken
 from .orchestrator import (
+    ABORTED,
     COMPLETED,
     FAILED,
     INCOMPLETE,
@@ -36,8 +38,9 @@ from .serialization import (
 __all__ = [
     "Node", "NodeContext", "NodeResult", "RunState", "Workflow",
     "advance", "merge_results", "stage_requirements", "surviving_findings",
-    "COMPLETED", "FAILED", "INCOMPLETE", "CheckpointStore",
+    "ABORTED", "COMPLETED", "FAILED", "INCOMPLETE", "CheckpointStore",
     "FileCheckpointStore", "MemoryCheckpointStore", "NodeEvent",
     "Orchestrator", "RunOutcome", "next_finding_seq", "state_hash",
+    "Cancelled", "CancellationToken",
     "FileRunStore", "state_from_dict", "state_to_dict",
 ]

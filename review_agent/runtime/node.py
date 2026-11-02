@@ -149,6 +149,9 @@ class NodeResult:
     output: Mapping[str, Any] = field(default_factory=dict)
     findings: tuple[Finding, ...] = ()
     evidence: tuple[Evidence, ...] = ()
+    # 对已有证据的修订（例如评估节点写入 strength/assessment）。
+    # 与 Finding.revisions 同语义：按 id 替换，且不能与新增证据同号。
+    evidence_revisions: tuple[Evidence, ...] = ()
     disputes: tuple[Dispute, ...] = ()
     decision: Decision | None = None
     errors: tuple[str, ...] = ()
@@ -304,6 +307,7 @@ def merge_results(results: Sequence[NodeResult]) -> NodeResult:
         output=output,
         findings=findings,
         evidence=tuple(e for r in results for e in r.evidence),
+        evidence_revisions=tuple(e for r in results for e in r.evidence_revisions),
         disputes=tuple(d for r in results for d in r.disputes),
         decision=decisions[0].decision if decisions else None,
         warnings=tuple(w for r in results for w in r.warnings),
@@ -356,11 +360,21 @@ def advance(state: RunState, stage: Stage, result: NodeResult, *,
     # 证据必须指向本次执行里真实存在的发现：悬空引用比没有引用更难查
     # （报告上看起来「有证据」，点进去是一条不存在的 ISS 号）。
     known = {f.id for f in (*state.findings, *result.findings)}
-    for ev in result.evidence:
+    for ev in (*result.evidence, *result.evidence_revisions):
         for fid in ev.finding_ids:
             if fid not in known:
                 raise InvariantViolation(
                     f"证据 {ev.id} 指向不存在的发现 {fid}")
+    # 反向索引也一样：`Finding.evidence_ids` 指向不存在的证据，等于
+    # 「这条结论说它有三条证据，点开一条都没有」。只校验**本次新产生或新修订**的
+    # 发现（历史导入的 finding 可能引用早已归档的证据，那条路径不受影响）。
+    known_evidence = {e.id for e in (*state.evidence, *result.evidence,
+                                     *result.evidence_revisions)}
+    for finding in (*result.findings, *result.revisions):
+        for eid in finding.evidence_ids:
+            if eid not in known_evidence:
+                raise InvariantViolation(
+                    f"发现 {finding.id} 引用了不存在的证据 {eid}")
     if result.decision is not None and result.decision.run_id != state.run_id:
         raise InvariantViolation(
             f"Decision {result.decision.id} 属于 run {result.decision.run_id}")
@@ -379,6 +393,19 @@ def advance(state: RunState, stage: Stage, result: NodeResult, *,
             raise InvariantViolation(
                 f"修订了不存在的发现 {rev.id}：只能修订上游已产出的结论")
 
+    added_evidence = {e.id for e in result.evidence}
+    upstream_evidence = {e.id for e in state.evidence}
+    for rev in result.evidence_revisions:
+        if rev.run_id != state.run_id:
+            raise InvariantViolation(
+                f"证据修订 {rev.id} 属于 run {rev.run_id}，不能并入 {state.run_id}")
+        if rev.id in added_evidence:
+            raise InvariantViolation(
+                f"证据 {rev.id} 在同一阶段既被新增又被修订：节点须先收敛成一条")
+        if rev.id not in upstream_evidence:
+            raise InvariantViolation(
+                f"修订了不存在的证据 {rev.id}：只能修订上游已产出的证据")
+
     done = state.completed_stages + (stage,)
     nxt = next_stage(stage) if stage is not Stage.FINALIZE else Stage.FINALIZE
     return replace(
@@ -386,7 +413,8 @@ def advance(state: RunState, stage: Stage, result: NodeResult, *,
         stage=nxt,
         completed_stages=done,
         findings=_apply_revisions(state.findings, result.revisions) + result.findings,
-        evidence=state.evidence + result.evidence,
+        evidence=_apply_evidence_revisions(state.evidence,
+                                           result.evidence_revisions) + result.evidence,
         disputes=state.disputes + result.disputes,
         decision=result.decision or state.decision,
         artifacts={**state.artifacts, **result.output},
@@ -399,3 +427,10 @@ def _apply_revisions(findings: tuple[Finding, ...],
     """按 id 替换，保持原顺序（顺序变了，报告的条目次序就变了）。"""
     by_id = {rev.id: rev for rev in revisions}
     return tuple(by_id.get(f.id, f) for f in findings)
+
+
+def _apply_evidence_revisions(evidence: tuple[Evidence, ...],
+                              revisions: tuple[Evidence, ...]) -> tuple[Evidence, ...]:
+    """按 id 替换证据，保持原顺序（报告证据编号次序不能因评估而变）。"""
+    by_id = {rev.id: rev for rev in revisions}
+    return tuple(by_id.get(item.id, item) for item in evidence)

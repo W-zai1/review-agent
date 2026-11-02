@@ -92,8 +92,8 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 
 | 工作项 | 说明 | 验收 |
 | --- | --- | --- |
-| ~~Application Service~~ | **已完成（v1）**：`review_agent/application/service.py` 组装/执行/落盘/恢复；CLI 以 `--engine v1|shadow` 接入（`state/runs/` 落状态、`state/double_run/` 落双跑差异）；server 侧通过 `REVIEW_ENGINE` 环境变量透传。**Task/Report 服务已落地（2026-10-31）**：`application/tasks.py`（`start_review` / `get_task` / `list_runs` / `mark`，落 `state/tasks/`）+ `application/reports.py`（按 `run_id` 取报告、v1 优先 legacy 兜底、注入了才校验哈希） | `checks/test_application_service.py`（9 项）、`checks/test_engine_switch.py`（9 项）、`checks/test_task_service.py`（32 项） |
-| ~~Orchestrator~~ | **已完成**：`review_agent/runtime/orchestrator.py`；一阶段多节点（结果先合成再推进一次）、失败停住、可重试才重试、未覆盖阶段报错不跳过 | `checks/test_orchestrator.py`（21 项：happy path / 失败 / 重试 / 检查点 / 恢复 / 哈希 / 编号） |
+| ~~Application Service~~ | **已完成（v1）**：`review_agent/application/service.py` 组装/执行/落盘/恢复；CLI 以 `--engine v1|shadow` 接入（`state/runs/` 落状态、`state/double_run/` 落双跑差异）；server 侧**没有显式传引擎**——`subprocess.run` 未传 `env=`，靠子进程继承父进程的 `REVIEW_ENGINE`。**Task/Report 服务已落地（2026-10-31，2026-11-01 起含取消/超时/恢复/幂等键）**：`application/tasks.py`（`start_review` / `start_async` / `cancel` / `recover` / `get_task` / `list_runs` / `mark`，落 `state/tasks/`）+ `application/reports.py`（按 `run_id` 取报告、v1 优先 legacy 兜底、注入了才校验哈希） | `checks/test_application_service.py`（9 项）、`checks/test_engine_switch.py`（9 项）、`checks/test_task_service.py`（32 项）、`checks/test_task_lifecycle.py` |
+| ~~Orchestrator~~ | **已完成**：`review_agent/runtime/orchestrator.py`；一阶段多节点（结果先合成再推进一次）、失败停住、可重试才重试、未覆盖阶段报错不跳过；**取消**在阶段边界与节点边界检查 `CancellationToken` | `checks/test_orchestrator.py`（27 项：happy path / 失败 / 重试 / 检查点 / 恢复 / 哈希 / 编号 / 取消） |
 | 六节点 | 见 [AGENT_RUNTIME.md](AGENT_RUNTIME.md) §3，先 Decision，再 Evidence | 每节点独立测试，输入输出用固定语料 |
 | ~~Decision Engine~~ | **已完成**：`review_agent/runtime/nodes/decision.py`，S6 已改调 `build_decision` | `checks/test_decision_node.py`（16 项；含全量历史报告重放，仅 5 份已登记偏差） |
 | ~~Evidence Analyzer~~ | **已完成**：`review_agent/runtime/nodes/evidence.py`，S4 已改调 `anchor_findings`；证据带 `finding_ids` 指回发现 | `checks/test_evidence_node.py`（四类引用归一 + 全量历史与旧实现逐条等价） |
@@ -131,8 +131,10 @@ historical reports adapted             →  202/202 无异常；5 份已知 verd
 | --- | --- | --- |
 | Checkpoint | ✅ `FileRunStore` + `MemoryCheckpointStore` + `state_hash`（阶段 2 已落地） | 阶段边界落盘 + `state_hash` 校验 |
 | Retry | ✅ 由 `Orchestrator(max_attempts)` 统一；只有 `retryable=True` 才重试 | 由 Orchestrator 统一策略（见 AGENT_RUNTIME §7） |
-| Timeout | ✅ **2026-10-31 已加单节点超时**（`Orchestrator(timeout=...)`，超时=可重试失败）；整体兜底仍是 server 的 `--review-timeout` | 节点级超时 + 整体兜底 |
-| 幂等 | ✅ **2026-10-31**：`_write_shadow_report` 按 `(run_id, finalize)` 幂等——同一次运行第二次写报告直接返回已有文件，不重写报告/日志、不追加链记录；坏文件不算「已写过」 | `(run_id, stage)` 幂等键；重复执行不产生第二份报告 |
+| Timeout | ✅ 单节点超时（`Orchestrator(timeout=...)`）；**2026-11-01 加任务级超时**（`TaskService.start_review(timeout=...)`：超时置位取消令牌 + 落 FAILED，不让线程无限跑） | 节点级 + 任务级 + 入口兜底 |
+| 取消 | ✅ **2026-11-01**：`CancellationToken` 在阶段/节点边界检查（`runtime/cancel.py`，协作式，不强杀）；`TaskService.cancel()` 幂等、终态拒绝；取消后不写报告 | 取消可跨进程（需 server 改进程内调用） |
+| 幂等 | ✅ **2026-10-31**：`_write_shadow_report` 按 `(run_id, finalize)` 幂等；**2026-11-01 加提交级幂等键**（`TaskService.start_review(idempotency_key=...)`：同键 + 未结束 → 返回同一任务；键随记录落盘，重启后仍生效） | `(run_id, stage)` + `(target_hash, 参数)` 两级幂等 |
+| 恢复 | ✅ **2026-11-01**：`TaskService.recover()` 按「running + 有检查点 + 无活执行者」分 `resumable` / `orphaned`（废任务就地 FAILED 并写原因）；「可恢复」是判断不是状态（`transitions.recoverable`） | 入口侧自动续跑（批次 2，随 server 进程内化） |
 | 审计 | ✅ **2026-10-31**：`application/audit.py` 把节点事件 / 工具 / 决策 / 检查点汇成一条 `AuditEvent` 流写 `logs/v1/<id>/events.jsonl`；旧的 `task.json` / `tools.jsonl` / `decisions.jsonl` 改为由事件流**投影**生成（内容逐字不变，UI 不用改） | 统一 `AuditEvent` 流，旧文件由事件流生成 |
 | 失败注入 | ✅ **2026-10-31**：`checks/test_failure_injection.py`（3 项）覆盖三类——模型不可用 / 写盘失败 / 进程中断 | 故障注入测试：模型超时、写盘失败、进程被杀 |
 

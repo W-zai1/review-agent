@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain import Checkpoint, Stage, ids
+from .cancel import Cancelled, CancellationToken
 from .node import (
     Node,
     NodeContext,
@@ -55,6 +56,7 @@ from .node import (
 COMPLETED = "completed"
 FAILED = "failed"
 INCOMPLETE = "incomplete"
+ABORTED = "aborted"        # 用户取消（与 FAILED 区分：不是缺陷，谈不上去修）
 
 
 def state_hash(state: RunState) -> str:
@@ -212,6 +214,9 @@ class Orchestrator:
     max_attempts: int = 1
     config: Mapping[str, Any] = field(default_factory=dict)
     timeout: float | None = None
+    # 取消是**协作式**的：只在阶段边界与节点边界检查（理由见 runtime/cancel.py）。
+    # 缺省 None = 不检查，与改造前行为完全一致。
+    token: CancellationToken | None = None
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -223,6 +228,10 @@ class Orchestrator:
         events: list[NodeEvent] = []
         while state.stage not in state.completed_stages:
             stage = state.stage
+            # 阶段边界（原子点）：取消在这里生效 = 已完成的阶段全部保留，
+            # 当前阶段一个节点都不跑，磁盘上不留半成品。
+            if self.token is not None and self.token.cancelled:
+                return self._aborted(state, events)
             nodes = self.workflow.nodes_for(stage)
             if not nodes:
                 return RunOutcome(
@@ -236,6 +245,10 @@ class Orchestrator:
             for node in nodes:
                 result, node_events = await self._run_node(node, state, next_seq)
                 events.extend(node_events)
+                if result.success and self.token is not None and self.token.cancelled:
+                    # 节点跑完但用户已取消：不再推进这一阶段的 merge/advance，
+                    # 否则状态会前进到一个"部分节点做过"的阶段，恢复语义就乱了。
+                    return self._aborted(state, events)
                 if not result.success:
                     return RunOutcome(
                         state=state, status=FAILED, events=tuple(events),
@@ -257,6 +270,9 @@ class Orchestrator:
         events: list[NodeEvent] = []
         result = NodeResult.fail(f"{node.name} 从未执行")
         for attempt in range(1, self.max_attempts + 1):
+            # 节点边界：取消在这里生效 = 这一次尝试根本不发起
+            if self.token is not None and self.token.cancelled:
+                return NodeResult.fail(f"{node.name} 已取消", retryable=False), events
             started = time.perf_counter()
             try:
                 call = node.run(NodeContext(
@@ -270,6 +286,15 @@ class Orchestrator:
                 result = NodeResult.fail(
                     f"{node.name} 超时（超过 {self.timeout:g}s 未返回）",
                     retryable=True)
+            except Cancelled:
+                # 节点自己检查到取消（长循环里调了 raise_if_cancelled）
+                result = NodeResult.fail(f"{node.name} 已取消", retryable=False)
+                events.append(NodeEvent(
+                    stage=node.stage, node=node.name, ok=False, attempt=attempt,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    errors=result.errors, warnings=result.warnings,
+                ))
+                return result, events
             except Exception as e:                      # noqa: BLE001 - 编排边界
                 result = NodeResult.fail(
                     f"{node.name} 抛异常：{type(e).__name__}: {e}")
@@ -281,6 +306,16 @@ class Orchestrator:
             if result.success or not result.retryable or attempt == self.max_attempts:
                 break
         return result, events
+
+    def _aborted(self, state: RunState, events: list[NodeEvent]) -> RunOutcome:
+        """取消后的终结：状态原样保留，只标 ABORTED，不落新检查点。"""
+        reason = self.token.reason if self.token is not None else "取消"
+        return RunOutcome(
+            state=state, status=ABORTED,
+            events=tuple(events),
+            errors=(f"已取消：{reason}",),
+            checkpoints=self._history(state),
+        )
 
     def _save(self, state: RunState, stage: Stage) -> None:
         if self.checkpoints is None:

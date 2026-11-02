@@ -1,0 +1,152 @@
+# 安全审查 Agent 的规则库
+#
+# 与文档审查的区别：这些规则判的是「代码是否可被利用」，不是「文字是否准确」。
+# 每条规则除 desc/severity 外，可选地带 pattern / require / guard / unless ——
+# 检查器只负责通用的匹配与去噪，**判定条件全部留在 YAML 里**，
+# 这样加一条规则不用改代码（第三轮对抗测试的教训：判定条件写死在代码里，
+# 换一个场景就得复制一份主流程）。
+#
+# 字段说明
+#   pattern  必中正则（字符串或字符串数组，任一命中即算命中）
+#   require  同一条语句里必须**同时**出现的正则（用于「execute( 且 有 SELECT」这类组合判断）
+#   guard    出现即**不算**命中（防御性语境：注释掉、示例、安全写法）
+#   unless   出现即不算命中（替代写法，如 yaml.safe_load）
+#   confidence  该规则的结构可信度（写死，不接受模型改写）
+
+# ---------------------------------------------------------------- 凭据泄露
+- rule_id: SEC-001
+  dimension: secret
+  severity: blocker
+  desc: 代码/配置中不得出现明文凭据（密码、Token、API Key、口令）
+  suggestion: 改为从环境变量或密钥管理服务读取（os.getenv / secrets），并立即轮换已泄露的凭据。
+  method: pattern_plus_placeholder_guard
+
+- rule_id: SEC-002
+  dimension: secret
+  severity: blocker
+  desc: 不得在源码中提交私钥块，或把凭据内嵌进 URL（scheme://user:pass@host）
+  suggestion: 私钥移出仓库并加入 .gitignore；URL 中的凭据改由认证头/连接池配置注入。
+  method: pattern
+
+# ---------------------------------------------------------------- 注入面
+- rule_id: SEC-003
+  dimension: injection
+  severity: blocker
+  desc: SQL 必须参数化，禁止用 f-string / % / + 拼接或格式化构造查询
+  suggestion: 改用占位符参数化（cursor.execute(sql, params)）或 ORM 的绑定参数。
+  confidence: 0.9
+  # 判的是「用拼接/格式化构造 SQL」，不是「SQL 里有占位符」：
+  # 参数化写法 execute("... %s", (v,)) 是安全的标准做法，绝不能报。
+  # 所以要求格式化算符紧跟在字符串结束引号之后（f-string / .format / % (var) / + var）。
+  pattern:
+    - '(?i)(?:execute|executemany|raw)\s*\([^)]*(?:f["'']|\.format\s*\()'
+    - '(?i)(?:execute|executemany|raw)\s*\([^)]*["'']\s*%\s*[(\w]'
+    - '(?i)\b(?:sql|query|stmt)\s*=\s*(?:f["'']|["''][^"'']*["'']\s*%\s*[(\w]|["''][^"'']*["'']\s*\.format\s*\()'
+    - '(?i)\b(?:sql|query|stmt)\s*=\s*[^"\n]*\+\s*[a-z_]'
+  require: '(?i)(select|insert|update|delete|where|from\s+\w+)'
+  guard: '(?:#.*示例|placeholder|占位)'
+
+- rule_id: SEC-004
+  dimension: injection
+  severity: blocker
+  desc: 禁止把外部输入拼进 shell 命令（shell=True / os.system / 字符串拼接命令）
+  suggestion: 用列表参数 + shell=False 调用（subprocess.run([...], check=True)），并对参数做白名单校验。
+  confidence: 0.9
+  pattern:
+    - '(?:shell\s*=\s*True|os\.system\s*\(|os\.popen\s*\(|commands\.getoutput\s*\()'
+    - '(?i)(?:subprocess\.(?:run|call|Popen|check_output)\s*\(\s*f["'']|os\.system\s*\(\s*f["''])'
+  guard: '(?:#\s*(?:示例|demo|演示)|说明[:：])'
+
+- rule_id: SEC-005
+  dimension: injection
+  severity: blocker
+  desc: 禁止对不可信输入使用 eval / exec / new Function 动态执行代码
+  suggestion: 改用显式解析（json.loads / ast.literal_eval）或映射表分发，不要执行字符串。
+  confidence: 0.9
+  pattern:
+    - '(?<![\w.])eval\s*\('
+    - '(?<![\w.])exec\s*\('
+    - 'new\s+Function\s*\('
+  guard: '(?:ast\.literal_eval|model\.eval\(|\.eval\(|eval_mode|#\s*示例)'
+
+- rule_id: SEC-006
+  dimension: injection
+  severity: major
+  desc: 反序列化必须使用安全加载器（yaml.safe_load / 禁 pickle 解析外部数据）
+  suggestion: yaml.load 改为 yaml.safe_load；对外部数据禁用 pickle，改用 json。
+  confidence: 0.85
+  pattern:
+    - '(?:yaml\.load\s*\(|pickle\.loads?\s*\(|marshal\.loads?\s*\()'
+  unless: '(?:safe_load|SafeLoader|#\s*(?:示例|demo))'
+
+- rule_id: SEC-007
+  dimension: injection
+  severity: major
+  desc: 服务端模板不得渲染用户可控的字符串（SSTI）
+  suggestion: 只渲染固定模板文件 + 传参，不要用 render_template_string 拼接用户输入。
+  confidence: 0.8
+  pattern: '(?:render_template_string\s*\(|Template\s*\(\s*(?:user|input|request|data|payload))'
+
+- rule_id: SEC-008
+  dimension: injection
+  severity: major
+  desc: 文件路径若来自外部输入，必须做规范化和白名单校验（路径穿越）
+  suggestion: 用 os.path.realpath 校验父目录落在允许目录内，或改用 ID 映射而非路径拼接。
+  confidence: 0.8
+  pattern: '(?:open\s*\(\s*(?:os\.path\.join|f["'']|.*\+\s*(?:req|args|params))|send_file\s*\(|readFile\s*\()'
+  require: '(?i)(request|req\.|args|params|query|input\(|form\[|user_)'
+
+# ---------------------------------------------------------------- 危险配置
+- rule_id: SEC-009
+  dimension: config
+  severity: major
+  desc: 生产配置不得开启调试模式或关闭证书校验
+  suggestion: debug 由环境变量控制且生产为 false；证书校验保持开启，自签证书走 CA 配置。
+  confidence: 0.85
+  pattern:
+    - '(?:\bdebug\s*=\s*True|DEBUG\s*[:=]\s*True|verify\s*=\s*False|ssl_verify\s*=\s*False|rejectUnauthorized\s*:\s*false)'
+  guard: '(?:#\s*(?:示例|仅本地|local only)|test_|_test)'
+
+- rule_id: SEC-010
+  dimension: config
+  severity: major
+  desc: CORS 不得对任意来源开放，尤其是同时允许携带凭证
+  suggestion: 改为显式白名单域名；确需跨域时不要把 allow_credentials 与通配来源同时开启。
+  confidence: 0.9
+  pattern:
+    - '(?:allow_origins\s*=\s*\[\s*["'']\*["'']|Access-Control-Allow-Origin\s*:\s*\*|origin\s*:\s*["'']\*["''])'
+  guard: '(?:#\s*(?:示例|demo|仅本地))'
+
+- rule_id: SEC-011
+  dimension: config
+  severity: major
+  desc: 容器镜像不得使用 latest 标签，不得以 root 运行
+  suggestion: 固定镜像摘要或语义化版本；增加非 root USER，并用只读文件系统与最小权限运行。
+  confidence: 0.9
+  pattern:
+    - '(?i)^\s*FROM\s+\S+:latest\b'
+    - '(?i)^\s*USER\s+root\b'
+
+- rule_id: SEC-012
+  dimension: dependency
+  severity: minor
+  desc: 依赖必须锁定版本，避免不同环境装出不同代码
+  suggestion: 用 == 精确锁定（或 lock 文件），并在 CI 中校验哈希。
+  confidence: 0.8
+  method: dependency_file_scan
+
+- rule_id: SEC-013
+  dimension: dependency
+  severity: major
+  desc: 不得从 URL / git 直接安装未经校验的来源
+  suggestion: 改为发布到内部制品库并锁定版本与哈希；如必须直连，固定 commit 并校验完整性。
+  confidence: 0.85
+  method: dependency_file_scan
+
+- rule_id: SEC-014
+  dimension: config
+  severity: minor
+  desc: 日志与异常输出不得打印凭据、令牌等敏感字段
+  suggestion: 打日志前脱敏（只保留前后 4 位），或改为记录字段名而非值。
+  confidence: 0.8
+  pattern: '(?i)(?:print|logger?\.(?:info|debug|warning|error)|console\.log)\s*\([^)]*(?:password|passwd|token|secret|api_key|credential)'

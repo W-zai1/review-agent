@@ -35,6 +35,7 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
 | Rule Analyzer | analysis | 目标文本、Profile 规则集 | `findings`（规则类） | **不用** | `run_agent_steps` 1821 + `_h_*` 1516 + `rule_exec` / `regex_check` |
 | Semantic Reviewer | analysis | 目标文本、任务书、维度 | `findings`（模型类）+ `llm_meta` | **用** | `semantic_review` 1843、`llm_review`、`llm_client` |
 | Evidence Analyzer | evidence | findings、原文、知识库 | `evidence`、`evidence_dropped` | 混合（检索可算法，判断可模型） | S4 锚定 2517、`law_cite`、`retrieve`、`law_index` |
+| Evidence Assessor | evidence | evidence 集合 | 修订后的 `evidence.strength` / `assessment` | **不用**（确定性规则） | B2；`evidence_assess.py` |
 | Cross Reviewer | cross_review | findings（全维度） | `disputes`、折叠/降权决策 | 可选（先规则，复杂冲突再用模型） | `cross_review` 1359、`aggregate_repeats` 1401、`drop_covered_comp004` |
 | Decision Engine | decision | findings、disputes、coverage、研究兜底 | `decision` | **不用** | S6 裁定 2639–2686 + `remediation.attach` |
 | Review Supervisor | 全部 | RunState | 新 RunState / 终止原因 | 不用 | `run_one` 的控制流 2292–3270 |
@@ -49,6 +50,13 @@ Supervisor 本身不产出结论：它只做四件事——挑下一个节点、
   （节点 + 纯函数 `anchor_findings` / `verify_quote`）。旧流程 S4 已改为按节点结论过滤条目；
   证据对象带 `finding_ids` 指回它支撑的发现，`advance()` 校验不出现悬空指向。
   单测：`checks/test_evidence_node.py`（四类引用归一 + 历史语料与旧实现逐条等价）。
+* Evidence Assessor 已落地（B2）：`review_agent/runtime/nodes/evidence_assess.py`
+  （节点 + 纯函数 `assess_evidence`）。它通过 `NodeResult.evidence_revisions` 按 id
+  修订已有证据，不改新增证据；QUOTE 有字符定位才 VERIFIED，外部来源最多 PARTIAL，
+  占位引用为 UNVERIFIED。单测：`checks/test_evidence_assessor.py`（8 项）。
+* Evidence Gate 已落地（B3，缺省关闭）：`domain/policy.py::evidence_gate` +
+  `DecisionPolicy(evidence_gate_enabled=True)`。开启后弱证据/部分证据把裁定封顶为
+  warn，反证生成 `DisputeKind.CONTRADICTION`；单测：`checks/test_evidence_gate.py`。
 * Cross Reviewer 已落地：`review_agent/runtime/nodes/cross_review.py`
   （节点 + `review_findings`）。旧流程 S5 已改成「编成领域对象 → 节点复核 → 回写」；
   降权通过 `NodeResult.revisions` 表达（见 §4 规则 6）。
@@ -172,14 +180,14 @@ class RunState:
 | planning | `plan` | 规划失败 → 终止（不允许「边跑边想」） | S2 |
 | analysis | `findings`、`analysis_stats`、`semantic_stats` | 单维度失败 → 记录失败维度并继续；全失败 → 降级 rule-only | S3 |
 | evidence | `evidence`、`evidence_dropped` | 锚定工具失败 → 该批 finding 标 `UNANCHORED` 并进 limitations | S4 |
+| cross_review | `disputes` | 复核失败 → 终止（带着未复核的结论出报告 = 假绿灯） | S5 |
+| decision | `decision` | 策略无法复算 → 终止；人工复核未完成 → `awaiting_decision` | S6 |
+| finalize | `report`（含 `evidence[]`）、`audit_export` | 写入失败 → 重试；仍失败则保留状态，报告下载返回明确错误 | S6 写盘 |
 
 `evidence_dropped` 不只是统计：它列出的发现**不再算数**——交叉复核与裁定都要
 用 `runtime.surviving_findings(state)` 取「排除已丢弃后」的集合。
 状态是只增的（发现不可变），所以「移出报告」表现为后续阶段按清单排除，
 而不是从 `state.findings` 里删掉。
-| cross_review | `disputes` | 复核失败 → 终止（带着未复核的结论出报告 = 假绿灯） | S5 |
-| decision | `decision` | 策略无法复算 → 终止；人工复核未完成 → `awaiting_decision` | S6 |
-| finalize | `report`（含 `evidence[]`）、`audit_export` | 写入失败 → 重试；仍失败则保留状态，报告下载返回明确错误 | S6 写盘 |
 
 报告的 `evidence[]` 段是 finalize 的产物之一：每条发现对应一条证据记录
 （`evidence_id` / `issue_id` / `quote` / `verification`），
@@ -189,6 +197,19 @@ class RunState:
 旧实现里 **S5.5（目的比对）与 S5.6（库外事实核验）** 是 analysis 的补算子阶段：
 它们不改变阶段顺序，只往 `findings` / `artifacts` 追加内容，因此不单列阶段。
 把它们做成「阶段」会让人误以为可以跳过——事实上目的比对失败必须写进 limitations。
+
+2026-11-01（批次 2 / A2）：S5.6 已落成 **`FactCheckNode`（`fact-checker`）**，
+挂在 analysis 阶段、`SemanticReviewerNode` 之后：
+
+* 只产出两样东西——被反驳主张的 `FACT-001` 发现（severity 由来源权威性决定：
+  ≥0.8 才 major，单一来源只到 minor 并进 `needs_confirm`）与
+  `kind=EXTERNAL_SOURCE` 的证据（带 `source_ref` = 来源 URL）；
+* 结论块写进 `artifacts["research"]`（`STAGE_ARTIFACTS[ANALYSIS]` 已登记该键，
+  它只是**允许写入**，是否必填由节点 `produces` 决定，所以不开 `--research`
+  时不会因缺它而推进失败）；
+* 联网走 `research.web` 工具（`Permission.RESEARCH`，缺省不授予），
+  网页内容 `untrusted=True`；`official` 标记按白名单二次校验。
+  报告段由 `tools/research.build_block()` 产出——与旧链路**同一个函数**。
 
 ## 6. 状态与 Checkpoint
 
@@ -218,7 +239,8 @@ class RunState:
 | finalize | 是（写盘） | 30s | 无（失败保留状态供重试） |
 
 超时值不是拍脑袋：阶段 2 用历史 `logs/*/cost.json` 的 `total_latency_ms` 分布校准，
-校准结果写进本表并留 ADR。当前不写死，是因为还没有节点级耗时数据。
+校准结果写进本表并留 ADR。上表是**建议值**，尚未写成默认配置——原因见本节末的
+「已知边界」，不是因为机制没有实现。
 
 **已落地（2026-10-31）**：`Orchestrator(timeout=...)` 是**单节点**上限，不是整次审查的上限——
 整次超时只能告诉你「跑太久了」，单节点超时能告诉你「卡在哪个节点的第几次尝试」。
@@ -278,8 +300,10 @@ class RunState:
    模型调用经 `SemanticExecutor` 端口注入。
    *已完成 Document Analyzer*：`document.classify_target` 是类型判定的唯一实现，
    旧流程的 `detect_type_detail` 已改为委托；读文件经 `reader` 端口注入。
-   六节点全部就位。下一步是 **Application Service**：把 `run_one` 的入参组装、
-   节点执行器（reader / rule executor / semantic executor）与 `FileRunStore` 接起来。
+   六节点全部就位。Application Service 也已落地（`application/service.py`：组装 + 执行
+   + 落盘 + 恢复，`checks/test_application_service.py`），因此下一步不是「接线」而是
+   **切流**：清零 `unsupported_blocks` → 在线双跑 → `DEFAULT_ENGINE` 改 `v1`。
+   逐项验收见 `docs/V1-架构收口与整改方案.md`。
 4. **开关**：`REVIEW_ENGINE=v1` 环境变量切换新链路；默认仍是旧链路，直到双跑连续
    一周零未解释差异。
 5. **回滚**：把开关切回旧链路即可，不需要回滚数据——两份产物都写同一套 `outputs/` 格式。
@@ -291,10 +315,10 @@ class RunState:
 
 | 问题 | 现状 | 倾向 |
 | --- | --- | --- |
-| Planner 是否用 LLM？ | 未实现 | 不用：按 Profile 与目标类型确定性生成计划（可复现优先） |
+| Planner 是否用 LLM？ | **已实现（规则化）**：`runtime/nodes/planner.py`，按目标类型 + Profile 确定性生成 `plan`，不调模型（验收 `checks/test_planner_node.py`） | 保持不用：计划必须可复现 |
 | 人工复核如何进入状态机？ | `awaiting_decision` 已定义，动作未实现 | 阶段 4 加 `HUMAN` 事件 + `Decision.approved_by` |
 | 阶段内部分失败如何计入覆盖率？ | 旧实现按块记 `failed_chunks` | 沿用，并进 `Coverage.failed_chunks` |
 | 多 Run 的重审触发条件？ | 只有 1:1 历史映射 | 材料变更（`target_hash` 变化）或规则集升级；由 Application 决定 |
-| research 结果如何进状态？ | Decision 节点暂从 `ctx.config` 读 `external_unverified` / `coverage_complete` | 阶段 2 扩 `STAGE_ARTIFACTS[evidence]`/`[cross_review]`，把研究兜底升级为登记产物；在那之前不改契约，避免「产物键随手加」 |
+| research 结果如何进状态？ | **已解决（批次 2 / A2）**：`FactCheckNode` 把结论块写进 `artifacts["research"]`（`STAGE_ARTIFACTS[ANALYSIS]` 已登记），报告段与旧链路共用 `build_block()`；`Decision` 仍从 `ctx.config` 读 `external_unverified` / `coverage_complete` | 下一步把「库外未核完不得 pass」接进 `DecisionPolicy` 的显式输入（批次 3 随证据闸门一起） |
 | 节点如何分配发现编号？ | **已解决**：`NodeContext.next_finding_seq` + 编排器按「已有最大号 + 1」发放、同阶段逐节点接续 | 节点一律用它起号；`merge_results()` 对重复编号直接报错 |
 | `Finding` 与 issue dict 的关系？ | 迁移期双形态：管线内用 dict（S3~S5 边跑边改），S6 出口由 `issue_codec` 单向回写并逐键校验 | 阶段 5 之后 dict 只作为报告序列化格式，管线内一律用 `Finding`；`evidence`（判定依据文字）是否升为领域字段在阶段 3 定 |

@@ -42,6 +42,169 @@
 
 ---
 
+# 2026-11-02
+
+### 2026-11-02 · 新增 · 证据评估节点 + 证据闸门（批次 3 / B2、B3）
+
+- **文件**：`review_agent/runtime/nodes/evidence_assess.py`（新增 `EvidenceAssessorNode` / `assess_evidence`）、`review_agent/runtime/node.py`（`NodeResult.evidence_revisions` + 按 id 替换与悬空校验）、`review_agent/runtime/nodes/__init__.py`、`review_agent/application/service.py`（workflow 插入评估节点）、`review_agent/domain/policy.py`（`EvidenceGate` / `evidence_gate` / `cap_verdict` / `DecisionPolicy.evidence_gate_enabled`）、`review_agent/domain/__init__.py`、`review_agent/runtime/nodes/decision.py`（闸门封顶 + 反证争议）、`checks/test_evidence_assessor.py`（8 项）、`checks/test_evidence_gate.py`（7 项）、`docs/{AGENT_RUNTIME,ARCHITECTURE,V1-架构收口与整改方案}.md`
+- **改了什么**：
+  1. `EvidenceAssessorNode` 位于 EVIDENCE 阶段、`EvidenceAnalyzerNode` 之后、`CrossReviewerNode` 之前；不新增阶段、不调模型。QUOTE 有原文定位才 `VERIFIED`，无字符位置为 `PARTIAL`，占位/其它为 `UNVERIFIED`；外部来源最多 `PARTIAL`（主体/指标/时间为 `None`），已有反证保持 `CONTRADICTED`。
+  2. 运行时新增 `NodeResult.evidence_revisions`：评估节点修订已有证据，不再重复追加；`advance()` 校验修订 id 属于上游、不得与新增同号，并保持原证据顺序。
+  3. 策略层新增 `EvidenceGate`：G1 最弱一环、G2 blocker/major 弱证据不计入 fail、G3 反证生成 `CONTRADICTION` 争议、G4 PARTIAL 封顶 warn、G5 默认关闭完全等价旧裁定；`DecisionPolicy(evidence_gate_enabled=True, version="2")` 才启用。
+- **为什么**：B1 只让强度字段“写得出来”，但没有任何节点填它，也没有任何裁定读它——报告仍会把「有引用」当「证据充分」。B2 把强度变成流水线产物，B3 让弱证据真正改变裁定，同时用默认关闭保证历史报告重放不受影响。
+- **验证**：`checks/test_evidence_assessor.py` **8 项 OK**、`checks/test_evidence_gate.py` **7 项 OK**；公开不变量 **780 项 OK**；私有回归 **642 项 OK**；`compileall` OK。闸门默认关闭，V1 默认引擎仍保持 `legacy`，未做未经样本门槛的切流。
+
+### 2026-11-02 · 修复 · P1 边界收口：远程 HTTPS、联网 SSRF、删除缓存残留
+
+- **文件**：`tools/llm_client.py`（`endpoint_security_error` + `LLMConfig.endpoint_error/available`）、`server.py`（保存/试连/历史恢复三个入口校验；删除连带缓存、快照、缺口日志）、`review.py`（端点错误提示、审查号传入缓存上下文、研究缓存 owner）、`tools/research.py`（`validate_fetch_url` + `SafeRedirectHandler` + 缓存 owner）、`tools/llm_review.py`（`_owners` 记录/触碰 + 上下文变量）、`tools/fact_gap.py`（`purge_review`）、`checks/test_endpoint_security.py`（11 项）、`checks/test_url_safety.py`（6 项）、`checks/test_cache_ownership.py`（2 项）、`checks/test_server_governance.py`（新增删除连带用例）、`config/llm.yaml`、`config/research.yaml`、`README.md`
+- **改了什么**：
+  1. 远程 LLM 端点强制 `https://`；只有本机/局域网端点允许 `http://`；服务端保存、试连、历史恢复三处都拒绝 userinfo 与不安全地址，`LLMConfig.available` 也会因端点不安全而返回 false。
+  2. 联网核验新增 SSRF 边界：只接受 `http/https`，外部地址只允许 80/443；解析后拒绝回环、私网、链路本地、组播、未指定地址和 userinfo；重定向目标通过 `SafeRedirectHandler` 重新校验。
+  3. LLM 与检索缓存写入 `_owners`，缓存命中时也会补记当前审查号；删除报告时独占缓存移入回收站，共享缓存只摘掉当前 review_id。
+  4. v1 报告删除时读取 `target.snapshot_ref`，仅在没有其他报告引用时清理 `state/text` 快照；`state/gap_log.jsonl` 只移除该 review_id 的行，其他报告保留。
+- **为什么**：P0 只解决了“不要泄露”和“能复现”，P1 要解决“传输过程可能明文、搜索页可被诱导访问内网、删除报告后原文仍留在缓存/快照/缺口日志”。这三类问题不会报错，只会在事后审计或数据清理时暴露。
+- **验证**：`checks` 全量 **766 项 OK**；私有回归 **642 项 OK**；待提交快照 **212 个文件 / 密钥命中 0**，快照内 `checks` **766 项 OK（skipped=39）**；新增用例覆盖远程 HTTP 拒绝、本机 HTTP 放行、userinfo/私网/重定向边界、缓存 owner 合并、独占/共享缓存删除、快照引用与缺口日志清理；`compileall` 与 `git diff --cached --check` OK。
+
+### 2026-11-02 · 修复 · P0 交付安全：清除明文 Key、拦截误提交、验证待提交快照
+
+- **文件**：`config/llm.local.json`（删除本地明文副本）、`.gitignore`（补充 `config/*.local.json`、`.env*`、`*.pem`、`*.key`）、`tools/secret_scan.py`（新增）、`tools/release_check.py`（新增）、`checks/test_secret_scan.py`（新增 6 项）、`checks/test_release_check.py`（新增 5 项）、`.githooks/pre-commit`、`.github/workflows/ci.yml`、`docs/RELEASE_CHECKLIST.md`、`README.md`
+- **改了什么**：
+  1. 删除 `config/llm.local.json` 中的本地明文 Key；新增强化忽略规则，防止同类文件再次落库。
+  2. 新增 `secret_scan.py`：支持工作区、暂存区、导出目录扫描；命中时只显示脱敏预览，不打印密钥原文；测试夹具用精确白名单放行。
+  3. 新增 `release_check.py`：要求工作区干净，从 Git 暂存区 `write-tree` 后 `git archive` 到临时目录，检查关键文件、密钥、编译与 `checks/`；`--require-private-tests` 可追加工作区 `tests/` 私有回归。
+  4. `.githooks/pre-commit` 先跑暂存区密钥扫描，再跑 CHANGELOG 守门；CI 增加密钥扫描和待提交快照清单检查；README 与 `docs/RELEASE_CHECKLIST.md` 明确用 `git archive` 出包，不要压缩整个目录。
+- **为什么**：此前 `config/llm.local.json` 虽在 `.gitignore` 中，仍会随整目录打包带出；同时多个新模块未跟踪时，工作区测试通过但干净克隆会直接 ImportError。密钥轮换仍需在服务商后台由用户执行，代码侧只能先移除落盘副本并建立门禁。
+- **验证**：`python tools/secret_scan.py --include-tests` → 扫描 **210 个文件 / 命中 0**；`python tools/secret_scan.py --staged` → 暂存区 **62 个文件 / 命中 0**；`python -m unittest checks.test_secret_scan checks.test_release_check` → **11 项 OK**；`python -m unittest discover -s checks -q` → **746 项 OK**；`python tools/release_check.py --require-private-tests` → 暂存区快照 **209 个文件 / 密钥命中 0**，快照内 `checks` **746 项 OK（skipped=39）**，工作区私有回归 **642 项 OK**；`git diff --cached --check` OK。
+
+# 2026-11-01
+
+### 2026-11-01 · 新增 · 证据第二根轴 `EvidenceStrength`：从"有引用"到"有证据"（批次 3 / B1）
+
+- **文件**：`review_agent/domain/enums.py`（`EvidenceStrength` 五值 + `rank` / `label` / `ordered`）、`review_agent/domain/models.py`（`SourceRef` / `MatchCheck` / `EvidenceAssessment` 三个值对象 + `MATCH_KINDS`；`Evidence` 新增 `strength` / `assessment` / `contradicted_by` / `source` 四个字段与四条硬不变量）、`review_agent/domain/__init__.py`（导出）、`review_agent/runtime/serialization.py`（新字段读写 + 旧检查点缺键回落缺省）、`review_agent/runtime/node.py`（`advance()` 校验反向索引）、`review_agent/runtime/nodes/evidence.py`（`backfill_evidence_ids()` + 节点回填 `Finding.evidence_ids`）、`review_agent/runtime/nodes/research.py`（外部来源证据带 `SourceRef`）、`review_agent/application/shadow_report.py`（证据行补 `strength` / `contradicted_by` / `source`；`target` 补 `snapshot_ref` / `snapshot_hash`；顶层补 `target_text`；Markdown 补快照行与强度列）、`review.py`（`_write_target_snapshot()` + 报告注入）、`review_agent/infrastructure/retention.py` + `config/retention.yaml`（新增 `text` 类别，90 天）、`server.py`（删除连带 docstring 登记 `state/text/`）、`checks/test_evidence_strength.py`（新增 40 项）、`docs/{V1-架构收口与整改方案,DOMAIN_MODEL,ARCHITECTURE}.md`
+- **改了什么**：
+  1. **第二根轴**：`EvidenceStrength = unassessed / unverified / partial / verified / contradicted`，与 `verification` **正交**、不合并（合并会改掉 202 份历史报告的语义）。缺省 `UNASSESSED` 而不是 `UNVERIFIED`——历史报告是「没评估过」，不是「评估为不可靠」。
+  2. **四条硬不变量**让强度「写不出来」：`VERIFIED` 必须有评估者且四项匹配（来源身份/主体/指标/时间）**全部明确通过**；外部来源要标 `VERIFIED` 必须有正文快照（`SourceRef.snapshot_hash`）；`CONTRADICTED` 必须指出反证证据编号；`UNASSESSED` 不许带评估结果、`PARTIAL` 必须带评估（说清「部分」在哪）。
+  3. **N1 双向索引**：evidence 阶段用 `NodeResult.revisions` 回填 `Finding.evidence_ids`（合并而非覆盖），`advance()` 拒绝指向不存在证据的发现——此前 v1 路径上 `Finding.evidence_ids` **恒为空**，报告说不出「这条结论有哪些证据」。
+  4. **N2 原文快照**：`_write_target_snapshot()` 写 `state/text/<sha256>.txt`（按内容寻址、幂等、唯一临时名 + `os.replace` 原子替换），报告 `target` 补 `snapshot_ref` / `snapshot_hash`，顶层补 `target_text`（前端 `web/app.js` 的高亮/定位就读它）；没有快照时 limitations 自报「本报告只在同一仓库内可复核引用」。快照与报告都不再只说「我引了这句」。
+  5. 顺带：`state/text/` 纳入 retention（`text: 90`），并在删除连带的「未覆盖清单」里写明它按内容寻址、不能跟着单份报告删。
+- **为什么**：《审查意见》§3.2 举的例子是「材料写营收 100 亿，quote 校验成功 → 报告算可回溯，外部来源 80 亿时没有任何字段能表达『被反证』」。`verification` 只回答「这句话在不在原文里」，回答不了「够不够证明结论」；B1 补的正是这根轴，并把它做成**构造期就拦住伪造**，而不是靠调用方自觉。
+- **验证**：`checks/test_evidence_strength.py` **40 项 OK**（枚举序与正交性 / `SourceRef` 域名推导与 http 校验 / 三项值对象不变量 / 四条硬不变量逐条 / 旧证据字典读回为 `UNASSESSED` / 检查点往返保留第二根轴 / 双向索引回填·合并·幂等·悬空拒绝 / 快照写入·哈希·幂等 / retention 覆盖快照目录）；全量 `checks` **695 → 735 项 OK**；私有回归 **642 项 OK**；真实 v1 冒烟：报告 `target.snapshot_ref=.../state/text/7ca293….txt`、`snapshot_hash` 与 `target_text` 的 sha256 一致、快照文件与报告原文逐字节相同、两条证据 `strength=unassessed`（评估节点 B2 之前不该有别的值）。
+- **一处解释性收窄（已登记）**：方案原文「`EXTERNAL_SOURCE` ⇒ `source` 非空且 `snapshot_hash` 非空」落地为「`EXTERNAL_SOURCE` ⇒ `source` 非空」+「`VERIFIED` 且 `EXTERNAL_SOURCE` ⇒ `snapshot_hash` 非空」。原因：检索证据大多只有搜索摘要，把快照设成**存在性**条件会让 A2 产出的外部来源证据当场构造不出来；改后原意（没有快照只能到 `PARTIAL`）不变。
+
+### 2026-11-01 · 新增 · `research` 接入 v1：`unsupported_blocks` 清零，外部来源第一次成为证据（批次 2 / A2）
+
+- **文件**：`tools/research.py`（抽出 `lookup_verdict` / `remember_verdict` / `item_from_verdict` / `build_block` 四个共用函数；`review_claims()` 改为调它们）、`review_agent/capabilities/research.py`（新增：`research.web` 工具）、`review_agent/runtime/nodes/research.py`（新增：`FactCheckNode` + `ResearchClaim` / `ClaimVerdict` / `ResearchOutcome` + 发现/证据/整改建议构造）、`review_agent/application/service.py`（`PipelinePorts.research_executor` + `workflow()` 插入节点）、`review_agent/application/shadow_report.py`（`research` 顶层键 + limitations + 证据行补 `kind`/`source_ref`/`note` + Markdown 补「限制」「库外核验」两节 + `UNSUPPORTED_BLOCKS=()` + `fixes` 传输字段）、`review_agent/domain/transitions.py`（`STAGE_ARTIFACTS[ANALYSIS]` 登记 `research`）、`review_agent/runtime/nodes/evidence.py`（`next_evidence_seq()`）、`review.py`（`make_research_executor` / `_record_research_egress` / `run_typed_pipeline(research_enabled=)` / `_run_v1` / `_run_shadow` / `main`）、`checks/test_research_v1.py`（新增 34 项）、`checks/test_shadow_report.py`（2 处断言改为「已接入」）、`docs/{V1-架构收口与整改方案,ARCHITECTURE,AGENT_RUNTIME}.md`
+- **改了什么**：
+  1. **新节点 `FactCheckNode`**（analysis 阶段，接在语义审之后）。只产出两样东西：被反驳主张的 `FACT-001` 发现（来源够权威 ≥0.8 才 `major`，单一来源只到 `minor` 并进 `needs_confirm`）与 `kind=EXTERNAL_SOURCE` 的证据（`source_ref` = 来源 URL、`verified_by=research.web`、`verification=not_checked`——它引用的是别人网页上的话，不是待审原文）。
+  2. **`research.web` 工具**：`Permission.RESEARCH`（缺省不授予任何主体，审查流程自己要出网也得显式授权）、官方域白名单**二次校验**（检索层说「这是官网」但域名不在白名单里一律降级）、网页内容一律 `untrusted=True`、有结论却没来源直接判失败。
+  3. **报告 `research` 段与旧链路共用 `tools/research.build_block()`**：条目形状、`needs_confirm` 判据、来源截断（2 条）都只有一份实现。旧链路 `review_claims()` 同步改调这套函数（行为不变，由私有回归 642 项守着）。
+  4. **整改建议跟着来**：外部检索已经知道「改成 1.69 亿」，节点把它作为 `fixes`（传输字段）挂到状态上，报告层并进 `issues[].fix` 后立刻摘掉——否则 `remediation` 只能给「请补统计口径」这类通用建议，整改单会从「可直接改」误判成「需人工改写」。
+  5. **顺手修的两个真问题**：① 证据编号跨阶段撞号——analysis 阶段发了 `EV-0001`，evidence 阶段还从 1 起号，报告里「这条证据指向哪个发现」会变成掷硬币（`next_evidence_seq()` + 用例守着）；② `--engine shadow` 以前不透传 `--research`，两条链路一条联网一条不联网，差异全是「一边多出 FACT-001」。
+  6. 顺带补上影子报告 Markdown 缺的「限制」一节：限制以前只在 JSON 里，而看报告的人读的是 Markdown。
+- **为什么**：`unsupported_blocks` 是切流验收单，只剩 `research` 一项；而「库外事实」是审查结论里最容易被当成真的那一类——没有外部来源核验，报告只能对库外数字说「缺出处」，说不出「这个数和公开来源不一致」。这一项接完，v1 的 `unsupported_blocks` 才真正清零。
+- **验证**：`checks/test_research_v1.py` **34 项 OK**（三态→发现/证据、单一来源降级、维度闸门不发请求、执行器异常转失败、证据编号续号、产物白名单、工具权限/白名单/不可信输入、报告与 Markdown 段落、**真实本地来源库的 legacy↔v1 逐项比对**：`research` 段字段 / `FACT-001` 的严重度·置信度·建议 / 改写 `fix.to` 全部一致、端到端流水线与工具审计）；全量 `checks` **661 → 695 项 OK**；私有回归 **642 项 OK / 318s**；真实冒烟（`targets/selftest/st21_fact_xiaomi_research.txt --engine v1 --no-llm --research`）：`unsupported_blocks=[]`、`research.refuted=1`、`FACT-001 major`、证据 `EV-0001 external_source → finance.sina.cn`（第二条 `EV-0002 quote anchored` 证明续号生效）、台账 1 条、整改单「1 条可直接改」。
+
+### 2026-11-01 · 新增 · `law_library` 接入 v1：法条段与旧报告逐键一致（批次 2 / A1）
+
+- **文件**：`review.py`（抽出 `law_library_block(session)`；`run_one` 改为调用它；`_write_shadow_report` 注入）、`review_agent/application/shadow_report.py`（`build_shadow_report(law_library=...)` + `law_library` 顶层键 + limitations 自报法律依据范围 + `UNSUPPORTED_BLOCKS` 移除该项）、`checks/test_shadow_report.py`（3 处断言改为"law_library 已接入"，新增 3 项）、`checks/test_law_library_parity.py`（新增 4 项）
+- **改了什么**：
+  1. 把 `run_one` 里内联的法条库块抽成 `law_library_block(session)`，**两条链路调同一个函数**：「搬过去了」由同一段代码保证，而不是两份相似的实现"看着像"。
+  2. v1 影子报告新增顶层 `law_library`（与旧报告同名同形：`available / articles_total / laws / cited / skipped`），并在 `limitations` 里自报「法律依据仅限已收录的法条库：…共 N 条」——不写清楚，一条「依据：第十九条」会被读成"全部法律都查过了"。
+  3. `unsupported_blocks` 从 2 项降到 1 项（只剩 `research`）。
+- **为什么**：切流判据之一是 `unsupported_blocks` 清零，而它列的是**结论**不是格式——新链路没算就不能写。法条库这块本来只差"报告里那一段"，但"规则阶段也跑 `builtin.law_cite`"这件事没有任何测试守着，一旦注册被删就会悄悄变成空 `cited`，报告看起来完全正常。
+- **验证**：`checks/test_law_library_parity.py` **4 项**（用真实语料 `targets/selftest/st04_fact_law_trial.txt`——它故意写错法定上限，必定触发 LAW-001：键集合与旧报告一致 / `articles_total` 与法名一致 / **`cited` 条文逐条一致且非空** / limitations 带法条范围 / `unsupported_blocks` 不再列 `law_library`）；`checks/test_shadow_report.py` 18 项 OK（新增"注入后有块"、"未注入为 None"、"库不可用要解释"）；全量 `checks` **654 → 661 项 OK**。
+
+### 2026-11-01 · 新增 · 保留期（只算不删）+ 双跑观测工具（批次 2 / C5 · A4）
+
+- **文件**：`review_agent/infrastructure/retention.py`（新增，约 300 行）、`config/retention.yaml`（新增）、`tools/double_run.py`（新增）、`checks/test_retention.py`（新增 17 项）、`checks/test_double_run.py`（新增 11 项）、`docs/ARCHITECTURE.md`（目录树）
+- **改了什么**：
+  1. **保留期**：`plan(root, config, now)` 是纯函数（只算不删），`apply(plan, dry_run=True)` 缺省 dry-run，CLI 默认也是 dry-run。三条硬规则：**`ledger/` 永不进计划**（审计凭据）、**`state/tasks/` 里非终态记录永不删**（恢复依据，单独列进 `skipped` 并标 `keep=True`）、**没有"全清"开关**（只按 mtime 与天数比较，有 `--apply` 才动手）。目录年龄取**内部最新文件**的年龄而不是目录 mtime——否则往旧日志目录里多写一行就让整个目录"变新"，永远删不掉。
+  2. `config/retention.yaml` 给出七类默认值（outputs 365 / trash 30 / logs 180 / runs 90 / tasks 365 / jobs 7 / cache 30），缺文件或写坏都退回代码内缺省——清理配置坏了应当"少删"，不该"不跑"或"全删"。
+  3. **双跑观测**：`tools/double_run.py` 汇总 `state/double_run/*.json`，按「未解释差异 / 缺失 / 裁定不一致 / 样本门槛（`--require N`）」给出通过与否，退出码可直接接进门禁；`--since` 按 review_id 里的日期过滤。切流判据（连续 N 天零未解释差异）从此**能被一条命令回答**，而不是"记得去看那个目录"。
+- **为什么**：运行产物里每一类都带原文或原文片段（报告 `target_text`、检查点 `artifacts`、`cache/llm` 的引用、`gap_log` 的缺口句），没有保留期就是"用户以为删了、其实永远在"；而双跑差异以前只能人手点开 JSON 看，判据形同虚设。
+- **验证**：`checks/test_retention.py` **17 项**（台账再旧也不进计划 / 未结束任务保留并标注 / 终态任务可清理 / 目录整删 / 配置覆盖与坏值兜底 / dry-run 不删 / apply 真删 / 删不到计数不抛 / CLI 缺省 dry-run）；`checks/test_double_run.py` **11 项**（未解释、缺失、裁定不一致三种都判不通过 / 折叠不算差异 / `--since` 过滤 / 样本不足不通过 / 坏文件跳过 / 退出码）；全量 `checks` **626 → 654 项 OK**；真实仓库 `python -m review_agent.infrastructure.retention`：计划删 **0** 项、保留 **1201** 项（现有产物都还在期限内）。
+
+### 2026-11-01 · 修改 · 任务归属不再靠猜：预发号 + 子进程自报 + 任务记录 + 取消（批次 2 / C2）
+
+- **文件**：`review.py`（`--review-id`、`--print-review-id`、`REVIEW_RESULT` 行、`run_one(review_id=)`、`_run_v1(review_id=)`）、`review_agent/application/tasks.py`（`find_active` / `active_tasks` / `finish_task` / `mark_task` / `recover_tasks` 提成模块级函数；`FileTaskStore` 读取加重试）、`review_agent/application/__init__.py`（导出）、`server.py`（`TASKS` / `PROCS` / `_allocate_review_id` / `_idempotency_key` / `_job_view` / `_parse_review_result` / `_cancel_review` / `_finish_sync_task`；`_start_review` 与 `_run_review_job` 重写；`_recover_jobs` 接 `recover_tasks`）、`checks/test_server_tasks.py`（新增 16 项）
+- **改了什么**：
+  1. **报告归谁不再靠差集**：旧实现用「跑前/跑后 `outputs/` 的文件差集」认领报告，两个任务并发时会认领到**对方的**报告且不报错。现在号由服务端预发（`review.py --print-review-id`，发号逻辑仍只有一份），子进程结束时打印 `REVIEW_RESULT {review_id, report_path, verdict}`，父进程按它取报告。
+  2. **状态落盘**：`_start_review` 先写 `state/tasks/<review_id>.json`（QUEUED）再起进程；结束按子进程回报 `finish_task(COMPLETED/FAILED)`；`JOBS` 退化为视图（`_job_view`）。进程重启后「跑完没有」仍有答案。
+  3. **取消**：新增 `POST /api/review/cancel`（`job` 或 `review_id`），执行进程登记在 `PROCS` 里，取消 = `terminate` + 落 CANCELLED；幂等、终态拒绝。
+  4. **并发闸门改成看任务记录**（`active_tasks`，超龄不算）。旧实现只看内存 `JOBS` 的 running，而**同步接口根本不写 JOBS**——等于同步与异步可以同时跑。
+  5. **幂等键**：`file + llm + research + type + agent + scenario + spec + purpose` 的 sha256，落进任务记录；同键且未结束 → 复用同一个 job，不再起第二个进程。
+  6. **同步接口也走同一条路**：预发号、写任务记录、占闸门、按 `REVIEW_RESULT` 取报告。
+  7. `FileTaskStore.get/all` 读时对 `PermissionError` 重试：Windows 上 `os.replace` 会瞬时独占目标文件，不重试会让并发提交时 `find_active` 漏掉刚写的记录（实测导致同一幂等键建出两个任务）。
+- **为什么**：实测生产台账 286 条记录只对应 77 个不同目标、单份材料最多审了 15 次，其中相当一部分是「点了两次 / 刷新后重提」；而报告归属靠差集在并发下会张冠李戴。这两件事都属于「不报错但结论错」，比崩溃更难发现。
+- **验证**：`checks/test_server_tasks.py` **16 项 OK**（结果行解析 / 幂等键随任一参数变化且不含明文目的 / 状态映射 / 起进程前必有记录 / 重复提交去重 / 换参数被闸门拦 / 已完成不挡新任务 / 取消真的 terminate 且幂等 / 终态拒绝 / 未知任务报错）；`checks` 全量 **626 项 OK**；端到端冒烟 `targets/code_001.py` → `R-20261101-002`，0.6s、verdict=warn、任务记录 `completed/finalize`、台账 `288 条记录（含 65 条墓碑）链完整`，冒烟产物随后走真实删除路径清掉。
+
+### 2026-11-01 · 新增 · 工具执行三道护栏 + 出网权限档 + 调用审计接线（批次 2 / C7）
+
+- **文件**：`review_agent/capabilities/tools.py`（`Permission.RESEARCH`、`ToolBudgetError`、`ToolResult.invocation_id`、`ToolInvocation.invocation_id`、`ToolRegistry(max_calls/timeout/max_bytes)`、`_invoke` 护栏）、`review.py`（`Session.tool_invocations` + `record_invocation()`；`build_rule_registry` 传 `on_invoke`）、`checks/test_tool_limits.py`（新增 17 项）
+- **改了什么**：
+  1. `Permission.RESEARCH` 单独成档，`DEFAULT_POLICY` 里**默认不授予**：出网等于把材料送给第三方，不能因为「它也算分析」就跟着 `ANALYZE` 一起放行。
+  2. `ToolRegistry` 增三个**缺省关闭**的执行约束：`max_calls`（超出抛 `ToolBudgetError`，与工具自身失败区分开）、`timeout`（超时折成失败结果而不是抛异常——工具慢是可解释的失败，不该让整条审查崩）、`max_bytes`（输出过大折成失败，防止把整篇文档塞进状态与检查点）。
+  3. 每次调用生成 `invocation_id` 并同时写进 `ToolResult` 与 `ToolInvocation`：报告里「这条发现是哪个工具产出的」终于能和审计里的那一次调用对上号。
+  4. `build_rule_registry` 从 `ToolRegistry()` 改为 `ToolRegistry(on_invoke=session.record_invocation)`：原来 `ToolInvocation` 生成完就被丢弃，生产链路**没有任何工具级审计**。现在每次经注册表的调用（含被超时/配额拦下的）都留一条记录。**不落新文件**：`logs_hash` 进了报告完整性链，增删文件会让历史报告哈希对不上。
+- **为什么**：工具层协议早就齐了（`ToolResult` / `Permission` / `ToolInvocation`），缺的是「执行时的约束」和「记录有没有被接走」。没有超时，一个慢工具让整次审查卡到入口超时；没有配额，某个维度炸了会把调用次数堆到不可控；没有 `invocation_id`，审计里同一工具的同毫秒两次调用无法区分。
+- **验证**：`checks/test_tool_limits.py` **17 项 OK**（权限档默认拒绝 / 超预算不执行到工具 / 超时折成失败 / 输出过大被拒 / `invocation_id` 与审计回调一致 / 非 `ToolResult` 仍报错 / 生产链路 `builtin.fact` 真跑一次并在 `Session.tool_invocations` 里留痕）；全量 **610 项 OK**。
+
+### 2026-11-01 · 修复 · 「没勾选也外发全文」与「删除只删了三分之一」（批次 2 / C5 前置）
+
+- **文件**：`server.py`（`_llm_flag()`、`_record_egress()`、`EGRESS_LOG`、`STATE_DIR`；同步与异步两条 `cmd` 构建改用显式开关；`_purge_derived()` 连带清理；`_delete_report` 调用它）、`checks/test_server_governance.py`（新增 12 项）
+- **改了什么**：
+  1. **缺省不外发**：`llm` 字段缺省（`None`）时以前**不传** `--llm/--no-llm`，`review.py` 于是按 `config/llm.local.json` 的 `enabled: true` 走 —— 用户没勾选，全文照样发外部模型。现在统一折成显式开关，且**只认严格 `True`**（`"false"`、`0`、`[]` 都不算同意）。
+  2. **外发清单**：新增 `state/egress.log`（append-only jsonl），每次 `--llm` 审查记一行元信息（时间 / 对象 / job / 用途），**不记 prompt 内容**——审计日志本身不该成为新的泄露面；写失败只告警不阻断。
+  3. **删除连带**：删报告时同时处理 `outputs/v1/`、`state/runs/*.state.json`（`artifacts` 里带 `target_text` 全文）、`logs/v1/<id>/`，一并移入 `outputs/.trash/`（可恢复）。未覆盖的三处（`cache/llm/`、`state/gap_log.jsonl`、`state/research_cache/`）**写在 docstring 里明说**，不宣称「已彻底删除」。
+  4. 把 `_purge_derived` / `_mark_ledger_deleted` 提成模块级函数（它们不用 `self`），删报告的逻辑因此可脱离 `Handler` 单测。
+- **为什么**：这两条都是「默认值事故」——屏幕上显示「未调用模型」，实际已把材料送出去；用户点了删除，原文还在三个地方躺着。两者都属于「用户以为的样子」和「实际发生的样子」不一致。
+- **验证**：`checks/test_server_governance.py` **12 项 OK**（`None`/`"false"`/`0` 都判为不外发；外发日志只含元信息且可关闭、写失败不抛；删除后 `outputs/v1`、`state/runs`、`logs/v1` 均不在原位且进回收站；未二次确认时不动文件；老报告没有 v1/state 副本也能删）；全量 **610 项 OK**。
+
+### 2026-11-01 · 修改 · 台账删除改为「追加墓碑」，不再整文件重写（批次 1 / C4）
+
+- **文件**：`review_agent/infrastructure/__init__.py`（新增）、`review_agent/infrastructure/ledger.py`（新增，约 380 行）、`review.py`（`_acquire_ledger_lock`/`_release_ledger_lock` 改为薄包装；`run_one` 与 `_write_shadow_report` 的追加改走 `ledger_store`）、`server.py`（`_mark_ledger_deleted` 改为 `ledger_store.tombstone`；`_integrity` 改用 `entries_for_api`；`do_DELETE` 包 try/except）、`tools/integrity.py`（`verify_ledger` 委托唯一实现）、`checks/test_ledger_concurrency.py`（新增 15 项）
+- **改了什么**：
+  1. 新增 `review_agent/infrastructure/ledger.py`，把锁（`O_EXCL` 锁文件 + 30s 超时 + 60s 陈旧锁清理）、`seq` 推导、追加、墓碑、校验收成一份实现。行分两种形态，靠字段区分而**不看 `op`**：有 `report_hash` = 链上记录（旧版原位 `op=delete` 也属此类）；有 `target_seq` 且无 `report_hash` = 独立墓碑。
+  2. `seq` 改为**只数报告记录**（墓碑不占新号）。旧实现按行数推，删过报告之后新记录会与历史号相撞。
+  3. `append()` 在锁内复核 `prev_hash`，对不上直接抛 `LedgerError`——专抓「忘了拿锁」这类 bug。
+  4. `server.py` 的删除改为 `tombstone()` 追加一行；`_integrity` 不再把墓碑当成坏行（旧实现会让删过报告的用户永远看到红叉），接口新增 `tombstones` / `deleted` 字段（只增不改）。
+  5. `tools/integrity.py::verify_ledger` 委托 `ledger.verify`，同时兼容新旧两种墓碑形态（旧的原位行标注 `legacy_tombstone`）。
+- **为什么**：旧实现删报告时把整个 `chain.log` 读进内存、改一行、`os.replace` 整文件写回，三个洞：**不持锁**（撞上正在 append 的审查会静默吞掉新行，而 `seq` 按行数推→撞号断链）、**临时名固定** `chain.tmp`（并发删除互相覆盖）、**Windows 上 `os.replace` 撞上打开的文件会 `PermissionError`**，而 `do_DELETE` 没有 try/except → 连接被掐。
+- **验证**：`checks/test_ledger_concurrency.py` **16 项 OK**（并发 8 写者 ×25 + 4 删除者 ×5，连跑 3 轮均 OK；断言「墓碑后原有行逐字节不变」「链完整」「seq 1..N 不重号」「墓碑指向有效」「真断链仍被抓」）；全量 `python -m unittest discover -s checks` → **581 项 OK**；`python tools/integrity.py verify` → `ledger 校验通过，共 286 条记录，链完整`（45 OK / 180 STALE / 0 FAIL）。
+
+### 2026-11-01 · 新增 · 任务生命周期：QUEUED/CANCELLED、取消、超时、恢复、幂等（批次 1 / C1）
+
+- **文件**：`review_agent/domain/enums.py`（`RunStatus` 增 `QUEUED`/`CANCELLED`）、`review_agent/domain/transitions.py`（迁移表 + `recoverable()`）、`review_agent/domain/__init__.py`（导出）、`review_agent/runtime/cancel.py`（新增 `CancellationToken`）、`review_agent/runtime/orchestrator.py`（阶段/节点边界检查 + `ABORTED`）、`review_agent/runtime/__init__.py`、`review_agent/application/service.py`（`ReviewApplication(token=...)`）、`review_agent/application/tasks.py`（`start_async`/`cancel`/`wait`/`recover`/`idempotency_key`/`timeout`/`is_live`/`active_review_ids`，`FileTaskStore` 改唯一临时名）、`review.py`（`run_typed_pipeline(token=...)`、`make_task_runner` 接 token、`has_run_state()`）、`checks/test_task_lifecycle.py`（新增 27 项）
+- **改了什么**：
+  1. **取消是协作式的**，只在阶段边界与节点边界生效（不在 `asyncio` 里强杀）；取消时状态原样保留、只标 `ABORTED`，报告不写——「取消不留半成品」靠流程保证，不靠事后删文件。
+  2. `RunStatus` 加 `QUEUED` / `CANCELLED`；**不加 `RECOVERABLE`**：「可恢复」是「running + 有检查点 + 无活执行者」的三元判断（`recoverable()`），写成状态会出现两套真相。同步入口仍允许 `CREATED → RUNNING`（不强迫所有入口先入队）。
+  3. `TaskService`：`start_async`（先落 `QUEUED` 再后台跑）、`cancel`（幂等；终态拒绝；置位令牌）、`timeout`（超时置位令牌 + 落 FAILED）、`recover()`（返回 `resumable` / `orphaned`，废任务就地标 FAILED 并写明原因）、`idempotency_key`（落盘，同一键 + 未结束 → 返回同一任务）。
+  4. 取消与「入队→开跑」用同一把 `_state_lock` 互斥：否则 `cancel()` 写的 CANCELLED 会被执行线程的 RUNNING 覆盖——实测复现过「点取消却照样跑完并写报告」。
+  5. `FileTaskStore.save` 临时名改 `<rid>.<pid>.<uuid>.tmp` + `os.replace` 重试：固定名 `<rid>.tmp` 在取消与推进并发时直接 `PermissionError [WinError 5]`。
+  6. `Runner` 协议的 `token` 是**可选**参数（`inspect.signature` 判断）：老 runner 不接就照旧调用，不逼全仓同时改签名。
+- **为什么**：生产侧取消是**零实现**（全仓 `cancel|terminate|kill` 零命中），用户只能等；超时只靠 server 的 1800s 子进程 `timeout`，杀掉就丢状态；`_recover_jobs` 只能靠「目标 + 时间窗」猜；重复提交零幂等（实测 `ledger/chain.log` 286 条记录只对应 77 个不同目标，单份材料最多审了 15 次）。
+- **验证**：`checks/test_task_lifecycle.py` **27 项 OK**（取消落在「开始前 / 节点之间 / 最后节点之后」三个边界、超时置位令牌、幂等键跨实例存活、恢复三分支、异步 QUEUED→COMPLETED、活任务可见）；连跑 3 轮均 OK；全量 **581 项 OK**。
+
+### 2026-11-01 · 修改 · 仓库卫生：`agents/` 入库、5 个内部报告出库、文档漂移收口（批次 1 / C6）
+
+- **文件**：`.gitignore`（去掉 `agents/`）、`agents/**`（4 个文件入库）、`docs/修复报告-{第二轮,第三轮,压力测试问题整改}.md`、`docs/本地模型实测报告.md`、`docs/盲测协议.md`（`git rm --cached`，本地保留）、`docs/ARCHITECTURE.md`、`docs/AGENT_RUNTIME.md`、`docs/REFACTOR_PLAN.md`、`docs/PHASE0_INVENTORY.md`
+- **改了什么**：
+  1. `agents/` 取消忽略并入库（`doc-review/manifest.json`、`security-audit/{manifest.json,checks.py,rules/security.yaml}`），`__pycache__` 仍由全局规则排除。
+  2. 5 个命中忽略规则却仍被跟踪的文件移出索引（本地文件保留）。
+  3. 文档漂移逐条修：`ARCHITECTURE.md` §1 换成实测数字（123 文件 / 38,029 行；`review.py` 4,833 行 / 非空非注释 3,998；`tools/` 43 个 15,434 行）、行号表重算（`run_one` 2469 / `Session` 474 / `_h_*` 1568）、目标树删掉从未存在的 `engine/`、用例数改实测（Rule 18 / 编排器 27）、§7 五处「v1 缺口」改为现状；`AGENT_RUNTIME.md` 修被段落打断的阶段表、删「超时机制未实现」的自相矛盾、`Planner 未实现` → 已实现（规则化）；`REFACTOR_PLAN.md` 把「server 通过 `REVIEW_ENGINE` 透传」改成事实（子进程继承，未显式传）；`PHASE0_INVENTORY.md` 顶部标注「阶段 0 冻结快照，不随后续提交更新」。
+- **为什么**：`agents/` 从未入库（`git log -- agents` 为空），而 `agent_spec.py` 默认 Agent 是 `doc-review` → **干净克隆跑任何审查都会 `AgentError: 未知 Agent：doc-review` 并 `exit 2`**，不是"少一个 Profile"而是开箱不可运行；文档里的行号与用例数已整体失效，照着找代码会找错位置。
+- **验证**：`git ls-files agents` → 4 个文件；`git check-ignore -v agents` → 无命中；`python review.py --list-agents` → 列出 `doc-review`（33 条规则 / 5 检查器）与 `security-audit`（18 条规则）；5 个文档 `Test-Path` 仍为 True（本地保留）；全量 **581 项 OK**。
+
+### 2026-11-01 · 修复 · 控制台后端退出时「Failed to fetch」被当成 LLM 配置错误
+
+- **文件**：`web/app.js`（`api()` 增加网络失败分支 + 新增 `markBackendDown()`；`loadLlmStatus()` / `renderLlmStatusLine()` / `updateRunState()` 区分「读不到状态」与「未配置」）、`web/index.html`（横幅文案包一层 `#llmBannerText`，便于改字而不动按钮）。
+- **改了什么**：
+  1. `api()` 的 `fetch` 拒绝分支不再把浏览器的 `Failed to fetch` 原样丢给调用方：统一提示一次「无法连接控制台后端（<path>）：请重新运行 start-console.bat」，并抛同义 `Error`；任何成功响应把 `state.backendDown` 复位。
+  2. 新增 `markBackendDown()`：药丸改「控制台未连接」、横幅改「服务已退出，请重新运行 start-console.bat」、弹窗状态行改「Key / 模型配置没被读取（不是重新填 Key）」；`renderLlmStatusLine()` 在断线时不再回落到「配置状态未知」。
+  3. `updateRunState()`：断线时按钮文案为「运行审查（控制台未连接）」、tooltip 指向重启命令；恢复后 `loadLlmStatus()` 顺手刷一次状态行，断线期间的旧文案不会滞留。
+- **为什么**：用户报「LLM 的 API 配置显示 failed to fetch」，实际原因是 `server.py` 进程已退出（8000 端口无监听），页面上每一次 `/api/*` 都失败；而 `/api/llm/status` 一失败，药丸就退回「LLM 未配置」，用户于是去翻 Key。Key 与配置本身是好的：直连 `https://api.deepseek.com/v1/models` 与 `/v1/chat/completions` 均 200。把最容易被误读的那句报错改成能自证原因的文案。
+- **验证**：`node --check web/app.js` 通过；Edge headless（CDP 拦 `*/api/*`）加载页面 → 药丸「控制台未连接」、横幅「无法连接控制台后端（服务已退出）」、按钮「运行审查（控制台未连接）」、点「测试连接」得「无法连接控制台后端：Key / 模型配置没被读取」；解除拦截并 `loadLlmStatus()` → 药丸 `LLM · deepseek-chat`、状态行「可用 · deepseek-chat · 来源：前端保存」、点「测试连接」→「连接成功 · deepseek-flash · 延迟 768ms · 回复「可用」」；`/api/llm/status`、`/api/llm/test` 实测 HTTP 200。
+
 # 2026-10-31
 
 ### 2026-10-31 · 删除 · 金标准数据（tests/）整体移出公开仓库

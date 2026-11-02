@@ -27,11 +27,17 @@ from .shadow_report import (
 from .tasks import (
     TASK_SCHEMA,
     FileTaskStore,
+    RecoveryReport,
     Runner,
     TaskOutcome,
     TaskRecord,
     TaskService,
     TaskStore,
+    active_tasks,
+    find_active,
+    finish_task,
+    mark_task,
+    recover_tasks,
 )
 
 __all__ = [
@@ -41,8 +47,9 @@ __all__ = [
     "ENGINE", "LOGS_HASH_LIMITATION", "SCHEMA_VERSION", "UNSUPPORTED_BLOCKS",
     "build_shadow_report", "render_shadow_md",
     # 任务
-    "TASK_SCHEMA", "FileTaskStore", "Runner", "TaskOutcome", "TaskRecord",
-    "TaskService", "TaskStore",
+    "TASK_SCHEMA", "FileTaskStore", "RecoveryReport", "Runner", "TaskOutcome",
+    "TaskRecord", "TaskService", "TaskStore",
+    "active_tasks", "find_active", "finish_task", "mark_task", "recover_tasks",
     # 报告
     "DEFAULT_ORDER", "SOURCE_LEGACY", "SOURCE_V1", "ReportRef", "ReportService",
     # 审计事件流

@@ -15,6 +15,7 @@
 import json
 import re
 import secrets
+import contextvars
 from pathlib import Path
 
 DIM_LABEL = {"fact": "事实", "safety": "安全", "compliance": "合规", "style": "风格",
@@ -26,6 +27,7 @@ INSTRUCTION_RE = re.compile(
 # 规则清单外的独立发现用 OPEN-xxx 标识（仍必须通过 quote 逐字校验）
 FLOAT_NOISE_RE = re.compile(r"\d+\.\d{5,}")
 CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "llm"
+_CACHE_OWNER = contextvars.ContextVar("llm_cache_owner", default=None)
 # prompt 一旦改动必须改版本号，否则会命中旧缓存，拿不到新策略的效果
 PROMPT_VERSION = "2026-10-30a"
 
@@ -113,9 +115,40 @@ def _cache_read(key):
         return None
 
 
-def _cache_write(key, payload):
+def set_cache_owner(owner):
+    """把当前审查号放进上下文，避免改动 review_dimension 的调用签名。"""
+    return _CACHE_OWNER.set(str(owner) if owner else None)
+
+
+def reset_cache_owner(token):
+    _CACHE_OWNER.reset(token)
+
+
+def _cache_touch(key, owner):
+    """记录某次审查用过这条缓存；删除报告时据此判断是否仍被引用。"""
+    if not owner:
+        return
+    path = CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        owners = list(payload.get("_owners") or [])
+        if owner not in owners:
+            owners.append(owner)
+            payload["_owners"] = owners
+            path.write_text(json.dumps(payload, ensure_ascii=False),
+                            encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+
+def _cache_write(key, payload, owner=None):
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if owner:
+            payload = dict(payload)
+            payload["_owners"] = [owner]
         (CACHE_DIR / f"{key}.json").write_text(
             json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except OSError:
@@ -500,13 +533,14 @@ def validate(raw, rules, text, max_issues, dim=None, facts=None):
 
 
 def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None,
-                     facts=None):
+                     facts=None, owner=None):
     """调一次模型做单维审查；调用失败由上层捕获 LLMError。
 
     charter: 可选的「审查任务书」文本，注入 prompt 让模型知道判定标准与后果等级。
     full_text: 分块审查时传完整原文——quote 必须对完整原文校验（块是原文的子串）。
     facts: 事实库（事实维度注入 prompt + 校验降级；其它维度忽略）。
     """
+    owner = owner or _CACHE_OWNER.get()
     validate_text = full_text if full_text is not None else text
     prompt_text = text
     truncated = False
@@ -521,6 +555,7 @@ def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None
     if cache_key:
         hit = _cache_read(cache_key)
         if hit:
+            _cache_touch(cache_key, owner)
             # 命中缓存：原文块、维度、规则集、模型、prompt 版本全都一致才会命中，
             # 所以结论等价；token 记 0，成本与耗时如实反映"没调用模型"。
             for k, default in (("model", cfg.model), ("issues", []), ("dropped", []),
@@ -529,6 +564,7 @@ def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None
                                ("output_truncated", False)):
                 hit.setdefault(k, default)
             return {**hit, "cached": True, "latency_ms": 0,
+                    "cache_key": cache_key,
                     "usage": {"input": 0, "output": 0}}
 
     messages = build_messages(dim, rules, prompt_text, charter=charter, facts=facts)
@@ -566,7 +602,7 @@ def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None
     }
     # 只缓存"干净的"结果：输出被截断的不缓存，否则下次会复用不完整的结论
     if cache_key and not truncated_output:
-        _cache_write(cache_key, payload)
+        _cache_write(cache_key, payload, owner=owner)
     return {
         "issues": issues,
         "dropped": dropped,
@@ -580,4 +616,5 @@ def review_dimension(client, dim, rules, text, cfg, charter=None, full_text=None
         "open_discoveries": sum(1 for i in issues if i.get("open_discovery")),
         "finish_reason": finish_reason,
         "output_truncated": truncated_output,
+        "cache_key": cache_key,
     }

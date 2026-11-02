@@ -205,7 +205,13 @@ class LLMConfig:
         """有模型 + (有密钥 或 本地端点) 才算可用。"""
         if not self.enabled or not self.model or not self.base_url:
             return False
-        return bool(self.api_key) or _is_local(self.base_url)
+        return (not endpoint_security_error(self.base_url)
+                and (bool(self.api_key) or _is_local(self.base_url)))
+
+    @property
+    def endpoint_error(self):
+        """端点安全/格式问题；为空表示可以发请求。"""
+        return endpoint_security_error(self.base_url)
 
     def masked_key(self):
         """只回显前缀，绝不回显末几位。
@@ -229,6 +235,7 @@ class LLMConfig:
             "model": self.model,
             "api_key": self.masked_key(),
             "api_key_set": bool(self.api_key),
+            "endpoint_error": self.endpoint_error,
             "timeout": self.timeout,
             "max_retries": self.max_retries,
             "max_tokens": self.max_tokens,
@@ -259,6 +266,35 @@ def _is_local(url):
     except ValueError:
         return False
     return ip.is_loopback or ip.is_private
+
+
+def endpoint_security_error(url):
+    """返回端点不可用的原因；None 表示可接受。
+
+    规则：
+      * 只接受 http / https；
+      * 不允许 userinfo（`https://user:pass@host`）——它会被原样写进历史与响应；
+      * 远程端点必须 HTTPS；本机 / 局域网端点才允许 HTTP（Ollama 等常见形态）。
+    """
+    raw = str(url or "").strip()
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "Base URL 格式不合法"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return "Base URL 必须以 http:// 或 https:// 开头"
+    if not parts.hostname:
+        return "Base URL 缺少主机名"
+    if parts.username or parts.password:
+        return "Base URL 不允许包含用户名/密码（userinfo）"
+    try:
+        parts.port
+    except ValueError:
+        return "Base URL 端口不合法"
+    if scheme == "http" and not _is_local(raw):
+        return "远程 LLM 端点必须使用 https://；仅本机/局域网端点允许 http://"
+    return None
 
 
 def _as_bool(value, default=True):
@@ -423,6 +459,9 @@ class LLMClient:
 
     def chat(self, messages, temperature=None, max_tokens=None):
         """一次 chat completion；失败抛 LLMError（已含重试）。"""
+        endpoint_error = self.cfg.endpoint_error
+        if endpoint_error:
+            raise LLMError(endpoint_error)
         if not self.cfg.available:
             raise LLMError("LLM 未启用或缺少 API Key / 本地端点")
 

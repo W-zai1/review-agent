@@ -291,6 +291,39 @@ def resolve(gap_ids, by_candidate="", path=None):
     return len(ids)
 
 
+def purge_review(review_id, path=None):
+    """删除某次审查写入的缺口行；其他报告的缺口保留。
+
+    这不是审计链：`gap_log` 是派生工单，删除报告时不应继续保留它的原文片段。
+    先写唯一临时文件再 `os.replace`，避免半截文件让后续 `load()` 读坏。
+    """
+    rid = str(review_id or "").strip()
+    if not rid:
+        return 0
+    p = path_of(path)
+    if not p.exists():
+        return 0
+    kept, removed = [], 0
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            kept.append(line)
+            continue
+        if str(row.get("review_id") or "") == rid:
+            removed += 1
+            continue
+        kept.append(line)
+    if not removed:
+        return 0
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.purge.tmp")
+    tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    os.replace(tmp, p)
+    return removed
+
+
 def load(path=None, include_resolved=False):
     """折叠 jsonl → 缺口视图（次数、首末次出现、是否已解决）。"""
     p = path_of(path)

@@ -34,17 +34,21 @@ from ..domain import (
     DisputeKind,
     DisputeStatus,
     Evidence,
+    EvidenceAssessment,
     EvidenceKind,
+    EvidenceStrength,
     Finding,
     FindingOrigin,
     FindingStatus,
     IntegrityHashes,
     Location,
+    MatchCheck,
     ReviewProfile,
     RiskLevel,
     RuleRef,
     RunStats,
     Severity,
+    SourceRef,
     Stage,
     Verdict,
     Verification,
@@ -133,6 +137,49 @@ def finding_from_dict(data: Mapping[str, Any]) -> Finding:
     )
 
 
+def source_to_dict(source: SourceRef) -> dict[str, Any]:
+    return {
+        "url": source.url,
+        "domain": source.domain,
+        "official": source.official,
+        "fetched_at": _iso(source.fetched_at),
+        "snapshot_hash": source.snapshot_hash,
+    }
+
+
+def source_from_dict(data: Mapping[str, Any] | None) -> SourceRef | None:
+    if not isinstance(data, Mapping) or not data.get("url"):
+        # 没有 url 就没有来源。宁可当作「没有 SourceRef」，也不造一个空壳：
+        # 空壳会让 `EXTERNAL_SOURCE` 证据看起来有来源，实际无法复核。
+        return None
+    return SourceRef(
+        url=data["url"], domain=data.get("domain") or "",
+        official=bool(data.get("official")),
+        fetched_at=_dt(data.get("fetched_at")),
+        snapshot_hash=data.get("snapshot_hash"),
+    )
+
+
+def assessment_to_dict(assessment: EvidenceAssessment) -> dict[str, Any]:
+    return {
+        "checks": [{"kind": c.kind, "ok": c.ok, "detail": c.detail}
+                   for c in assessment.checks],
+        "assessed_by": assessment.assessed_by,
+        "assessed_at": _iso(assessment.assessed_at),
+    }
+
+
+def assessment_from_dict(data: Mapping[str, Any] | None) -> EvidenceAssessment | None:
+    if not isinstance(data, Mapping):
+        return None
+    checks = tuple(MatchCheck(kind=str(c.get("kind") or ""), ok=c.get("ok"),
+                              detail=str(c.get("detail") or ""))
+                   for c in (data.get("checks") or ()) if isinstance(c, Mapping))
+    return EvidenceAssessment(checks=checks,
+                              assessed_by=str(data.get("assessed_by") or ""),
+                              assessed_at=_dt(data.get("assessed_at")))
+
+
 def evidence_to_dict(evidence: Evidence) -> dict[str, Any]:
     return {
         "id": evidence.id,
@@ -146,6 +193,14 @@ def evidence_to_dict(evidence: Evidence) -> dict[str, Any]:
         "note": evidence.note,
         "created_at": _iso(evidence.created_at),
         "finding_ids": list(evidence.finding_ids),
+        # 批次 3 / B1：第二根轴。缺省值也照样写出来——检查点要能自描述
+        # 「这条证据当时没评估过」，而不是靠缺键猜。
+        "strength": evidence.strength.value,
+        "assessment": (assessment_to_dict(evidence.assessment)
+                       if evidence.assessment is not None else None),
+        "contradicted_by": list(evidence.contradicted_by),
+        "source": (source_to_dict(evidence.source)
+                   if evidence.source is not None else None),
     }
 
 
@@ -160,6 +215,12 @@ def evidence_from_dict(data: Mapping[str, Any]) -> Evidence:
         verified_by=data.get("verified_by"), note=data.get("note"),
         created_at=_dt(data.get("created_at")),
         finding_ids=tuple(data.get("finding_ids") or ()),
+        # 旧检查点没有这几个键 → 落到缺省（UNASSESSED / 无评估 / 无来源），
+        # 不报错、不补造：历史状态原样读回。
+        strength=EvidenceStrength(data.get("strength") or "unassessed"),
+        assessment=assessment_from_dict(data.get("assessment")),
+        contradicted_by=tuple(data.get("contradicted_by") or ()),
+        source=source_from_dict(data.get("source")),
     )
 
 

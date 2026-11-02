@@ -43,11 +43,29 @@ import uuid
 import shutil
 import threading
 import subprocess
+import hashlib
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, urlsplit
+
+# 台账的锁 / seq 推导 / 墓碑格式只有一套实现（`infrastructure/ledger.py`）。
+# server 与 review.py 共用它：两边各写一份的下场是「一个按行数推号、一个按记录数推号」，
+# 删过报告之后新记录的 seq 就会撞号。
+from review_agent.infrastructure import ledger as ledger_store
+# 任务记录是「这条审查到底跑完没有」的唯一真相：JOBS 只是给前端看的内存视图。
+from review_agent.application import (
+    FileTaskStore,
+    TaskOutcome,
+    TaskRecord,
+    active_tasks,
+    find_active,
+    finish_task,
+    mark_task,
+    recover_tasks,
+)
+from review_agent.domain import RunStatus, Stage
 
 # 强制 UTF-8 输出：Windows / GitHub Actions runner 的控制台可能用 cp1252 等
 # 非 UTF-8 编码，打印中文（任务恢复日志等）会抛 UnicodeEncodeError。
@@ -66,10 +84,14 @@ UPLOADS = TARGETS / "uploads"
 OUTPUTS = ROOT / "outputs"
 LEDGER = ROOT / "ledger"
 LOG_DIR = ROOT / "logs"
+STATE_DIR = ROOT / "state"                               # 运行状态（检查点 / 任务记录 / 缓存）
 FAVORITES = ROOT / "config" / "favorites.json"         # 被收藏的报告 ID（顺序无意义）
 TRASH = OUTPUTS / ".trash"                              # 已删报告回收区（可恢复）
 LLM_HISTORY = ROOT / "config" / "llm_history.json"     # LLM 配置记忆（最近用过的）
 LLM_HISTORY_MAX = 12
+# 外发清单：哪些材料发给了第三方（只记元信息，不记内容）
+EGRESS_LOG = ROOT / "state" / "egress.log"
+LLM_CACHE_DIR = ROOT / "cache" / "llm"
 
 UPLOADS.mkdir(parents=True, exist_ok=True)
 UPLOAD_MAX_BYTES = 2 * 1024 * 1024
@@ -99,6 +121,13 @@ JOBS_DIR = LOG_DIR / ".jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+# 任务记录（`state/tasks/<review_id>.json`）：跨进程、跨重启的事实来源。
+# `JOBS` 从这一刻起只是它的内存视图，不再自己长出一套状态。
+TASKS = FileTaskStore(STATE_DIR / "tasks")
+# 活着的子进程：取消要真的停掉它（terminate），而不是只把状态改成"已取消"。
+PROCS: dict[str, subprocess.Popen] = {}
+PROCS_LOCK = threading.Lock()
+TASK_STALE_AFTER = timedelta(hours=1)
 
 # 审查子进程超时：长文 + LLM 远超 5 分钟，写死 300s 等于必然超时。
 # 默认 1800s，允许用环境变量 / 命令行调整，但必须落在 [30, 86400]。
@@ -172,6 +201,7 @@ PY = resolve_python()
 sys.path.insert(0, str(ROOT / "tools"))
 import integrity  # noqa: E402
 import ingest  # noqa: E402
+import fact_gap  # noqa: E402
 import agent_spec  # noqa: E402
 import scenario  # noqa: E402
 import format_spec  # noqa: E402
@@ -764,6 +794,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._run_review(data))
         if u.path == "/api/review/start":
             return self._send(200, self._start_review(data))
+        if u.path == "/api/review/cancel":
+            return self._send(200, self._cancel_review(data))
         if u.path == "/api/annotations":
             return self._send(200, self._add_annotation(data))
         if u.path == "/api/candidates/decide":
@@ -790,7 +822,13 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/report":
             rid = parse_qs(u.query).get("id", [None])[0]
             data = self._json_body()
-            return self._send(200, self._delete_report(rid, data))
+            # 删除是「移文件 + 追加墓碑」两步：任何一步抛异常都要回结构化错误，
+            # 不能让异常掀掉连接（旧实现的台账整文件重写在 Windows 上会 PermissionError）。
+            try:
+                return self._send(200, self._delete_report(rid, data))
+            except Exception as exc:                    # noqa: BLE001 - HTTP 边界
+                return self._send(500, {"ok": False,
+                                        "error": f"删除失败：{type(exc).__name__}: {exc}"})
         if u.path == "/api/purpose/files":
             pid = parse_qs(u.query).get("id", [None])[0]
             ok = _delete_purpose_record(pid)
@@ -1241,6 +1279,15 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "need_confirm": True,
                     "error": "删除需要二次确认：请提交 confirm=<报告ID>"}
 
+        report = None
+        for candidate in (OUTPUTS / "v1" / f"{rid}.json", hit):
+            if candidate.is_file():
+                try:
+                    report = _read_json(candidate)
+                    break
+                except Exception:
+                    continue
+
         TRASH.mkdir(parents=True, exist_ok=True)
         moved = []
         for src in (OUTPUTS / f"{rid}.json", OUTPUTS / f"{rid}.md"):
@@ -1254,8 +1301,10 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.rmtree(str(dst), ignore_errors=True)
             shutil.move(str(log_src), str(dst))
             moved.append(f"logs/{rid}/")
+        # 连带清理：报告不是唯一一份原文副本
+        moved.extend(_purge_derived(rid, report=report))
 
-        tombstoned = self._mark_ledger_deleted(rid)
+        tombstoned = _mark_ledger_deleted(rid)
         # 收藏表里摘掉这个 id：报告都进回收站了，收藏里留着会变成永远点不开的幽灵项
         favs = self._favorites()
         if rid in favs:
@@ -1269,31 +1318,13 @@ class Handler(BaseHTTPRequestHandler):
             "ledger_tombstone": tombstoned,
         }
 
+    def _purge_derived(self, rid):
+        """删报告时，把它在别处的**原文副本**一起处理掉（实现见模块级 `_purge_derived`）。"""
+        return _purge_derived(rid)
+
     def _mark_ledger_deleted(self, rid):
-        """在 ledger 对应行原位写墓碑；不改动 seq / report_hash / prev_hash。"""
-        ledger = LEDGER / "chain.log"
-        if not ledger.exists():
-            return False
-        lines = [l for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
-        hit = False
-        out = []
-        for raw in lines:
-            try:
-                row = json.loads(raw)
-            except Exception:
-                out.append(raw)
-                continue
-            if row.get("review_id") == rid and row.get("op") != "delete":
-                row["op"] = "delete"
-                row["deleted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-                row["deleted_hash"] = row.get("report_hash", "")
-                hit = True
-            out.append(json.dumps(row, ensure_ascii=False))
-        if hit:
-            tmp = ledger.with_suffix(".tmp")
-            tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
-            os.replace(str(tmp), str(ledger))
-        return hit
+        """给这份报告追加墓碑（实现见模块级 `_mark_ledger_deleted`）。"""
+        return _mark_ledger_deleted(rid)
 
     def _report(self, rid):
         if not rid:
@@ -1545,11 +1576,33 @@ class Handler(BaseHTTPRequestHandler):
         if purpose_err:
             return {"ok": False, "error": purpose_err}
         purpose_max = len(purpose_text) if purpose_text else None
+        # 「同一份材料 + 同一套参数」的指纹：重复提交不该建出第二个任务，
+        # 也不该在台账里多一条同结论记录（实测生产台账里 286 条只对应 77 个目标）。
+        key = _idempotency_key(file=file, llm=llm_opt, research=research_opt,
+                               type_=type_opt, agent=agent_opt,
+                               scenario=scenario_opt, spec=spec_opt,
+                               purpose_text=purpose_text)
         with JOBS_LOCK:
             now = time.time()
+            # 1) 幂等命中：同一个键的未结束任务直接复用（返回同一个 job_id）
+            existing = find_active(TASKS, key)
+            if existing is not None:
+                for old_id, old in list(JOBS.items()):
+                    if old.get("review_id") == existing.review_id:
+                        JOBS[old_id] = _job_view(existing, old)
+                        print(f"[review] 幂等命中：沿用任务 {existing.review_id}"
+                              f"（job {old_id}）", flush=True)
+                        return {"ok": True, "job_id": old_id, "deduped": True,
+                                "review_id": existing.review_id,
+                                "status": JOBS[old_id]["status"]}
+            # 2) 并发闸门：看**任务记录**，不看内存里的 running。后者在重启后是空的，
+            #    而且同步接口根本不占位（等于没闸门）。
+            busy = active_tasks(TASKS, stale_after=TASK_STALE_AFTER)
+            if busy:
+                return {"ok": False, "error": "已有审查任务进行中，请稍候",
+                        "review_id": busy[0].review_id}
+            # 3) 清掉一小时前结束的内存任务（只清视图与进度文件，不动任务记录）
             for old_id, old in list(JOBS.items()):
-                if old.get("status") == "running":
-                    return {"ok": False, "error": "已有审查任务进行中，请稍候"}
                 if old.get("finished") and now - old["finished"] > 3600:
                     JOBS.pop(old_id, None)
                     try:
@@ -1562,10 +1615,35 @@ class Handler(BaseHTTPRequestHandler):
                 progress.unlink()
             except OSError:
                 pass
+            try:
+                review_id = _allocate_review_id()
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc)}
+            stamp = datetime.now().isoformat(timespec="seconds")
+            record = TaskRecord(
+                review_id=review_id,
+                run_id=f"{review_id}-RUN01",
+                status=RunStatus.QUEUED.value,
+                stage=Stage.INTAKE.value,
+                target=str(file),
+                engine="legacy",
+                profile_id=agent_opt,
+                purpose=(purpose_text or None),
+                idempotency_key=key,
+                created_at=stamp,
+                updated_at=stamp,
+            )
+            # 先落任务记录再起进程：进程被杀时至少能证明「这个号确实存在过」
+            try:
+                TASKS.save(record)
+            except OSError as exc:
+                return {"ok": False, "error": f"无法写入任务记录：{exc}"}
             JOBS[job_id] = {
                 "id": job_id,
+                "review_id": review_id,
                 "file": file,
                 "status": "running",
+                "task_status": RunStatus.QUEUED.value,
                 "created": now,
                 "finished": None,
                 "report_id": None,
@@ -1580,56 +1658,76 @@ class Handler(BaseHTTPRequestHandler):
                 # 「为什么跑了很久才失败 / 为什么 300s 就断了」时有据可查。
                 "timeout": REVIEW_TIMEOUT,
             }
-        print(f"[review] 任务 {job_id} 已创建：{file}（超时 {REVIEW_TIMEOUT}s）",
-              flush=True)
+        print(f"[review] 任务 {job_id}（{review_id}）已创建：{file}"
+              f"（超时 {REVIEW_TIMEOUT}s）", flush=True)
         threading.Thread(
             target=_run_review_job,
-            args=(job_id, file, llm_opt, progress, type_opt, agent_opt,
+            args=(job_id, review_id, file, llm_opt, progress, type_opt, agent_opt,
                   purpose_text or None, purpose_max, purpose_quality, scenario_opt,
                   spec_opt, research_opt),
             daemon=True,
         ).start()
-        return {"ok": True, "job_id": job_id}
+        return {"ok": True, "job_id": job_id, "review_id": review_id}
+
+    def _cancel_review(self, data):
+        """取消正在跑（或排队）的审查。
+
+        为什么现在能做到：执行进程登记在 `PROCS` 里，取消就是 `terminate` 它——
+        旧实现只在内存里把状态改成 error，进程还在后台写完报告，用户看到
+        「已取消」却在 `outputs/` 里多出一份报告。
+
+        状态以任务记录为准：`terms` 之后子进程退出码非零，但 `_run_review_job`
+        会先看任务记录是不是 CANCELLED，是就不覆盖成 error。
+        """
+        d = data or {}
+        job_id = str(d.get("job") or "").strip()
+        review_id = str(d.get("review_id") or "").strip()
+        if not review_id and job_id:
+            with JOBS_LOCK:
+                review_id = str((JOBS.get(job_id) or {}).get("review_id") or "")
+        if not review_id:
+            return {"ok": False, "error": "找不到任务：请给 job 或 review_id"}
+        record = TASKS.get(review_id)
+        if record is None:
+            return {"ok": False, "error": f"找不到任务：{review_id}"}
+        status = RunStatus(record.status)
+        if status is RunStatus.CANCELLED:
+            cancelled = record                      # 幂等：连点两下不该报错
+        elif status.is_terminal:
+            return {"ok": False,
+                    "error": f"任务已是终态（{status.value}），不能取消"}
+        else:
+            with PROCS_LOCK:
+                proc = PROCS.get(review_id)
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except OSError as exc:
+                    print(f"[review] 取消时终止子进程失败：{exc}", flush=True)
+            cancelled = mark_task(TASKS, review_id, RunStatus.CANCELLED,
+                                  error="用户取消")
+        with JOBS_LOCK:
+            for jid, job in JOBS.items():
+                if job.get("review_id") != review_id:
+                    continue
+                job.update(_job_view(cancelled, job))
+                job.update({"status": "cancelled",
+                            "finished": job.get("finished") or time.time()})
+        print(f"[review] 任务 {review_id} 已取消（{cancelled.status}）", flush=True)
+        return {"ok": True, "review_id": review_id,
+                "status": cancelled.status, "job": job_id or None}
 
     def _integrity(self):
         ledger = LEDGER / "chain.log"
         if not ledger.exists():
             return {"ok": False, "chain_ok": False, "entries": [],
                     "reports": [], "detail": "ledger 尚未生成（运行一次审查后才有）"}
-        lines = [l for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
-        chain_ok = True
-        prev = "0" * 64
-        seq = 1
-        broken_at = None
-        entries = []
-        for raw in lines:
-            try:
-                row = json.loads(raw)
-            except Exception:
-                chain_ok = False
-                broken_at = broken_at or seq
-                break
-            row_ok = row.get("seq") == seq and row.get("prev_hash") == prev
-            if not row_ok:
-                chain_ok = False
-                if broken_at is None:
-                    broken_at = seq
-            entries.append({
-                "seq": row.get("seq"),
-                "review_id": row.get("review_id"),
-                "report_hash": row.get("report_hash", ""),
-                "report_hash_short": (row.get("report_hash") or "")[:12],
-                "prev_hash": row.get("prev_hash", ""),
-                "prev_hash_short": (row.get("prev_hash") or "")[:12],
-                "ts": row.get("ts", ""),
-                "ok": row_ok,
-                # op=delete 为墓碑行：报告已被用户删除，链位保留、痕迹可审计
-                "op": row.get("op", "report"),
-                "deleted": row.get("op") == "delete",
-                "deleted_at": row.get("deleted_at"),
-            })
-            prev = row.get("report_hash", "")
-            seq += 1
+        # 链的解读交给唯一实现：墓碑（独立行 / 历史原位行）不再被当作"坏行"，
+        # 否则删过一份报告的用户会永远看到红叉（旧实现就是这样）。
+        view = ledger_store.entries_for_api(ledger)
+        entries = view["entries"]
+        chain_ok = view["chain_ok"]
+        broken_at = view["broken_at"]
 
         reports = []
         cur_rules_ver = integrity.rules_version()
@@ -1671,6 +1769,8 @@ class Handler(BaseHTTPRequestHandler):
             "ok": ok,
             "chain_ok": chain_ok,
             "entries": entries,
+            "tombstones": view["tombstones"],
+            "deleted": view["deleted"],
             "reports": reports,
             "broken_at": broken_at,
             "stale_count": stale_count,
@@ -1700,7 +1800,11 @@ class Handler(BaseHTTPRequestHandler):
             elif len(base_url) > 300:
                 errors.append("Base URL 过长")
             else:
-                patch["base_url"] = base_url
+                security_error = llm_client.endpoint_security_error(base_url)
+                if security_error:
+                    errors.append(security_error)
+                else:
+                    patch["base_url"] = base_url
 
         if "model" in data:
             model = str(data.get("model") or "").strip()
@@ -1785,6 +1889,9 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": "缺少 base_url 或 model"}
         if not base_url.startswith(("http://", "https://")):
             return {"ok": False, "error": "Base URL 必须以 http:// 或 https:// 开头"}
+        security_error = llm_client.endpoint_security_error(base_url)
+        if security_error:
+            return {"ok": False, "error": security_error}
         try:
             old = llm_client.load_config()
         except Exception:
@@ -1816,6 +1923,9 @@ class Handler(BaseHTTPRequestHandler):
 
         base_url = str(data.get("base_url") or "").strip().rstrip("/")
         effective_base = base_url or base.base_url
+        security_error = llm_client.endpoint_security_error(effective_base)
+        if security_error:
+            return {"ok": False, "error": security_error}
         if _url_has_userinfo(effective_base):
             # userinfo 会原样回显并写进 llm_history.json，等于明文留凭据
             return {"ok": False,
@@ -1920,15 +2030,16 @@ class Handler(BaseHTTPRequestHandler):
         target, error = _resolve_target(file)
         if error:
             return {"ok": False, "error": error}
-        with JOBS_LOCK:
-            if any(j.get("status") == "running" for j in JOBS.values()):
-                return {"ok": False, "error": "已有审查任务进行中，请稍候"}
+        # 同步接口也要占并发闸门：旧实现只查内存 JOBS 里的 running，而同步调用根本不写 JOBS，
+        # 于是「同步 + 异步同时跑」是允许的——两条进程同时写 ledger/outputs。
+        busy = active_tasks(TASKS, stale_after=TASK_STALE_AFTER)
+        if busy:
+            return {"ok": False, "error": "已有审查任务进行中，请稍候",
+                    "review_id": busy[0].review_id}
         cmd = [str(PY), str(ROOT / "review.py"), file]
         llm_opt = (data or {}).get("llm")
-        if llm_opt is True:
-            cmd.append("--llm")
-        elif llm_opt is False:
-            cmd.append("--no-llm")
+        # 永远显式给一个：不传 = 由 config 的 enabled 决定 = 默认把全文发出去
+        cmd.append(_llm_flag(llm_opt))
         # 库外事实核验默认关闭；前端勾选后显式传 research:true
         if (data or {}).get("research") is True:
             cmd.append("--research")
@@ -1963,7 +2074,25 @@ class Handler(BaseHTTPRequestHandler):
         if purpose_quality:
             cmd.extend(["--purpose-notes",
                         json.dumps(purpose_quality, ensure_ascii=False)])
-        before = {p.name for p in OUTPUTS.glob("R-*.json")}
+        # 与异步接口同一条规矩：号由本端预先发、报告路径由子进程回报。
+        # 旧实现的 `before/after` 差集在同步接口上同样会认领错报告（两个 API 调用并发时）。
+        try:
+            review_id = _allocate_review_id()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        cmd.extend(["--review-id", review_id])
+        stamp = datetime.now().isoformat(timespec="seconds")
+        try:
+            TASKS.save(TaskRecord(
+                review_id=review_id, run_id=f"{review_id}-RUN01",
+                status=RunStatus.QUEUED.value, stage=Stage.INTAKE.value,
+                target=str(file), engine="legacy",
+                profile_id=(data or {}).get("agent"),
+                purpose=(purpose_text or None),
+                created_at=stamp, updated_at=stamp))
+            mark_task(TASKS, review_id, RunStatus.RUNNING)
+        except OSError as exc:
+            return {"ok": False, "error": f"无法写入任务记录：{exc}"}
         t0 = time.time()
         timeout = REVIEW_TIMEOUT
         try:
@@ -1971,7 +2100,7 @@ class Handler(BaseHTTPRequestHandler):
                 cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            return {"ok": False, "timeout": timeout,
+            return {"ok": False, "timeout": timeout, "review_id": review_id,
                     "elapsed": round(time.time() - t0, 1),
                     "error": f"审查超时（{timeout}s）"}
         except Exception as e:
@@ -1980,24 +2109,367 @@ class Handler(BaseHTTPRequestHandler):
         if proc.returncode != 0:
             raw = (proc.stderr or proc.stdout or f"退出码 {proc.returncode}")[-2500:]
             info = _parse_review_error(raw) or {}
-            payload = {"ok": False,
-                       "error": _strip_error_marker(raw) or raw,
+            message = _strip_error_marker(raw) or raw
+            _finish_sync_task(review_id, status=RunStatus.FAILED, error=message)
+            payload = {"ok": False, "error": message,
                        "returncode": proc.returncode, "timeout": timeout,
-                       "elapsed": elapsed}
+                       "elapsed": elapsed, "review_id": review_id}
             if info:
                 payload["error_kind"] = info.get("kind")
                 payload["error_status"] = info.get("http_status")
             return payload
-        after = {p.name for p in OUTPUTS.glob("R-*.json")}
-        new = after - before
-        if not new:
+        result = _parse_review_result(proc.stdout) or {}
+        report_path = result.get("report_path")
+        if not report_path or not Path(str(report_path)).exists():
+            _finish_sync_task(review_id, status=RunStatus.FAILED,
+                              error="审查完成但未生成报告（子进程未报告结果路径）")
             return {"ok": False, "error": "审查完成但未生成报告",
-                    "timeout": timeout, "elapsed": elapsed}
-        # 取最新生成的报告
-        latest = max(OUTPUTS.glob("R-*.json"), key=lambda p: p.stat().st_mtime)
-        report = _read_json(latest)
-        return {"ok": True, "report": report, "id": report.get("review_id"),
+                    "timeout": timeout, "elapsed": elapsed,
+                    "review_id": review_id}
+        report = _read_json(Path(str(report_path)))
+        _finish_sync_task(review_id, status=RunStatus.COMPLETED,
+                          report_path=report_path, verdict=result.get("verdict"))
+        return {"ok": True, "report": report,
+                "id": report.get("review_id") or review_id,
                 "elapsed": elapsed, "timeout": timeout}
+
+
+def _finish_sync_task(review_id, *, status, error=None, report_path=None,
+                      verdict=None):
+    """同步接口收尾时落任务记录（与异步路径同一套状态语义）。
+
+    stage 沿用记录里已有的值：失败时硬写一个阶段（比如 ANALYSIS）会让人以为
+    「跑到 analysis 才挂的」，而实际可能挂在 intake（读不出文件）。
+    """
+    try:
+        current = TASKS.get(review_id)
+        stage = Stage(current.stage) if current is not None else Stage.INTAKE
+        finish_task(TASKS, review_id, TaskOutcome(
+            status=status, stage=stage, error=error,
+            report_path=report_path, verdict=verdict))
+    except (OSError, ValueError) as exc:                # 找不到记录 / 写盘失败
+        print(f"[review] 任务记录落盘失败：{exc}", flush=True)
+
+
+def _llm_flag(llm_opt) -> str:
+    """把前端的 llm 三态折成**显式**命令行开关（永远给一个）。
+
+    为什么不能"不传就让配置决定"：`config/llm.local.json` 里 `enabled` 通常是 true，
+    不传参数时 `review.py` 会按配置走 —— 用户没勾选，全文照样发往外部模型。
+    这是默认外发，不是"用户选择外发"。
+    `None`（接口调用方没带这个字段）按**不外发**处理：缺省必须落在保守的一侧。
+    """
+    return "--llm" if llm_opt is True else "--no-llm"
+
+
+def _record_egress(kind, *, target=None, job_id=None, detail="", enabled=True):
+    """记一行"哪些内容发给了第三方"（append-only jsonl）。
+
+    为什么单独记：报告里能查到"用过模型"，查不到"这次把哪份材料送出去了"。
+    出问题时要回答的是后者。这里只记**元信息**（对象、任务号、提供方），
+    不记 prompt 内容——审计日志本身不该成为新的泄露面。
+    """
+    if not enabled:
+        return
+    try:
+        EGRESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "kind": str(kind),
+            "target": (str(target) if target else None),
+            "job_id": job_id,
+            "detail": str(detail or ""),
+        }
+        with open(EGRESS_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        # 记录失败不该让审查跑不下去：但要显式说一句，不能静默
+        print(f"[egress] 外发记录写入失败：{exc}", flush=True)
+
+
+def _trash_destination(name):
+    TRASH.mkdir(parents=True, exist_ok=True)
+    dst = TRASH / name
+    if dst.exists():
+        stem, ext = os.path.splitext(name)
+        dst = TRASH / f"{stem}-{int(time.time() * 1000)}{ext}"
+    return dst
+
+
+def _move_derived(src, prefix, moved, label):
+    try:
+        dst = _trash_destination(f"{prefix}_{src.name}")
+        shutil.move(str(src), str(dst))
+        moved.append(f"{label}/{src.name}")
+    except OSError:
+        pass
+
+
+def _purge_owned_cache(directory, owner, prefix, label, moved):
+    """移除缓存里的 owner；若还有别的 owner 就保留文件。"""
+    if not owner or not directory.is_dir():
+        return
+    for src in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(src.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw = data.get("_owners")
+        owners = [str(x) for x in raw] if isinstance(raw, list) else []
+        if owner not in owners:
+            continue
+        remaining = [x for x in owners if x != owner]
+        if remaining:
+            data["_owners"] = remaining
+            try:
+                tmp = src.with_name(f"{src.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                               encoding="utf-8")
+                os.replace(tmp, src)
+            except OSError:
+                pass
+        else:
+            _move_derived(src, prefix, moved, label)
+
+
+def _snapshot_ref(report):
+    if not isinstance(report, dict):
+        return ""
+    target = report.get("target")
+    if isinstance(target, dict) and target.get("snapshot_ref"):
+        return str(target["snapshot_ref"])
+    snap = report.get("target_snapshot")
+    if isinstance(snap, dict) and snap.get("ref"):
+        return str(snap["ref"])
+    return ""
+
+
+def _snapshot_file(ref):
+    if not ref:
+        return None
+    path = Path(ref)
+    if path.is_absolute():
+        return path if path.is_file() else None
+    candidate = ROOT / path
+    if candidate.is_file():
+        return candidate
+    candidate = STATE_DIR / "text" / path.name
+    return candidate if candidate.is_file() else None
+
+
+def _snapshot_referenced(ref, exclude_rid):
+    for base in (OUTPUTS, OUTPUTS / "v1"):
+        for path in base.glob("R-*.json"):
+            if path.stem == exclude_rid:
+                continue
+            try:
+                report = _read_json(path)
+            except Exception:
+                continue
+            if _snapshot_ref(report) == ref:
+                return True
+    return False
+
+
+def _find_report(rid):
+    for path in (OUTPUTS / f"{rid}.json",
+                 OUTPUTS / "v1" / f"{rid}.json",
+                 TRASH / f"{rid}.json",
+                 TRASH / f"v1_{rid}.json"):
+        if path.is_file():
+            try:
+                return _read_json(path)
+            except Exception:
+                continue
+    return None
+
+
+def _purge_derived(rid, report=None):
+    """删报告时，把它在别处的**原文副本/派生缓存**一起处理掉。
+
+    新报告会带两类归属信息：
+      * LLM/检索缓存的 `_owners` 里有 review_id；
+      * v1 报告的 `target.snapshot_ref` 指向 `state/text/<sha256>.txt`。
+
+    因此删除时可以做到：
+      * 独占缓存 → 移到回收站；
+      * 共享缓存 → 只摘掉当前 review_id，文件保留；
+      * 共享原文快照 → 其他报告仍引用就保留；
+      * `state/gap_log.jsonl` → 只移除该 review_id 的行。
+
+    旧报告没有归属键时，无法可靠反查的缓存不会被误删，继续由 retention
+    按年龄清理；返回的 `moved` 如实列出实际处理过的条目。
+    """
+    moved = []
+    for suffix in (".json", ".md"):
+        src = OUTPUTS / "v1" / f"{rid}{suffix}"
+        if src.exists():
+            dst = _trash_destination(f"v1_{src.name}")
+            shutil.move(str(src), str(dst))
+            moved.append(f"outputs/v1/{src.name}")
+    for src in sorted((STATE_DIR / "runs").glob(f"{rid}*.state.json")):
+        dst = _trash_destination(f"state_{src.name}")
+        shutil.move(str(src), str(dst))
+        moved.append(f"state/runs/{src.name}")
+    v1_logs = LOG_DIR / "v1" / rid
+    if v1_logs.is_dir():
+        dst = _trash_destination(f"{rid}_v1logs")
+        if dst.exists():
+            shutil.rmtree(str(dst), ignore_errors=True)
+        shutil.move(str(v1_logs), str(dst))
+        moved.append(f"logs/v1/{rid}/")
+
+    report = report if isinstance(report, dict) else _find_report(rid)
+    ref = _snapshot_ref(report)
+    if ref and not _snapshot_referenced(ref, rid):
+        snapshot = _snapshot_file(ref)
+        if snapshot:
+            _move_derived(snapshot, "text", moved, "state/text")
+
+    _purge_owned_cache(LLM_CACHE_DIR, rid, "cache_llm", "cache/llm", moved)
+    _purge_owned_cache(STATE_DIR / "research_cache", rid,
+                       "cache_research", "state/research_cache", moved)
+    try:
+        removed = fact_gap.purge_review(
+            rid, path=STATE_DIR / "gap_log.jsonl")
+    except OSError:
+        removed = 0
+    if removed:
+        moved.append(f"state/gap_log.jsonl（移除 {removed} 行）")
+    return moved
+
+
+def _mark_ledger_deleted(rid):
+    """给这份报告**追加**一条墓碑；链上原有行一个字节都不动。
+
+    旧实现是在台账里原位改一行（`op=delete`）再整文件 `os.replace` 写回：
+    语义对，机制有三个洞——不持写锁（撞上正在 append 的审查会静默吞掉新行，
+    而 `seq` 按行数推，吞一行就撞号）、临时名固定（并发删除互相覆盖）、
+    Windows 上 `os.replace` 还可能 PermissionError。现在改为追加独立墓碑行，
+    锁与 `review.py` 共用同一把（`review_agent.infrastructure.ledger`）。
+
+    两种形态都能被 `verify` 读：历史那批原位墓碑继续有效（`legacy_tombstone`）。
+    """
+    chain = LEDGER / "chain.log"
+    if not chain.exists():
+        return False
+    try:
+        records = ledger_store.read_records(chain)
+    except ledger_store.LedgerError as exc:
+        print(f"[ledger] 删除墓碑跳过：{exc}", flush=True)
+        return False
+    target = next((r.get("seq") for r in ledger_store.report_records(records)
+                   if r.get("review_id") == rid and r.get("op") != "delete"), None)
+    if target is None:
+        return False
+    try:
+        ledger_store.tombstone(chain, int(target), actor="web",
+                               reason=f"删除报告 {rid}")
+    except ledger_store.LedgerError as exc:
+        # 重复删除、链异常都不该把 DELETE 变成 500：文件已经移进回收站了，
+        # 这里如实记一行日志并向调用方返回 False（前端会显示"墓碑未写入"）。
+        print(f"[ledger] 删除墓碑失败：{exc}", flush=True)
+        return False
+    return True
+
+
+RESULT_MARKER = "REVIEW_RESULT "
+
+
+def _parse_review_result(text):
+    """从子进程 stdout 里取「这次跑出来的报告是哪一份」。
+
+    与 `_parse_review_error` 对称：父进程不再用「`outputs/` 跑前跑后的差集」认领报告——
+    那个做法在两个任务并发时会认领到**对方的**报告，而且不会报错，只会让用户
+    下载到别人的结论。子进程自己说出 review_id 与路径，归属就没有猜测空间。
+    """
+    for raw in reversed((text or "").splitlines()):
+        line = raw.strip()
+        if not line.startswith(RESULT_MARKER):
+            continue
+        try:
+            payload = json.loads(line[len(RESULT_MARKER):])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("review_id"):
+            return payload
+    return None
+
+
+def _allocate_review_id():
+    """向 `review.py` 要一个号（它内部用 O_EXCL 锁 + 扫 outputs/ledger/state/tasks 发号）。
+
+    为什么不在这里自己算：号必须与报告里那个一致，而发号规则会随产物布局变化
+    （`state/tasks` 就是后来才加进去的）。复制一份到服务端，等于埋一个
+    「某天两边的号开始撞」的定时炸弹。
+    """
+    cmd = [str(PY), str(ROOT / "review.py"), "--print-review-id"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT),
+                              timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"无法分配审查号：{exc}") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(f"无法分配审查号（退出码 {proc.returncode}）："
+                           f"{(proc.stderr or '').strip()[:200]}")
+    for raw in reversed((proc.stdout or "").splitlines()):
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("review_id"):
+            return str(payload["review_id"])
+    raise RuntimeError(f"无法解析审查号：{(proc.stdout or '')[:200]}")
+
+
+def _idempotency_key(*, file, llm, research, type_, agent, scenario, spec,
+                     purpose_text) -> str:
+    """「同一份材料 + 同一套参数」的指纹，用来防止重复提交产生第二个任务。
+
+    刻意包含 purpose：同一份合同、换个审查目的，是**另一个**任务。
+    刻意用哈希而不是原串：它会落进 `state/tasks/`，不该把用户填的目的写成明文键。
+    """
+    payload = json.dumps({
+        "file": str(file), "llm": llm, "research": research, "type": type_,
+        "agent": agent, "scenario": scenario, "spec": spec,
+        "purpose": (purpose_text or ""),
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _job_view(record: TaskRecord, job: dict | None = None) -> dict:
+    """把任务记录折成前端认识的 job 形状（`running/done/error` 三态之外加 `cancelled`）。
+
+    前端只读 `status` 的三态；这里多做一步映射而不是改前端：`queued` 视为 running，
+    `cancelled/aborted` 视为 error 但带 `cancelled=True`——老前端不会因此白屏。
+    """
+    status = RunStatus(record.status)
+    if status in (RunStatus.COMPLETED,):
+        shown = "done"
+    elif status in (RunStatus.CANCELLED, RunStatus.ABORTED):
+        shown = "cancelled"
+    elif status in (RunStatus.FAILED,):
+        shown = "error"
+    else:
+        shown = "running"
+    view = dict(job or {})
+    view.update({
+        "id": view.get("id"),
+        "review_id": record.review_id,
+        "status": shown,
+        "task_status": status.value,
+        "error": record.error,
+        "report_id": record.report_path and Path(record.report_path).stem
+                     or view.get("report_id"),
+        "finished": view.get("finished") or (
+            time.time() if status.is_terminal else None),
+    })
+    return view
 
 
 def _resolve_agent(raw):
@@ -2227,21 +2699,42 @@ def _recover_jobs(now=None):
     if recovered or pruned:
         print(f"[recover] 恢复 {recovered} 个任务状态，"
               f"清理 {pruned} 个超过 7 天的进度文件", flush=True)
+    # 任务记录也要体检：`.jobs/*.jsonl` 只覆盖「有进度文件的那次」，
+    # 而并发闸门与「跑完没有」现在都看 `state/tasks/`。没有这一步，
+    # 一次崩溃留下的 running 记录会永远挡住后续所有审查。
+    try:
+        report = recover_tasks(
+            TASKS, has_checkpoint=lambda run_id: (STATE_DIR / "runs" / f"{run_id}.state.json").exists(),
+            stale_after=TASK_STALE_AFTER)
+    except OSError as exc:
+        print(f"[recover] 任务记录体检失败：{exc}", flush=True)
+        return recovered
+    if report.total:
+        print(f"[recover] 任务记录：可续 {len(report.resumable)} 个，"
+              f"判废 {len(report.orphaned)} 个", flush=True)
     return recovered
 
 
-def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
+def _run_review_job(job_id, review_id, file, llm_opt, progress_path, type_opt=None,
                     agent_opt=None, purpose=None, purpose_max=None,
                     purpose_quality=None, scenario_opt=None, format_spec_opt=None,
                     research_opt=None):
-    """后台线程：跑 review.py，进度事件写入 progress_path。"""
-    before = {p.stem for p in OUTPUTS.glob("R-*.json")}
+    """后台线程：跑 review.py，进度事件写入 progress_path。
+
+    与改造前的三处差别（都是为了「报告归谁」这件事不再靠猜）：
+      1. 号由服务端预先发给子进程（`--review-id`），报告路径因此是确定的；
+      2. 子进程结束时用 `REVIEW_RESULT` 行自报 review_id / 路径，不再做
+         `outputs/` 前后差集（并发时会认领到别人的报告）；
+      3. 状态写进 `state/tasks/<review_id>.json`，`JOBS` 只是它的视图——
+         进程重启后「跑完没有」仍然有答案。
+    """
     cmd = [str(PY), str(ROOT / "review.py"), file,
-           "--progress", str(progress_path)]
+           "--progress", str(progress_path), "--review-id", str(review_id)]
+    # 显式开关：不传就等于"按配置文件决定"，而配置里 enabled 通常是 true
+    cmd.append(_llm_flag(llm_opt))
     if llm_opt is True:
-        cmd.append("--llm")
-    elif llm_opt is False:
-        cmd.append("--no-llm")
+        _record_egress("llm", target=file, job_id=job_id,
+                       detail="review.py --llm（全文分块送审）")
     if research_opt is True:
         cmd.append("--research")
     else:
@@ -2271,35 +2764,85 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
     error = None
     error_kind = None
     report_id = None
-    print(f"[review] 任务 {job_id} 开始：{file}（超时 {timeout}s）", flush=True)
+    result = None
+    interrupted = False
+    mark_task(TASKS, review_id, RunStatus.RUNNING)
+    print(f"[review] 任务 {job_id}（{review_id}）开始：{file}"
+          f"（超时 {timeout}s）", flush=True)
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=timeout,
-        )
-        if proc.returncode != 0:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, cwd=str(ROOT))
+        with PROCS_LOCK:
+            PROCS[review_id] = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 超时：真的停掉它。只改状态不改进程，会留下一个还在写报告的幽灵。
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            interrupted = True
             status = "error"
-            raw = (proc.stderr or proc.stdout or f"退出码 {proc.returncode}")[-2000:]
-            info = _parse_review_error(raw) or {}
-            error_kind = info.get("kind")
-            error = _strip_error_marker(raw) or raw
-        else:
-            after = {p.stem for p in OUTPUTS.glob("R-*.json")}
-            new = sorted(after - before)
-            if not new:
-                status = "error"
-                error = "审查完成但未生成报告"
+            error = f"审查超时（{timeout}s）"
+            error_kind = "system"
+        finally:
+            with PROCS_LOCK:
+                PROCS.pop(review_id, None)
+        if not interrupted:
+            if proc.returncode != 0:
+                # 用户取消时 terminate 的结果也是非零：状态以任务记录为准，别覆盖成 error
+                current = TASKS.get(review_id)
+                if current is not None and RunStatus(current.status) is RunStatus.CANCELLED:
+                    status = "cancelled"
+                    error = current.error
+                else:
+                    status = "error"
+                    raw = (stderr or stdout or f"退出码 {proc.returncode}")[-2000:]
+                    info = _parse_review_error(raw) or {}
+                    error_kind = info.get("kind")
+                    error = _strip_error_marker(raw) or raw
             else:
-                report_id = max(
-                    new, key=lambda rid: (OUTPUTS / f"{rid}.json").stat().st_mtime)
-    except subprocess.TimeoutExpired:
-        status = "error"
-        error = f"审查超时（{timeout}s）"
-    except Exception as e:
+                result = _parse_review_result(stdout)
+                report_path = (result or {}).get("report_path")
+                if not report_path or not Path(str(report_path)).exists():
+                    status = "error"
+                    error = "审查完成但未生成报告（子进程未报告结果路径）"
+                    error_kind = "system"
+                else:
+                    report_id = (result or {}).get("report_id") or review_id
+    except Exception as e:                              # noqa: BLE001 - 后台线程边界
         status = "error"
         error = str(e)[:2000]
+        error_kind = "system"
+
+    # 落任务记录：这是"跑完没有"的唯一真相
+    try:
+        if status == "done":
+            finish_task(TASKS, review_id, TaskOutcome(
+                status=RunStatus.COMPLETED, stage=Stage.FINALIZE,
+                verdict=(result or {}).get("verdict"),
+                report_path=(result or {}).get("report_path")))
+        elif status == "cancelled":
+            pass                       # cancel() 已经写过 CANCELLED，别重复写
+        else:
+            current = TASKS.get(review_id)
+            if current is None or RunStatus(current.status) is not RunStatus.CANCELLED:
+                finish_task(TASKS, review_id, TaskOutcome(
+                    status=RunStatus.FAILED, stage=Stage(current.stage if current
+                                                         else Stage.INTAKE),
+                    error=error))
+    except Exception as exc:                            # noqa: BLE001
+        print(f"[review] 任务记录落盘失败：{exc}", flush=True)
+
+    record = TASKS.get(review_id)
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job:
+            updated = _job_view(record, job) if record is not None else {}
+            job.update(updated or {})
             job.update({
                 "status": status,
                 "error": error,
@@ -2312,7 +2855,7 @@ def _run_review_job(job_id, file, llm_opt, progress_path, type_opt=None,
                 # 子进程超时可能被调整过；把本任务真实用到的值留在状态里。
                 "timeout": timeout,
             })
-    print(f"[review] 任务 {job_id} {status}："
+    print(f"[review] 任务 {job_id}（{review_id}）{status}："
           f"{report_id or error or ''}（{round(time.time() - started, 1)}s，"
           f"超时上限 {timeout}s）", flush=True)
 

@@ -23,6 +23,9 @@ model: "deepseek-chat"
 # 不建议在文件里写明文密钥；留空则只读环境变量
 api_key: ""
 
+# 远程端点必须使用 https://；只有本机/局域网端点（如 Ollama）允许 http://。
+# 这样 API Key 不会以明文经过网络。
+
 timeout: 40              # 单次请求超时（秒）
 max_retries: 2           # 失败重试次数（429/5xx/网络错误）
 temperature: 0           # 审查要稳定，建议 0

@@ -17,6 +17,7 @@ review.py —— 审查 Agent 主流程 S1~S6 (Demo v0.9.0)
 import importlib.util
 import asyncio
 import atexit
+import hashlib
 import os
 import sys
 import re
@@ -89,6 +90,7 @@ from review_agent.capabilities import (
     ToolResult,
     batch1_tools,
     ingest_candidates,
+    research_tools,
 )
 from review_agent.text import sentence_no as text_sentence_no
 from review_agent.application import (
@@ -114,12 +116,19 @@ from review_agent.runtime import (
     state_to_dict,
     surviving_findings,
 )
+# 台账只有一套实现（`infrastructure/ledger.py`）：锁、seq 推导、墓碑格式都在那里。
+# 旧实现把「读末行 → 算 hash → 追加」散在 review.py 与 server.py 各写一遍，
+# 结果两边的 seq 口径不同（一个按行数、一个按记录数），删过报告之后必然对不上。
+from review_agent.infrastructure import ledger as ledger_store
 from review_agent.runtime.nodes import (
+    ClaimVerdict,
     CrossReviewerNode,
     DecisionEngineNode,
     DocumentAnalyzerNode,
     EvidenceAnalyzerNode,
     PlannerNode,
+    ResearchClaim,
+    ResearchOutcome,
     RuleAnalyzerNode,
     SemanticStepOutcome,
     anchor_findings,
@@ -204,6 +213,32 @@ def _emit_domain_error(exc: DomainError):
     """按领域错误自带的分类上报（kind / http_status / retryable）。"""
     _emit_error(str(exc), kind=exc.kind, http_status=exc.http_status,
                 retryable=exc.retryable)
+
+
+# 成功收尾的机器可读行（与 `REVIEW_ERROR` 对称）：服务端靠它把「报告归谁」定死。
+RESULT_MARKER = "REVIEW_RESULT "
+
+
+def _emit_result(review_id, report_path, *, verdict=None, report_id=None):
+    """告诉调用方「这次跑出来的报告到底是哪一份」。
+
+    为什么需要它：`server.py` 以前用「`outputs/` 在跑前跑后的差集」认领报告——
+    两个任务并发时会认领到**对方的**报告，而这种错误不会报错，只会让用户
+    下载到别人的结论。把 review_id / 路径由子进程自己说出来，归属就没有猜测空间。
+
+    输出到 stdout：stderr 已经被错误分类行占用，混在一起会让解析器更容易误判。
+    """
+    try:
+        payload = {
+            "review_id": str(review_id),
+            "report_id": str(report_id or review_id),
+            "report_path": str(report_path).replace("\\", "/"),
+            "verdict": verdict,
+        }
+        print(RESULT_MARKER + json.dumps(payload, ensure_ascii=False), flush=True)
+    except (OSError, TypeError, ValueError):
+        # 上报失败不该让一份已经写好的报告变成功败
+        pass
 
 # 事实审的确定性启发式（FACT-002/003/004）
 SOURCE_CLAIM_RE = re.compile(
@@ -484,6 +519,11 @@ class Session:
         self.disputes = []
         self.decisions = []
         self.tool_logs = []
+        # 管线级工具调用记录（ToolInvocation）：与 `tool_logs` 分工不同——
+        # `tool_logs` 是处理器自己写的"这一步做了什么"（进 tools.jsonl 给用户看），
+        # 这里是注册表自动记的"谁授权、耗时多少、有没有被预算/超时/权限拦下"。
+        # 只放内存：写新文件会改变 `logs_hash`，而历史报告的哈希是审计凭据。
+        self.tool_invocations = []
         self.steps = []
         self.verified_facts = []
         # 同一片段被「线索级」规则和「结论级」规则同时命中时，折叠掉较弱的那条
@@ -624,6 +664,30 @@ class Session:
             self.tool_ok += 1
         elif status == "skipped":
             self.tool_skipped += 1
+
+    def record_invocation(self, invocation):
+        """工具注册表的审计回调（`ToolInvocation`）——由注册表自动调用。
+
+        为什么要有它：`tool()` 是**处理器自己写**的日志，处理器不写就没有记录
+        （旧的 `tools.jsonl` 因此长期只能反映"愿意写日志的那些处理器"）。
+        这里由管线统一记，覆盖每一次经过注册表的调用，包括被超时/输出过大
+        折成失败的调用——那类失败最容易在报告里消失。
+
+        不写文件：`logs/` 的目录哈希（`logs_hash`）进了报告完整性链，
+        增删文件会让**历史报告**的哈希对不上。要落盘时应作为新的审计出口
+        显式加进链里，而不是顺手多写一个文件。
+        """
+        self.tool_invocations.append({
+            "ts": now_iso(),
+            "tool": invocation.tool,
+            "permission": getattr(invocation.permission, "value", invocation.permission),
+            "actor": invocation.actor,
+            "ok": bool(invocation.ok),
+            "latency_ms": int(invocation.latency_ms),
+            "argument_keys": list(invocation.argument_keys),
+            "invocation_id": invocation.invocation_id,
+            "dry_run": bool(invocation.dry_run),
+        })
 
 
 # ----------------------------------------------------------------------------
@@ -1888,7 +1952,9 @@ def build_rule_registry(session, text, active, legacy_ctx, run_id, agent):
 
     注册表按 run 建：处理器绑定了 Session（迁移期必然如此），跨 run 复用会串数据。
     """
-    registry = ToolRegistry()
+    # on_invoke：让每一次经注册表的调用都留一条管线级记录（含被超时/超权限拦下的）。
+    # 这是「审计里能不能回答『这次运行调了多少工具』」的唯一实现点。
+    registry = ToolRegistry(on_invoke=getattr(session, "record_invocation", None))
 
     def _add(key, handler):
         registry.register(_HandlerTool(
@@ -2075,6 +2141,8 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
             reason = "已通过 --no-llm 关闭"
         elif not cfg.enabled:
             reason = "config 中 enabled=false"
+        elif getattr(cfg, "endpoint_error", None):
+            reason = cfg.endpoint_error
         else:
             reason = "未配置 API Key 且非本地端点"
         s.tool("llm_api", f"model={cfg.model}", f"跳过语义审：{reason}", 0, status="skipped")
@@ -2162,9 +2230,13 @@ def semantic_review(s: Session, text, active, target_type, use_llm=None, dims=No
             chunks_attempted += 1
             started = time.perf_counter()
             try:
-                res = llm_review.review_dimension(
-                    client, dim, dim_rules, chunk, cfg, charter=charter,
-                    full_text=text if chunked else None, facts=llm_facts)
+                owner_token = llm_review.set_cache_owner(s.review_id)
+                try:
+                    res = llm_review.review_dimension(
+                        client, dim, dim_rules, chunk, cfg, charter=charter,
+                        full_text=text if chunked else None, facts=llm_facts)
+                finally:
+                    llm_review.reset_cache_owner(owner_token)
             except llm_client.LLMError as e:
                 elapsed = (time.perf_counter() - started) * 1000
                 s.llm_usage["failures"] += 1
@@ -2320,56 +2392,21 @@ def coverage_from_llm_meta(llm_meta, chars_total):
 # ----------------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------------
-LEDGER_LOCK_NAME = ".chain.lock"
+LEDGER_LOCK_NAME = ledger_store.LOCK_NAME
 
 
 def _acquire_ledger_lock(timeout=30.0):
-    """拿台账写锁（O_EXCL 锁文件，进程内线程与多进程共用一套）。
+    """拿台账写锁——实现已收进 `review_agent.infrastructure.ledger`。
 
-    为什么必须锁：追加一条台账 = 「读最后一行取 prev_hash → 算 report_hash → 追加」。
-    这三步不是原子的，两个审查同时收尾会读到同一个 prev，写出两条 seq 相同的记录，
-    链条当场断裂（实测 6 路并发 → `序号不连续 @line2`），而且**报告本身看起来都正常**，
-    只有事后 verify 才发现。这类"生产时无感、审计时才炸"的损坏必须从源头堵。
+    保留这两个薄包装是为了不打断既有调用点与测试（`test_idempotency` /
+    队列/CLI 都按「拿锁 → 算 hash → 追加 → 放锁」写）。真正的锁语义、
+    超时、陈旧锁清理只有一份实现，server 侧删除墓碑用的是同一把。
     """
-    LEDGER.mkdir(parents=True, exist_ok=True)
-    lock = LEDGER / LEDGER_LOCK_NAME
-    deadline = time.time() + timeout
-    while True:
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            return lock
-        except PermissionError:
-            # Windows 上「锁文件已存在且被别的进程打开」时，O_EXCL 抛的可能是
-            # PermissionError 而不是 FileExistsError（实测 6 路并发必现）。
-            # 这里不能先判断「锁文件还在不在」：持有者可能在两次系统调用之间就删了锁，
-            # 检查会误判成「目录不可写」而直接抛错。统一按争用处理，靠超时兜底。
-            _wait_for_ledger_lock(lock, deadline, timeout)
-        except FileExistsError:
-            # 进程被强杀会留下锁文件：超龄（60s）视为陈旧，直接清掉，不能永久堵死
-            _wait_for_ledger_lock(lock, deadline, timeout)
-
-
-def _wait_for_ledger_lock(lock, deadline, timeout):
-    """锁被别人持有：清超龄锁、等一小会、超时给出可操作报错。"""
-    try:
-        if time.time() - lock.stat().st_mtime > 60:
-            lock.unlink()
-            return
-    except OSError:
-        pass
-    if time.time() > deadline:
-        raise TimeoutError(
-            f"等待台账写锁超时（{timeout:.0f}s）：{lock}；"
-            "如确认没有审查在跑，可手工删除该锁文件")
-    time.sleep(0.01)
+    return ledger_store.acquire_lock(LEDGER, timeout=timeout)
 
 
 def _release_ledger_lock(lock):
-    try:
-        lock.unlink()
-    except OSError:
-        pass
+    ledger_store.release_lock(lock)
 
 
 def allocate_review_id(date):
@@ -2469,7 +2506,7 @@ def read_target_text(path: Path):
 def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             type_override=None, agent_id=None, purpose=None, purpose_max=None,
             purpose_notes=None, scenario=None, format_spec=None,
-            research_enabled=False):
+            research_enabled=False, review_id=None):
     t0 = time.perf_counter()
     # 非 UTF-8（GBK/UTF-16）不能让整个进程崩掉：按候选编码依次尝试。
     try:
@@ -2521,8 +2558,18 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     set_rule_index(rules)
 
     # 生成 review_id（ledger 已用 ID + O_EXCL 锁，避免并发/清理后覆盖）
-    date = datetime.date.today().strftime("%Y%m%d")
-    review_id, id_lock = allocate_review_id(date)
+    #
+    # 调用方可以**预先指定**（`--review-id`）：服务端要先建任务记录才能落盘状态，
+    # 而任务记录里的 review_id 必须和报告里的那个一致，否则「按任务找报告」永远找不着。
+    # 号仍然由本模块的 `allocate_review_id` 统一发（服务端通过 `--print-review-id` 取），
+    # 不在服务端复制一份发号逻辑——两份发号逻辑迟早会发出同一个号。
+    if review_id is None:
+        date = datetime.date.today().strftime("%Y%m%d")
+        review_id, id_lock = allocate_review_id(date)
+    else:
+        review_id = str(review_id).strip()
+        domain_ids.parse_review_id(review_id)      # 格式不对立刻报错，不写半份报告
+        id_lock = None
     log_dir = LOGS / review_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2837,7 +2884,7 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         try:
             research_block = research.review_claims(
                 s, text, list(iter_sentences(text)), fact_assertions,
-                enabled=True, web=True)
+                enabled=True, web=True, owner=s.review_id)
             # 检索新增的 FACT-001 可能和已有的 FACT-002/004 同句，再归口一次
             collapse_rule_overlap(s)
             merge_law_into_fact(s)
@@ -3219,34 +3266,10 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
         limitations.append("合同审为关键词 + 否定语境预筛，不构成法律意见，需人工复核条款结构。")
     # 法条库的覆盖范围必须自报：读者要知道"这次引的依据是哪几部法、哪一版、
     # 有没有限缩"。不写清楚，一条「依据：第十九条」会被当成"全部法律都查过了"。
-    law_lib_block = None
-    try:
-        _laws, _arts = law_index.load_all()
-        _desc = "、".join(
-            f"《{l['name']}》{l['status']}·{l['effective_date']}施行·{l['_loaded']} 条"
-            for l in _laws)
-        limitations.append(
-            f"法律依据仅限已收录的法条库：{_desc}，共 {len(_arts)} 条。"
-            "库外法律/条款不作引用，也不以模型记忆代替条文；"
-            "命中条文 ≠ 条文适用（例外情形仍需人工判断）。")
-        law_lib_block = {
-            "available": True,
-            "articles_total": len(_arts),
-            "laws": [{"id": l["id"], "name": l["name"], "status": l["status"],
-                      "effective_date": l["effective_date"],
-                      "articles": l["_loaded"], "source_url": l["source_url"],
-                      "retrieved_at": l["retrieved_at"]} for l in _laws],
-            # 本次真正被引用到的条文（去重，按法名+条号）
-            "cited": _dedupe_cites(s.law_cites),
-            "skipped": list(s.law_skipped),
-        }
-    except Exception as e:                                   # noqa: BLE001
-        limitations.append(f"法条库不可用（{e}）：本次未做法条级依据比对，"
-                           "涉及法律条款的结论仅为线索。")
-        law_lib_block = {"available": False, "error": str(e)[:200]}
-    for note in s.law_skipped:
-        if note not in limitations:
-            limitations.append(note)
+    # 这段与 v1 影子报告共用 `law_library_block()`：两条链路调同一段代码，
+    # 「搬过去了」由代码保证，而不是靠两份相似的实现"看着像"。
+    law_lib_block, law_limitations = law_library_block(s)
+    limitations.extend(law_limitations)
     if len(active) < coverage["declared_rules"]:
         limitations.append(
             f"本次仅启用 {len(active)}/{coverage['declared_rules']} 条规则，结论范围相应收窄。")
@@ -3496,29 +3519,25 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # 「读 prev → 算 report_hash → 追加」必须在同一把锁内完成：report_hash 里含
     # prev_report_hash，读和写之间只要插进另一个审查，两条记录就会指向同一个 prev，
     # 链条断裂。锁的粒度只覆盖这三步，不包住文件写盘（那部分按 review_id 互不相干）。
+    #
+    # prev / seq 由 `ledger_store.chain_state` 推：它只数**报告记录**，
+    # 不数墓碑行。删过报告之后若仍按行数推号，新记录的 seq 会与历史记录撞号。
     ledger_path = LEDGER / "chain.log"
     lock = _acquire_ledger_lock()
     try:
-        prev = "0" * 64
-        seq_no = 1
-        if ledger_path.exists():
-            lines = [l for l in ledger_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-            if lines:
-                prev = json.loads(lines[-1]).get("report_hash", "0" * 64)
-                seq_no = len(lines) + 1
+        prev, seq_no = ledger_store.chain_state(ledger_path)
         report["integrity"]["prev_report_hash"] = prev
 
         # report_hash（自指处理：必须在 prev_report_hash 写入之后再算，否则校验对不上）
         report["integrity"]["report_hash"] = integrity.compute_report_hash(report)
 
-        with open(ledger_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "seq": seq_no, "review_id": review_id, "target_hash": target_hash,
-                "report_hash": report["integrity"]["report_hash"], "prev_hash": prev,
-                "rules_dir_hash": rules_dir_hash,
-                "rules_version": integrity.rules_version(),
-                "ts": now_iso(),
-            }, ensure_ascii=False) + "\n")
+        ledger_store.append(ledger_path, {
+            "seq": seq_no, "review_id": review_id, "target_hash": target_hash,
+            "report_hash": report["integrity"]["report_hash"], "prev_hash": prev,
+            "rules_dir_hash": rules_dir_hash,
+            "rules_version": integrity.rules_version(),
+            "ts": now_iso(),
+        }, locked=True, expect_prev=prev)
     finally:
         _release_ledger_lock(lock)
 
@@ -3527,11 +3546,13 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     (OUTPUTS / f"{review_id}.md").write_text(render_md(report), encoding="utf-8")
 
-    try:
-        id_lock.unlink()
-    except OSError:
-        pass
-    _ID_LOCKS.discard(id_lock)
+    if id_lock is not None:
+        # 号是本次自己发的才需要放锁；外部指定 review_id 时没有锁可放
+        try:
+            id_lock.unlink()
+        except OSError:
+            pass
+        _ID_LOCKS.discard(id_lock)
     return report
 
 
@@ -3575,7 +3596,8 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
                        agent_id=None, type_override=None, store=None,
                        semantic_review_fn=None, use_llm=False,
                        llm_meta_out=None, purpose_info=None,
-                       integrity_out=None):
+                       integrity_out=None, token=None, research_enabled=False,
+                       research_cfg=None, research_web=True):
     """用新的六节点流水线跑一次审查，返回 (RunState, RunOutcome, Session)。
 
     失败时抛 UnreadableTargetError（与 run_one 同语义），调用方不必区分两套异常。
@@ -3587,6 +3609,9 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
     `llm_meta_out`：传入 dict 时回填模型可用性与来源（CLI 摘要要用）。
 
     `use_llm=True` 但模型不可用时抛 `ConfigError`——**显式要求过模型就不许静默降级**。
+
+    `research_enabled=True` 时装配 `FactCheckNode` + `research.web` 工具（联网）。
+    默认 False：出网等于把材料里的实体/指标送给第三方，必须显式开启。
     """
     if review_id is None:
         date = datetime.date.today().strftime("%Y%m%d")
@@ -3634,6 +3659,7 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
     app = ReviewApplication(
         store=FileRunStore(store) if store else None,
         checkpoints=MemoryCheckpointStore(),
+        token=token,
     )
     state = app.initial_state(
         review_id=review_id, run_id=run_id, profile=profile,
@@ -3642,7 +3668,7 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
     if semantic_review_fn is None and use_llm is not False:
         semantic_review_fn, llm_meta = make_llm_review_fn(
             active, text, chosen_type, use_llm=use_llm, agent=agent,
-            purpose_info=purpose_info)
+            purpose_info=purpose_info, review_id=review_id)
         if llm_meta_out is not None:
             llm_meta_out.update(llm_meta)
         if semantic_review_fn is None and use_llm is True:
@@ -3654,10 +3680,18 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
         semantic_executor = make_semantic_executor(
             session=session, text=text, run_id=run_id,
             review_fn=semantic_review_fn)
+    # 库外核验：显式开启才装配（默认关闭，与 `--no-research` 等价）。
+    # 它要联网，属于「把材料里的实体/指标送到第三方」——不能默认开。
+    research_executor = None
+    if research_enabled:
+        research_executor = make_research_executor(
+            review_id=review_id, run_id=run_id, cfg=research_cfg, web=research_web)
+        research_executor.bind_session(session)
     ports = PipelinePorts(
         reader=read_target_text, rule_executor=_rule_executor,
         finalize_node=_FinalizeNode(review_id),
         semantic_executor=semantic_executor,
+        research_executor=research_executor,
     )
     config = {
         "target_path": str(target_path),
@@ -4159,11 +4193,14 @@ def _take_engine(args):
 
 
 def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None,
-                purpose=None, purpose_max=None):
+                purpose=None, purpose_max=None, research_enabled=False):
     """双跑：旧报告已生成，再跑一遍六节点流水线并比对。
 
     差异写进 `state/double_run/<review_id>.json`，控制台打印一句话结论。
     这是切流前的刹车：只有连续零未解释差异，才允许把默认链路换成 v1。
+
+    `research_enabled` 必须与旧链路一致：两条链路一次联网、一次不联网，
+    比对出来的差异全是「一边多出 FACT-001」，那就不叫双跑，叫自欺。
     """
     purpose_info = (purpose_mod.parse(str(purpose), max_chars=purpose_max)
                     if purpose and str(purpose).strip() else None)
@@ -4172,7 +4209,7 @@ def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None
         target_path, rules, review_id=report["review_id"],
         agent_id=agent_id, type_override=type_override,
         store=STATE / "runs", integrity_out=integrity_inputs,
-        purpose_info=purpose_info)
+        purpose_info=purpose_info, research_enabled=research_enabled)
     diff = compare_with_report(report, state)
     payload = {
         "review_id": report["review_id"],
@@ -4201,7 +4238,7 @@ def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None
 
 
 def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
-                       purpose_info=None, model_client=None):
+                       purpose_info=None, model_client=None, review_id=None):
     """构造「一次模型调用」的函数，返回 (review_fn | None, meta)。
 
     None 表示模型不可用（未配置 / 被关闭）；**调用方决定降级还是报错**——
@@ -4225,9 +4262,14 @@ def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
         except Exception as e:                          # noqa: BLE001 - 配置加载失败
             return None, {"available": False, "reason": f"配置加载失败：{e}"}
         if not cfg.available:
-            reason = ("已通过 --no-llm 关闭" if use_llm is False
-                      else "config 中 enabled=false" if not cfg.enabled
-                      else "未配置 API Key 且非本地端点")
+            if use_llm is False:
+                reason = "已通过 --no-llm 关闭"
+            elif not cfg.enabled:
+                reason = "config 中 enabled=false"
+            elif getattr(cfg, "endpoint_error", None):
+                reason = cfg.endpoint_error
+            else:
+                reason = "未配置 API Key 且非本地端点"
             return None, {"available": False, "reason": reason, "model": cfg.model}
         # 真实供应商也走同一个端口：否则「端口」只是摆设，换供应商时才发现
         # 审查侧其实还在依赖 LLMClient 的具体返回类型。
@@ -4245,15 +4287,175 @@ def make_llm_review_fn(active, text, target_type, *, use_llm=None, agent=None,
     facts = retrieve.load_facts()
 
     def review_fn(step):
-        return llm_review.review_dimension(
-            client, step.dimension, by_dim.get(step.dimension, []),
-            step.text, cfg, charter=charter, full_text=text, facts=facts)
+        owner_token = llm_review.set_cache_owner(review_id)
+        try:
+            return llm_review.review_dimension(
+                client, step.dimension, by_dim.get(step.dimension, []),
+                step.text, cfg, charter=charter, full_text=text, facts=facts)
+        finally:
+            llm_review.reset_cache_owner(owner_token)
 
     return review_fn, meta
 
 
+def make_research_executor(*, review_id, run_id, cfg=None, web=True, provider=None,
+                           use_tool=True, record_egress=True):
+    """把 `tools/research.py` 的判定链包成 `ResearchExecutor`（FactCheckNode 用）。
+
+    三件事在这里而不是在节点里：
+        1. **抽主张**：`extract_claims()` 要吃「句子 + 起始位置」与事实库断言，
+           这是 `tools/` 的口径；
+        2. **联网**：走 `research.web` 工具（`Permission.RESEARCH` + 审计 +
+           `untrusted=True`）而不是直接调 `verify()`——直接调等于把「谁能出网」
+           这件事交回给任意调用方；
+        3. **缓存/已学/本地来源**：`lookup_verdict()` / `remember_verdict()`
+           与旧链路是同一对函数，TTL 与「已学断言」口径不会漂移。
+
+    `use_tool=False` 只给测试用（不想起注册表时直接调 verify）。
+    `record_egress`：把「这次把哪些实体/指标发给了第三方」写进 `state/egress.log`
+    （只记元信息，不记原文）。
+    """
+    cfg = dict(cfg or research.load_config())
+    limit = int(cfg.get("max_claims_per_doc") or 3)
+    max_seconds = float(cfg.get("max_seconds") or 60)
+    try:
+        assertions = retrieve.load_facts().get("assertions", []) or []
+    except Exception:                                   # noqa: BLE001 - 事实库坏了不该拖垮核验
+        assertions = []
+
+    # 工具审计钩子：`ToolInvocation` 由注册表产出，写进旧日志的 Session 由入口装配后绑定
+    # （用 dict 而不是闭包属性：`use_tool=False` 时同一个 `bind_session` 也要能安全调用）。
+    hook = {"session": None}
+
+    def _on_invoke(invocation):
+        session = hook["session"]
+        if session is not None:
+            session.record_invocation(invocation)
+
+    registry = None
+    context = None
+    if use_tool:
+        registry = ToolRegistry(on_invoke=_on_invoke)
+        for tool in research_tools(
+                verify=lambda claim: research.verify(claim, cfg, web=web,
+                                                     provider=provider),
+                official_domains=cfg.get("official_domains") or ()):
+            registry.register(tool)
+        context = ToolContext(
+            review_id=review_id, run_id=run_id,
+            # 出网必须显式授予：`Permission.RESEARCH` 缺省不授予任何主体
+            permissions=frozenset({Permission.READ, Permission.ANALYZE,
+                                   Permission.RESEARCH}),
+            actor="pipeline",
+        )
+
+    def bind_session(session):
+        """把 Session 交给工具审计钩子（`run_typed_pipeline` 里装配完成后调用）。"""
+        hook["session"] = session
+        return executor
+
+    async def executor(text):
+        started = time.perf_counter()
+        sentences = list(iter_sentences(text or ""))
+        claims = research.extract_claims(sentences, assertions, max_claims=limit)
+        verdicts = []
+        items = []
+        cache_hits = learned_hits = local_hits = 0
+        tool_errors = []
+        stopped_early = False
+        for claim in claims:
+            if time.perf_counter() - started > max_seconds:
+                stopped_early = True
+                break
+            verdict, method = research.lookup_verdict(
+                claim, cfg, owner=review_id)
+            if verdict is None:
+                method = "search"
+                if registry is None:
+                    verdict = research.verify(claim, cfg, web=web, provider=provider)
+                else:
+                    data = {k: claim.get(k) for k in
+                            ("quote", "entity", "metric", "kind", "value",
+                             "unit", "year", "sentence_index", "raw")}
+                    result, _invocation = await registry.execute(
+                        "research.web", data, context)
+                    if record_egress:
+                        _record_research_egress(review_id, claim)
+                    if not result.ok:
+                        # 检索失败不能变成「这条主张没问题」：记进 errors，
+                        # 该主张不进结论（与旧链路 verify() 抛错同口径）
+                        tool_errors.append("；".join(result.errors)[:200])
+                        continue
+                    verdict = dict(result.data)
+                if verdict is not None:
+                    research.remember_verdict(claim, verdict, owner=review_id)
+            if verdict is None:
+                continue
+            if method == "local":
+                local_hits += 1
+            elif method == "learned":
+                learned_hits += 1
+            elif method == "cache":
+                cache_hits += 1
+            item = research.item_from_verdict(claim, verdict, method)
+            items.append(item)
+            verdicts.append(ClaimVerdict(
+                claim=ResearchClaim(**{k: claim.get(k) for k in
+                                       ("quote", "entity", "metric", "kind", "value",
+                                        "unit", "year", "sentence_index", "raw")}),
+                status=str(verdict.get("status") or "unverified"),
+                confidence=float(verdict.get("confidence") or 0.0),
+                method=method,
+                value=verdict.get("value"),
+                display=str(verdict.get("display") or ""),
+                reason=str(verdict.get("reason") or ""),
+                query=str(verdict.get("query") or ""),
+                sources=tuple(item.get("sources") or ()),
+                item=item,
+            ))
+
+        errors = list(cfg.get("_errors") or []) + tool_errors
+        block = research.build_block(
+            items, claims_found=len(claims), cache_hits=cache_hits,
+            learned_hits=learned_hits, local_hits=local_hits,
+            providers=cfg.get("providers") or (), errors=errors,
+            stopped_early=stopped_early,
+            latency_ms=round((time.perf_counter() - started) * 1000))
+        return ResearchOutcome(block=block, verdicts=tuple(verdicts),
+                               errors=tuple(errors))
+
+    executor.bind_session = bind_session
+    return executor
+
+
+def _record_research_egress(review_id, claim):
+    """记一条「这条主张的实体/指标被发给了第三方检索」。
+
+    与 `server._record_egress` 同一条流（`state/egress.log`）、同样只记元信息。
+    检索查询里只有实体 + 指标 + 年份（`build_query` 刻意不含原文数值），
+    但「哪家企业、核哪个指标」本身也可能是敏感信息，所以必须留痕。
+    """
+    try:
+        path = STATE / "egress.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": now_iso(),
+            "kind": "research",
+            "target": review_id,
+            "job_id": None,
+            "detail": (f"外部检索：{claim.get('entity') or ''}"
+                       f"{claim.get('metric') or ''}"
+                       f"（{claim.get('year') or '无年份'}）"),
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:                              # pragma: no cover - 落盘失败不阻断
+        print(f"[egress] 外发记录写入失败：{exc}", flush=True)
+
+
 def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
-            use_llm=False, purpose=None, purpose_max=None):
+            use_llm=False, purpose=None, purpose_max=None, review_id=None,
+            research_enabled=False):
     """只跑六节点流水线（影子）：**不写正式报告**，只落状态并打印摘要。
 
     为什么不写报告：v1 还没有接报告写出（哈希链 / ledger / limitations）。
@@ -4266,9 +4468,11 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
     integrity_inputs: dict = {}
     try:
         state, outcome, session = run_typed_pipeline(
-            target_path, rules, agent_id=agent_id, type_override=type_override,
+            target_path, rules, review_id=review_id,
+            agent_id=agent_id, type_override=type_override,
             store=STATE / "runs", use_llm=use_llm, llm_meta_out=llm_meta,
-            purpose_info=purpose_info, integrity_out=integrity_inputs)
+            purpose_info=purpose_info, integrity_out=integrity_inputs,
+            research_enabled=research_enabled)
     except ConfigError as e:
         print(f"[v1] {e}")
         _emit_domain_error(e)
@@ -4286,6 +4490,14 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
     else:
         print(f"[v1] 语义审未启用：{llm_meta.get('reason') or '未配置'}"
               "（本次为纯规则审）")
+    research = state.artifacts.get("research") or {}
+    if research.get("enabled"):
+        print(f"[v1] 库外核验：检索 {research.get('checked', 0)} 条主张"
+              f"（支持 {len(research.get('supported') or [])} / "
+              f"反驳 {len(research.get('refuted') or [])} / "
+              f"未找到 {len(research.get('unverified') or [])}）")
+    elif research_enabled:
+        print("[v1] 库外核验：本次维度不含事实审，未执行")
     verdict = state.decision.verdict.value if state.decision else "-"
     report_path = _write_shadow_report(state, outcome,
                                        integrity_inputs=integrity_inputs,
@@ -4300,7 +4512,48 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
           f"发现 {len(state.findings)} 条 | 证据 {len(state.evidence)} 条 | "
           f"影子报告：{shown} | "
           f"状态：state/runs/{state.run_id}.state.json")
+    _emit_result(state.review_id, report_path, verdict=verdict,
+                 report_id=state.review_id)
     return state
+
+
+def law_library_block(session):
+    """报告顶层 `law_library` 段 + 它对应的 limitations 条目。
+
+    为什么抽成函数：这一段以前直接写在 `run_one` 里，v1 影子报告只能把它列进
+    `unsupported_blocks`（"新链路没算"）。抽出来之后两条链路调同一个函数，
+    「搬过去了」这件事就由**同一段代码**保证，而不是由两份相似的代码"看着像"。
+    返回 `(block, limitations)`；法条库不可用时 block 里 `available=False`。
+    """
+    limitations = []
+    try:
+        laws, articles = law_index.load_all()
+    except Exception as exc:                                 # noqa: BLE001
+        return ({"available": False, "error": str(exc)[:200]},
+                [f"法条库不可用（{exc}）：本次未做法条级依据比对，"
+                 "涉及法律条款的结论仅为线索。"])
+    desc = "、".join(
+        f"《{law['name']}》{law['status']}·{law['effective_date']}施行·"
+        f"{law['_loaded']} 条" for law in laws)
+    limitations.append(
+        f"法律依据仅限已收录的法条库：{desc}，共 {len(articles)} 条。"
+        "库外法律/条款不作引用，也不以模型记忆代替条文；"
+        "命中条文 ≠ 条文适用（例外情形仍需人工判断）。")
+    block = {
+        "available": True,
+        "articles_total": len(articles),
+        "laws": [{"id": law["id"], "name": law["name"], "status": law["status"],
+                  "effective_date": law["effective_date"],
+                  "articles": law["_loaded"], "source_url": law["source_url"],
+                  "retrieved_at": law["retrieved_at"]} for law in laws],
+        # 本次真正被引用到的条文（去重，按法名+条号）
+        "cited": _dedupe_cites(getattr(session, "law_cites", []) or []),
+        "skipped": list(getattr(session, "law_skipped", []) or []),
+    }
+    for note in block["skipped"]:
+        if note not in limitations:
+            limitations.append(note)
+    return block, limitations
 
 
 def _integrity_inputs(target_path, rules, active, agent):
@@ -4418,6 +4671,47 @@ def _report_already_written(json_path, run_id):
     return existing.get("run_id") == run_id
 
 
+def _write_target_snapshot(state):
+    """把被审原文按内容哈希存成快照：`state/text/<sha256>.txt`。
+
+    为什么报告里要指一个文件而不是只嵌原文：报告嵌的是**解码后的文本**，
+    读者能读到它，但没法证明「这段字就是当初那份文件里的」；快照文件名就是
+    文本的 sha256，改一个字文件名就对不上。
+
+    为什么按内容寻址（文件名 = 哈希）而不是按 review_id：
+        同一份材料常被审很多次（生产台账里单个目标最多审过 15 次），
+        按运行存会把同一段原文复制十几份。
+
+    幂等：文件已存在就不重写（内容相同，重写只会刷 mtime，
+    让 retention 的「目录年龄取内部最新文件」永远判它不过期）。
+
+    返回 `{"ref": 相对仓库根的路径, "hash": sha256}`；没有原文时返回 None。
+    """
+    text = state.artifacts.get("target_text")
+    if not isinstance(text, str) or not text:
+        return None
+    payload = text.encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    path = STATE / "text" / f"{digest}.txt"
+    try:
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # 先写唯一临时名再原子替换：并发两个进程写同一份快照时，
+            # 固定临时名会互相覆盖（批次 1 的 FileTaskStore 踩过同一个坑）。
+            tmp = path.with_name(f"{digest}.{os.getpid()}.tmp")
+            tmp.write_bytes(payload)
+            os.replace(tmp, path)
+    except OSError as exc:                              # pragma: no cover - 落盘失败不阻断
+        print(f"[v1] 原文快照写入失败：{exc}", flush=True)
+        return None
+    try:
+        ref = path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        # 测试把 STATE 重定向到临时目录：照实给绝对路径，不假装它在仓库里
+        ref = path.resolve().as_posix()
+    return {"ref": ref, "hash": digest}
+
+
 def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
                          purpose_info=None):
     """把影子报告写到 `outputs/v1/`，并给它补上可校验的完整性链。
@@ -4439,6 +4733,11 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
 
     logs_hash = (_write_v1_logs(session, outcome, state.review_id)
                  if session is not None else None)
+    # 法条库：与旧报告共用 `law_library_block()`，保证「同一个 session → 同一个块」。
+    # session 为 None（测试里直接造 state）时给 None，报告里照实自报"未接入"。
+    law_lib = law_library_block(session)[0] if session is not None else None
+    # 原文快照必须先写：报告里的 snapshot_ref 指向它，写不进去就照实给 None
+    snapshot = _write_target_snapshot(state)
     report = build_shadow_report(
         state,
         target_meta=state.artifacts.get("target_meta"),
@@ -4446,34 +4745,28 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
         checkpoints=outcome.checkpoints,
         integrity_inputs=integrity_inputs,
         logs_hash=logs_hash,
+        law_library=law_lib,
+        target_snapshot=snapshot,
     )
     _attach_purpose(report, purpose_info, state.artifacts.get("target_text"))
     _attach_action_plan(report)      # 必须早于 report_hash：哈希要覆盖整改建议
     ledger_path = LEDGER / "v1-chain.log"
     lock = _acquire_ledger_lock()
     try:
-        prev, seq_no = "0" * 64, 1
-        if ledger_path.exists():
-            lines = [l for l in ledger_path.read_text(encoding="utf-8").splitlines()
-                     if l.strip()]
-            if lines:
-                prev = json.loads(lines[-1]).get("report_hash", "0" * 64)
-                seq_no = len(lines) + 1
+        prev, seq_no = ledger_store.chain_state(ledger_path)
         report["integrity"]["prev_report_hash"] = prev
         report["integrity"]["report_hash"] = integrity.compute_report_hash(report)
-        with open(ledger_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "seq": seq_no,
-                "review_id": report["review_id"],
-                "engine": report["engine"],
-                "target_hash": report["integrity"]["target_hash"],
-                "report_hash": report["integrity"]["report_hash"],
-                "prev_hash": prev,
-                "rules_dir_hash": report["integrity"]["rules_dir_hash"],
-                "rules_version": report["integrity"]["rules_version"],
-                "ts": now_iso(),
-            }, ensure_ascii=False) + "\n")
-            f.flush()
+        ledger_store.append(ledger_path, {
+            "seq": seq_no,
+            "review_id": report["review_id"],
+            "engine": report["engine"],
+            "target_hash": report["integrity"]["target_hash"],
+            "report_hash": report["integrity"]["report_hash"],
+            "prev_hash": prev,
+            "rules_dir_hash": report["integrity"]["rules_dir_hash"],
+            "rules_version": report["integrity"]["rules_version"],
+            "ts": now_iso(),
+        }, locked=True, expect_prev=prev)
     finally:
         _release_ledger_lock(lock)
 
@@ -4521,10 +4814,14 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None):
 
     与 `_run_v1` 的分工：`_run_v1` 是「人跑一次」的入口（打印摘要、错误码），
     这里只返回结果。失败以 `TaskOutcome(status=FAILED)` 返回，由任务层记账。
+
+    接了 `token`：取消在阶段/节点边界生效，被取消时 `outcome.ok` 为 False，
+    于是**不会写报告**（报告只在流水线跑完之后写）——这正是"取消不留半成品"的
+    实现方式，而不是靠事后删文件。
     """
 
     def runner(target, *, review_id, profile_id=None, purpose=None,
-               engine="v1", use_llm=False):
+               engine="v1", use_llm=False, token=None):
         # profile 目前就是「用哪个 Agent / 规则包」：v1 的 ReviewProfile 由 agent 派生，
         # 所以 profile_id 直接当 agent 选择器用；传空则走既有的扩展名自动路由。
         std_rules = rules if rules is not None else load_rules()
@@ -4535,11 +4832,18 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None):
             target, std_rules, review_id=review_id,
             agent_id=profile_id or agent_id, type_override=type_override,
             store=STATE / "runs", use_llm=use_llm,
-            purpose_info=purpose_info, integrity_out=integrity_inputs)
+            purpose_info=purpose_info, integrity_out=integrity_inputs,
+            token=token)
         if not outcome.ok:
             return TaskOutcome(
                 status=RunStatus.FAILED, stage=state.stage,
                 error="；".join(outcome.errors) or f"流水线未完成：{outcome.status}")
+        if token is not None and token.cancelled:
+            # 结论算完了但已请求取消：不写报告，交给任务层落 CANCELLED。
+            # （写一份"用户已经不想要"的报告，比不写更糟——它会进台账。）
+            return TaskOutcome(
+                status=RunStatus.FAILED, stage=state.stage,
+                error=f"已取消：{token.reason}")
         report_path = _write_shadow_report(
             state, outcome, integrity_inputs=integrity_inputs,
             session=session, purpose_info=purpose_info)
@@ -4551,6 +4855,16 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None):
         )
 
     return runner
+
+
+def has_run_state(run_id) -> bool:
+    """这次运行有没有落盘的检查点（`TaskService.recover` 要用）。
+
+    为什么由入口提供而不是让任务层自己查：任务层不认识 `state/runs/` 的布局，
+    让它 import 运行时的存储实现，等于把「任务」和「状态文件格式」焊死。
+    目录在这里读（每次调用现读 `STATE`，测试重定向才有效）。
+    """
+    return bool(run_id) and (STATE / "runs" / f"{run_id}.state.json").exists()
 
 
 def make_task_service(*, rules=None, type_override=None, agent_id=None) -> TaskService:
@@ -4587,6 +4901,7 @@ def main():
     purpose_notes = None
     scenario = None
     research_enabled = False
+    review_id_opt = None          # `--review-id`：服务端预先发的号（见 _emit_result）
     # 引擎选择：默认旧链路；v1 = 只跑六节点流水线（影子）；shadow = 两条都跑并比对。
     engine, args = _take_engine(args)
     if engine == "off":
@@ -4756,6 +5071,29 @@ def main():
     if "--llm" in args:
         use_llm = True
         args = [a for a in args if a != "--llm"]
+    # `--review-id <R-...>`：由服务端预先发号（它要先建任务记录，记录里的
+    # review_id 必须与报告一致）。号仍然由本模块统一发，见 `--print-review-id`。
+    if "--review-id" in args:
+        i = args.index("--review-id")
+        if i + 1 < len(args):
+            review_id_opt = args[i + 1]
+            del args[i:i + 2]
+        else:
+            del args[i]
+            print("--review-id 缺少取值（形如 R-20261101-001）")
+            sys.exit(2)
+    if "--print-review-id" in args:
+        # 服务端在起任务前调用它拿号：只发号、不做任何审查、不写任何报告。
+        # 为什么用子进程而不是把发号逻辑复制到服务端：两份发号逻辑迟早会发出同一个号。
+        date = datetime.date.today().strftime("%Y%m%d")
+        new_id, lock = allocate_review_id(date)
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+        _ID_LOCKS.discard(lock)
+        print(json.dumps({"review_id": new_id}, ensure_ascii=False))
+        return
     if not args or args[0] == "--list":
         print("可用待审对象：")
         paths = sorted(glob.glob(str(TARGETS / "*")))
@@ -4793,7 +5131,8 @@ def main():
     if engine == "v1":
         _run_v1(target_path, rules, type_override=type_override,
                 agent_id=agent_id, use_llm=use_llm,
-                purpose=purpose, purpose_max=purpose_max)
+                purpose=purpose, purpose_max=purpose_max,
+                review_id=review_id_opt, research_enabled=research_enabled)
         return
     try:
         report = run_one(target_path, rules, use_llm=use_llm,
@@ -4801,7 +5140,8 @@ def main():
                          agent_id=agent_id, purpose=purpose, purpose_max=purpose_max,
                          purpose_notes=purpose_notes, scenario=scenario,
                          format_spec=format_spec,
-                         research_enabled=research_enabled)
+                         research_enabled=research_enabled,
+                         review_id=review_id_opt)
     except agent_spec.AgentError as e:
         print(f"Agent 配置错误：{e}")
         _emit_domain_error(ConfigError(f"Agent 配置错误：{e}"))
@@ -4820,13 +5160,17 @@ def main():
         sys.exit(1)
     if engine == "shadow":
         _run_shadow(report, target_path, rules,
-                    type_override=type_override, agent_id=agent_id)
+                    type_override=type_override, agent_id=agent_id,
+                    purpose=purpose, purpose_max=purpose_max,
+                    research_enabled=research_enabled)
     print(f"[{report['review_id']}] 裁定={report['verdict']} | "
           f"Agent={(report.get('agent') or {}).get('id')} | "
           f"情境={(report.get('scenario') or {}).get('id') or '-'} | "
           f"规格={(report.get('format_spec') or {}).get('id') or '-'} | "
           f"模式={report['review_mode']} | 异议 {len(report['issues'])} 条 | "
           f"输出：outputs/{report['review_id']}.json/.md")
+    _emit_result(report["review_id"], OUTPUTS / f"{report['review_id']}.json",
+                 verdict=report.get("verdict"))
 
 
 if __name__ == "__main__":
