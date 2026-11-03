@@ -7,8 +7,8 @@
 把 null 变成 false、把 1 变成 1.0，都算失败——因为那会改报告哈希、也会让
 历史报告无法并排比对。
 
-历史全量用例只在本地跑（outputs/ 被 .gitignore 排除，CI 里没有）；
-CI 跑的是 checks/fixtures/legacy_report_min.json 这份最小样本。
+这里跑 `checks/fixtures/legacy_report_min.json` 最小样本；历史全量回放
+由 `test_historical_corpus.py` 通过显式 `REVIEW_AGENT_HISTORY_DIR` 运行。
 
 运行：
     python -m unittest discover -s checks -v
@@ -37,9 +37,6 @@ from review_agent.domain import (                      # noqa: E402
 
 RUN_ID = "R-20261030-001-RUN01"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "legacy_report_min.json"
-OUTPUTS = ROOT / "outputs"
-
-
 def sample_issue(**overrides):
     """一份「当前版本产出的 issue」：键集合与顺序跟 Session.make_issue 一致。"""
     issue = {
@@ -63,22 +60,6 @@ def sample_issue(**overrides):
 
 def load_fixture():
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
-
-
-def historical_reports():
-    """历史报告（本地才有）；只认带 review_id 与字符串 verdict 的报告。"""
-    if not OUTPUTS.is_dir():
-        return []
-    out = []
-    for path in sorted(OUTPUTS.rglob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and "review_id" in data and isinstance(
-                data.get("verdict"), str):
-            out.append((path, data))
-    return out
 
 
 class FixtureRoundTripTests(unittest.TestCase):
@@ -175,20 +156,6 @@ class StructuralRejectionTests(unittest.TestCase):
     def test_illegal_issue_id_is_rejected(self):
         with self.assertRaises(CodecMismatch):
             encode_issue(sample_issue(issue_id="1"), run_id=RUN_ID)
-
-
-@unittest.skipUnless(historical_reports(), "outputs/ 不存在（CI 无历史语料）")
-class HistoricalCorpusTests(unittest.TestCase):
-    def test_every_historical_issue_round_trips(self):
-        total = 0
-        for path, report in historical_reports():
-            for key in ("issues", "suppressed"):
-                raw = report.get(key) or []
-                rebuilt = export_issues(raw, run_id=RUN_ID)
-                self.assertEqual(rebuilt, [dict(x) for x in raw],
-                                 f"{path.name}: {key} 回写不一致")
-                total += len(raw)
-        self.assertGreater(total, 0, "历史语料里一条 issue 都没有")
 
 
 if __name__ == "__main__":

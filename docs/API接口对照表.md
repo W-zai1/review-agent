@@ -5,7 +5,7 @@
 > 否则契约测试会红。本表与契约测试共同保证「前端调的每个接口都有后端代码，且字段对得上」。
 > 检索方式：**只写函数/符号名，不写行号**——行号会随代码漂移；定位时直接搜函数名。
 >
-> 最近核对：2026-10-29 · 契约测试以 `python -m unittest tests.test_api_contract -v` 的实际输出为准
+> 最近核对：2026-11-03 · 契约测试以 `python -m unittest tests.test_api_contract -v` 的实际输出为准
 
 ## 1. 架构与请求链路
 
@@ -30,20 +30,23 @@ server.py  Handler.do_GET / do_POST
 安全防护拒绝（Host / Origin 端口 / 缺 `X-Review-Console` / 跨站）用 403，静态资源缺失用 404。
 前端 `api()` 只解析 JSON，非 JSON 响应会统一显示「响应解析失败（HTTP n）」。
 
-## 2. 接口对照总表（25 个前端调用点）
+## 2. 接口对照总表（按功能分组）
 
 | # | 前端调用点（app.js） | 方法 + 路径 | 后端 handler（server.py） | 响应契约（前端消费的字段） | 契约测试 |
 |---|---|---|---|---|---|
 | 1 | `loadTargets` | GET `/api/targets` | `_targets` | `items[].{name,rel,size,mtime,uploaded,role,reviewable}`；**排序 = 可审对象在前 + 组内 mtime 降序**（刚上传的排第一）；`role=labels`（`*.labels.json` 机读标注）`reviewable=false`，前端置灰不可选，后端 `_resolve_target` 直接拒绝 | TargetsTests |
 | 2 | `uploadFile`（裸 fetch） | POST `/api/upload?name=` | `_upload` | 文本：`ok` + `file.{name,rel,size}`；二进制：`ok` + `kind`(pdf/docx/image/zip) + `file`（首个可审对象） + `extracted[].{name,rel,chars,from,archive}` + `warnings[]` + `extractor` + `original`；图片额外经 OCR 转写，`warnings` 说明识别误差；失败 `error` | UploadTests + BinaryUploadTests |
+| 2.4 | `askDeleteTarget` → `deleteTarget` | DELETE `/api/target?rel=` | `_delete_target` | `{ok,rel,name,trashed,items[]}`；**软删除**：顶层文件和上传文件都搬进 `targets/uploads/.trash/<时间戳>__<原名>`，`items` 是删除后的完整列表（前端直接替换）；回收区清单记录原路径供撤销；`rel` 属不可信输入，`..` / 绝对路径 / 盘符 / 越出 `targets/` 一律 `{ok:false,error}` | TargetsTests |
+| 2.45 | `restoreTarget`（提示条「撤销」） | POST `/api/target/restore` | `_restore_target` | body `{trashed}` → `{ok,rel,name,items[]}`；按回收区清单恢复到原目录，只认 `.trash` 下的归档，同名文件已存在则拒绝覆盖；同一归档撤销第二次返回 `{ok:false,error}`（不静默成功） | TargetsTests |
 | 2.5 | `uploadPurposeFile`（裸 fetch） | POST `/api/purpose/upload?name=` | `_purpose_upload` | `{ok,id,name,kind,chars,truncated,preview,warnings[],items[]}`；与 `/api/upload` 同一套白名单/体积上限/摄取链，但产物暂存 `state/purpose_uploads/`（**不进 targets/**），文本截断至 2000 字并记 warning；提取不到文本（扫描件/无 OCR）明确拒绝；暂存满 20 个拒绝 | PurposeUploadTests |
 | 2.6 | `loadPurposeFiles` | GET `/api/purpose/files` | `_list_purpose_records` | `{ok,items[]{id,name,kind,chars,truncated,created,preview}}`（**不含原文**，只给 80 字预览） | 同上 |
 | 2.7 | `removePurposeFile` | DELETE `/api/purpose/files?id=` | `_delete_purpose_record` | `{ok,id,items[]}`（删暂存记录 + `_originals/` 归档原件）；id 非法（含路径穿越）或不存在 → `{ok:false,error}` | 同上 |
 | 2.8 | `loadScenarios` | GET `/api/scenarios` | 内联（`scenario.public_list`） | `{ok,version,default,items[]{id,name,desc,keep_note,disabled_count,disabled_rules[],disabled_dimensions[]}}`；配置损坏时 `{ok:false,error,items:[]}`（前端把下拉置灰并显示原因，不当成「没有情境」） | ScenarioApiTests |
-| 2.9 | `loadFormatSpecs` | GET `/api/format-specs` | 内联（`format_spec.public_list`） | `{ok,version,default,items[]{id,name,source,desc,checks[],disabled_count,disabled_rules[]}}`；`checks` = 该规格会判哪几项（正文字体/字号/首行缩进/行距/标题层级/图表编号），前端塞进下拉选项文案；配置损坏时 `{ok:false,error,items:[]}` | FormatSpecApiTests |
+| 2.9 | `initFormatForm`（原 `loadFormatSpecs`） | 不再调用 | 前端本地收集 | 格式要求改为**分项表单**（2026-11-03）：正文字体/字号/首行缩进/行距、段前后、逐级标题、层级上限、图表编号，填哪项判哪项。**不再请求 `/api/format-specs`**（该接口保留，供脚本与预设查看）；随 `POST /api/review/start` 以 `format_custom` 提交，未知键名由后端 `format_spec._KNOWN_KEYS` 拒绝 | test_format_custom.FrontendFormContractTests |
 | 3 | `loadReports` | GET `/api/reports` | `_reports` | `items[].{id,verdict,target_type,target_path,target_name,review_mode,timestamp,issues,stats{blocker,major,minor,nit},report_hash,favorite,mtime}`；`favorites[]`=已收藏 ID。**排序唯一依据 `(timestamp, id)` 倒序，最新在最前**（不再有 `order`） | ReportsLogsIntegrityTests |
+| 3.1 | `loadTrash` | GET `/api/reports/trash` | `_trash_reports` | `{ok,items[]{id,target_name,target_path,verdict,review_mode,issues,deleted_at,files,size,restorable},total}`；新数据读 `.trash/.manifests/*.json`，旧回收数据按历史命名反推 | RecycleBinTests |
 | 4 | `selectReport` | GET `/api/report?id=` | `_report` | `ok`；`report.{review_id,verdict,review_mode,target_path,timestamp,stats,coverage,limitations,issues[]}` | 同上 |
-| 5 | `loadIntegrity` | GET `/api/integrity` | `_integrity` | `{ok,chain_ok,entries[]{seq,review_id,report_hash,report_hash_short,prev_hash,ts,ok,op,deleted,deleted_at},reports[]{id,ok,rules_ok,stale,rules_version,verdict,hash_short},broken_at,stale_count,rules_version,detail}` | 同上 + EmptyIntegrityTests |
+| 5 | `loadIntegrity` | GET `/api/integrity` | `_integrity` | `{ok,chain_ok,entries[]{seq,review_id,report_hash,report_hash_short,prev_hash,ts,ok,op,deleted,deleted_at,restored,restored_at},reports[]{id,ok,rules_ok,stale,rules_version,verdict,hash_short},broken_at,stale_count,rules_version,detail}` | 同上 + EmptyIntegrityTests |
 | 5.4 | `markFalsePositive` / `markFalseNegative` | POST `/api/annotations` | `_add_annotation` | body `{kind, by, report_id?, issue_id?, target_path?, quote?, dimension?}` → `{ok,annotation{...}}`；`quote` 必须逐字出现在被审文本，否则 `{ok:false,error}`（**只能写标注，不能写规则库**） | LearningApiTests |
 | 5.6 | （控制台未接） | GET `/api/annotations?id=` | 内联 | `{ok,items[]{ts,kind,by,target_path,quote,dimension,report_id,issue_id,note,trusted}}` | LearningApiTests |
 | 5.7 | （控制台未接） | GET `/api/learning` | `rule_learning.summary` | `{ok,rules_version,annotations,negatives,candidates,by_status,promoted[],rolled_back[],auto_this_week,quota_week}`（只读） | LearningApiTests |
@@ -53,15 +56,20 @@ server.py  Handler.do_GET / do_POST
 | 6 | `loadRules` | GET `/api/rules` | `_rules` | `{ok,items[]{rule_id,dimension,desc,severity,method,source,file,enabled,capability{kind,executor,label}},total,enabled,dimensions,execution{deterministic,declarative,prompt_only}}` | RulesTests |
 | 7 | `toggleRule` | POST `/api/rules/toggle` | `_toggle_rule` | `{ok,rule_id,enabled,enabled_count,total}` | 同上 |
 | 8 | `loadLogs` | GET `/api/logs?id=` | `_logs` | `{ok,id,task{steps[]{step,name,status,ts,latency_ms,detail{}},final_status},decisions[]{ts,decision,rule_id,rationale,alternatives,why_not_alternative},tools[]{ts,tool,input,output_summary,latency_ms,status,retry},cost{total_latency_ms,llm_*}}` | ReportsLogsIntegrityTests |
-| 9 | `startReview` | POST `/api/review/start` | `_start_review` | body `{file, llm?, type?, agent?, purpose?, purpose_files?, scenario?}`；`scenario` = 审查情境 id（`general` / `resume-screening`，见 §3.6；未知 id 直接返回 `{ok:false,error}`，错误文案含「未知审查情境」，**不起任务**）；`purpose` = 「审查目的」（≤300 字，控制字符清洗后经 `--purpose` 传给子进程）；`purpose_files` = 暂存的目的文件 id 数组（≤5，启动前校验，id 不存在/超量直接 `{ok:false,error}` 不起任务）；两者可同时用，服务端组装成一段目的并经 `--purpose-max <实际字数>` 告知解析上限（文件类目的可超 300 字）；`{ok,job_id}`；冲突时 `error` 含「进行中」；未知 `agent` 直接返回 `{ok:false,error:"未知 Agent：…；可选：…"}`（**不启动任务**）；报告新增 `purpose{text,lexicon_version,intents[],terms[],goals[]{id,intent,question,status,evidence_ids[]},evidence[]{id,quote,start,relation,source,rule_id,goal_id,goal_ids[],intent_id,relevance,rationale,judged},judge{mode,calls,error,judged,unjudged},limitations[]}`，未填目的时为 `null` | AsyncReviewTests + AgentApiTests + PurposeApiTests + PurposeUploadTests |
+| 9 | `startReview` | POST `/api/review/start` | `_start_review` | body `{file, llm?, type?, agent?, purpose?, purpose_files?, scenario?}`；`scenario` = 审查情境 id（`general` / `resume-screening`，见 §3.6；未知 id 直接返回 `{ok:false,error}`，错误文案含「未知审查情境」，**不起任务**）；`purpose` = 「审查目的」（≤300 字，控制字符清洗后经 `--purpose` 传给子进程）；`purpose_files` = 暂存的目的文件 id 数组（≤5，启动前校验，id 不存在/超量直接 `{ok:false,error}` 不起任务）；`format_custom` = 本次手填的**格式要求**（check 块对象，键：`body_font_east[]` / `body_size_halfpt` / `first_line_chars` / `line_twips` + `line_rule` / `line_multiple` / `space_before_pt` / `space_after_pt` / `space_scope` / `heading_max_level` / `heading_levels[]` / `figref`），**建任务之前**用 `format_spec.build_custom()` 校验，未知键 / 负数 / 结构不对直接返回 `{ok:false,error:格式要求有误：…}` **不发号**；给了它就以它为准，`format_spec` 只当来源记录；报告 `format_spec.id=custom`、`version=custom`、`source=本次审查手动填写（不入配置库）`；两者可同时用，服务端组装成一段目的并经 `--purpose-max <实际字数>` 告知解析上限（文件类目的可超 300 字）；`{ok,job_id}`；冲突时 `error` 含「进行中」；未知 `agent` 直接返回 `{ok:false,error:"未知 Agent：…；可选：…"}`（**不启动任务**）；报告新增 `purpose{text,lexicon_version,intents[],terms[],goals[]{id,intent,question,status,evidence_ids[]},evidence[]{id,quote,start,relation,source,rule_id,goal_id,goal_ids[],intent_id,relevance,rationale,judged},judge{mode,calls,error,judged,unjudged},limitations[]}`，未填目的时为 `null` | AsyncReviewTests + AgentApiTests + PurposeApiTests + PurposeUploadTests |
 | 10 | `pollJob` | GET `/api/review/status?job=` | `_review_status` | `{ok,job{id,file,status,created,finished,report_id,error,llm,type,timeout,recovered,timed_out},steps[]{step,name,status,ts,latency_ms},report}` | 同上 |
 | 11 | `loadProviders` | GET `/api/llm/providers` | 内联 | `{ok,items[]{id,name,base_url,model,models[],needs_key,local,hint}}` | LlmConfigTests |
 | 12 | `loadLlmStatus` | GET `/api/llm/status` | `_llm_status` | `{ok,enabled,available,base_url,endpoint,model,api_key(masked),api_key_set,timeout,max_retries,max_tokens,source,local_override}` | 同上 |
 | 13 | `saveLlm` | POST `/api/llm/config` | `_save_llm_config` | `{ok,saved,status{…同 12}}`；校验失败 `error` | 同上 |
 | 14 | `testLlm` | POST `/api/llm/test` | `_test_llm` | 成功 `{ok,model,endpoint,latency_ms,usage,reply,note}`；`reply` 为空时 `note` 给出原因（思考型模型 token 预算不足）；失败 `{ok:false,error}` | 同上 |
 | 15 | `resetLlm` | POST `/api/llm/reset` | `_reset_llm_config` | `{ok,status{…同 12}}` | 同上 |
-| 16 | `confirmDeleteReport` | **DELETE** `/api/report?id=` | `_delete_report` | 成功 `{ok,id,moved[],trash,ledger_tombstone}`；未确认 `{ok:false,need_confirm:true,error}` | ReportManagementTests |
+| 16 | `trashReport` | **DELETE** `/api/report?id=` | `_delete_report` | 成功 `{ok,id,moved[],trash,ledger_tombstone}`；未确认 `{ok:false,need_confirm:true,error}`；UI 软件删除一键执行并展示「撤销」 | ReportManagementTests |
+| 16.1 | `restoreTrashReport` | POST `/api/reports/trash/restore` | `_restore_report` | body `{id}` → `{ok,id,restored[],ledger_restore}`；按 manifest 原路恢复，目标已存在时拒绝覆盖并回滚 | RecycleBinTests |
+| 16.2 | `askPurgeTrash` | **DELETE** `/api/reports/trash?id=` | `_purge_trash_report` | body `{confirm:"<报告ID>"}` → `{ok,id,removed[]}`；未确认 `{ok:false,need_confirm:true,error}` | 同上 |
+| 16.3 | `askEmptyTrash` | **DELETE** `/api/reports/trash` | `_empty_trash` | body `{confirm:"EMPTY"}` → `{ok,removed}`；缺确认词时拒绝 | 同上 |
+| 16.4 | `askDeleteSelectedReports` | **DELETE** `/api/reports/batch` | `_delete_reports` | body `{ids:[...], confirm:"DELETE_SELECTED"}` → `{ok,deleted[],failed[]{id,error},total}`；逐份移入回收站，单份失败不中断整批 | ReportManagementTests |
 | 17 | `toggleFavorite` | POST `/api/reports/favorite` | `_set_favorite` | body `{id:"R-xxx", favorite:true|false}` → `{ok,id,favorite,favorites[]}`；`favorite` 非布尔 / id 格式非法 / 报告不存在 → `{ok:false,error}`；重复收藏幂等 | ReportManagementTests |
+| 17.1 | `setHistoryFavorites` | POST `/api/reports/favorites` | `_set_favorites` | body `{ids:[...], favorite:true|false}` → `{ok,ids[],favorite,updated,favorites[]}`；先完整校验再一次性写盘，任一 ID 非法或报告不存在则整批失败 | ReportManagementTests |
 | 18 | `loadLlmHistory` | GET `/api/llm/history` | `_load_llm_history()` | `{ok,items[]{base_url,model,api_key_set,last_used_at}}`（最近 12 条，**不含 Key 明文**） | LlmMemoryTests |
 | 19 | `applyHistoryItem` | POST `/api/llm/history/restore` | `_restore_llm_history` | `{ok,status{…同 12}}`；换 host 且无 Key → `{ok:false,error}` | 同上 |
 
@@ -78,7 +86,7 @@ startReview ─POST /api/review/start {file, llm?}→ job_id
 pollJob     ─GET  /api/review/status?job=      ─┐ 每 350ms 轮询
             ← {job:{status:running}, steps:[S1..S6 进度事件]}
             ← {job:{status:done, report_id}, report:{…完整报告…}}
-            ├→ loadReports / loadIntegrity 刷新右栏
+            ├→ loadReports / loadIntegrity 刷新左侧历史栏
             └→ renderReport 渲染裁定 + issue 列表
 ```
 
@@ -123,25 +131,30 @@ GET /api/reports → 每份报告取 timestamp（生成时刻，非文件 mtime�
 标题「⟳ 刷新」→ refreshReports({force:true}) ─GET /api/reports→ 重渲染 + 提示新增条数
 window focus / visibilitychange → refreshReports()（8s 节流；收藏请求在飞时跳过）
 
-【删除（二次确认）】
-点🗑 → askDeleteReport() → #confirmModal 弹窗说明影响
-      → 用户点「确认删除」→ confirmDeleteReport()
-      → DELETE /api/report?id=R-xxx  body: {confirm:"R-xxx"}
-         · 服务端校验 confirm 必须等于 id，否则 400 语义 {ok:false,need_confirm:true}
-         → 报告 JSON/MD + logs/<id>/ 移入 outputs/.trash/（可自行找回）
-         → ledger 对应行原位打墓碑 op=delete（seq/report_hash/prev_hash 一律不动）
-         → 从 config/favorites.json 摘除（否则收藏里留下点不开的幽灵条目）
-      → loadReports() + loadIntegrity() 刷新
+【移入回收站（一键、可撤销）】
+点🗑 → trashReport()
+     → DELETE /api/report?id=R-xxx  body: {confirm:"R-xxx"}
+     → 报告 JSON/MD + logs/<id>/ 移入 outputs/.trash/
+     → .trash/.manifests/<id>.json 记录每个原始路径
+     → ledger 追加 op=delete 事件（原报告行与哈希链不动）
+     → 从 config/favorites.json 摘除
+     → toast 保留 8 秒「撤销」，点击调用恢复
+
+【回收站】
+标题「回收站（N）」→ GET /api/reports/trash
+单条「恢复」→ POST /api/reports/trash/restore {id}
+            → 原路搬回 → ledger 追加 op=restore 事件
+单条「彻底删除」→ DELETE /api/reports/trash?id= {confirm:id}
+清空 → DELETE /api/reports/trash {confirm:"EMPTY"}
 ```
 
-**为什么删除不破坏审计链**：`ledger/chain.log` 的每行含 `prev_hash` 与 `report_hash`，
-下一行的 `prev_hash` 等于上一行的 `report_hash`。删除时**不删行、不重算 hash**，
-只在该行加 `op="delete"`、`deleted_at`、`deleted_hash` 三个字段——链的衔接分毫不动，
-`verify_ledger` 依旧通过，删除痕迹留在链上可审计（`/api/integrity` 的 entries 里
-`deleted=true`）。
+**为什么删除/恢复都不破坏审计链**：`ledger/chain.log` 的每行含 `prev_hash` 与
+`report_hash`，下一行的 `prev_hash` 等于上一行的 `report_hash`。删除和恢复都只
+**追加事件行**，不删行、不重算 hash；最新事件决定当前状态，历史事件全部保留。
+`verify_ledger` 依旧通过，`/api/integrity` 同时返回 `deleted` 与 `restored`。
 
-**删除的两道防线**：UI 弹窗是第一道；服务端强制 `confirm=id` 是第二道——
-绕过 UI 直接打接口也删不掉（`need_confirm=true`）。
+**安全边界**：移入回收站可一键完成并通过 toast 撤销；只有「彻底删除」和
+「清空回收站」进入强确认，服务端分别强制 `confirm=id` / `confirm="EMPTY"`。
 
 ### 3.4 二进制文档上传（PDF / Word / 图片 / 压缩包）
 

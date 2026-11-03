@@ -312,10 +312,27 @@ class TaskService:
         为什么保留同步入口：迁移期一次只跑一个任务，把同步路径也改成队列会让
         所有既有调用点被迫处理「还没跑完」的中间态，而它换不来可观测性。
         """
+        return self.start_review_with(
+            self._runner, target, profile_id=profile_id, purpose=purpose,
+            engine=engine, use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key)
+
+    def start_review_with(self, runner: Runner, target: Path | str, *,
+                          profile_id: str | None = None,
+                          purpose: str | None = None, engine: str = "v1",
+                          use_llm: bool = False, timeout: float | None = None,
+                          idempotency_key: str | None = None) -> TaskRecord:
+        """同 `start_review`，但本次执行用传入的 runner。
+
+        服务端用的是子进程执行器，它的参数（research / 场景 / 格式要求 / 进度文件）
+        比 `Runner` 协议里的通用字段多，所以由入口把「这一次怎么跑」封在 runner 里；
+        任务层仍只负责建任务、落状态、超时与取消，不 import `review.py` 或 `subprocess`。
+        """
         record = self._open(target, profile_id=profile_id, purpose=purpose,
                             engine=engine, status=RunStatus.RUNNING,
                             idempotency_key=idempotency_key)
-        return self._execute(record, timeout=timeout, use_llm=use_llm)
+        return self._execute(record, timeout=timeout, use_llm=use_llm,
+                             runner=runner)
 
     def start_async(self, target: Path | str, *, profile_id: str | None = None,
                     purpose: str | None = None, engine: str = "v1",
@@ -326,18 +343,34 @@ class TaskService:
         QUEUED 是真实状态而非占位：用户能看到「已提交、还没开始」，
         而 RUNNING 只在后台线程真正拿到执行权后才写。
         """
+        return self.start_async_with(
+            self._runner, target, profile_id=profile_id, purpose=purpose,
+            engine=engine, use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key)
+
+    def start_async_with(self, runner: Runner, target: Path | str, *,
+                         profile_id: str | None = None,
+                         purpose: str | None = None, engine: str = "v1",
+                         use_llm: bool = False, timeout: float | None = None,
+                         idempotency_key: str | None = None) -> TaskRecord:
+        """同 `start_async`，但本次执行用传入的 runner（见 `start_review_with`）。"""
         record = self._open(target, profile_id=profile_id, purpose=purpose,
                             engine=engine, status=RunStatus.QUEUED,
                             idempotency_key=idempotency_key)
         if record.status != RunStatus.QUEUED.value:
             return record          # 幂等命中：已有任务在跑，不再起线程
-        future = self._executor().submit(self._async_body, record, timeout, use_llm)
+        future = self._executor().submit(self._async_body_with, runner, record,
+                                         timeout, use_llm)
         with self._lock:
             self._futures[record.review_id] = future
         return record
 
     def _async_body(self, record: TaskRecord, timeout: float | None,
                     use_llm: bool) -> TaskRecord:
+        return self._async_body_with(self._runner, record, timeout, use_llm)
+
+    def _async_body_with(self, runner: Runner, record: TaskRecord,
+                         timeout: float | None, use_llm: bool) -> TaskRecord:
         # 「入队 → 开跑」与「用户点取消」是两个线程，必须在同一把锁里做状态迁移，
         # 否则 cancel 写下的 CANCELLED 会被这里的 RUNNING 覆盖（实测就是这么发生的：
         # 取消后任务照样跑完并写了报告）。
@@ -349,7 +382,8 @@ class TaskService:
                               updated_at=_now_iso())
             self._store.save(running)
         try:
-            return self._execute(running, timeout=timeout, use_llm=use_llm)
+            return self._execute(running, timeout=timeout, use_llm=use_llm,
+                                 runner=runner)
         finally:
             with self._lock:
                 self._futures.pop(record.review_id, None)
@@ -525,7 +559,8 @@ class TaskService:
         return record
 
     def _execute(self, record: TaskRecord, *, timeout: float | None,
-                 use_llm: bool) -> TaskRecord:
+                 use_llm: bool, runner: Runner | None = None) -> TaskRecord:
+        runner = runner or self._runner
         # 取消可能发生在「记录已建、线程还没开始执行」之间（`start_async` 立刻返回，
         # 用户马上点取消）。此时不能开跑：否则跑完会把 CANCELLED 覆写成 COMPLETED，
         # 用户看到"取消了但又完成了"，而台账里已经多了一份报告。
@@ -534,7 +569,8 @@ class TaskService:
             return persisted
         token = self._token_for(record.review_id, create=True)
         target_path = self._abs(record.target)
-        call = lambda: self._call_runner(record, target_path, token, use_llm)  # noqa: E731
+        call = lambda: self._call_runner(runner, record, target_path, token,  # noqa: E731
+                                         use_llm)
         cancelled_by_user = False
         try:
             if timeout is None:
@@ -585,16 +621,16 @@ class TaskService:
         self._forget(record.review_id)
         return record
 
-    def _call_runner(self, record: TaskRecord, target_path: Path,
+    def _call_runner(self, runner: Runner, record: TaskRecord, target_path: Path,
                      token: CancellationToken, use_llm: bool) -> TaskOutcome:
         kwargs = dict(review_id=record.review_id, profile_id=record.profile_id,
                       purpose=record.purpose, engine=record.engine,
                       use_llm=use_llm)
-        if self._runner_accepts_token():
+        if self._runner_accepts_token(runner):
             kwargs["token"] = token
-        return self._runner(target_path, **kwargs)
+        return runner(target_path, **kwargs)
 
-    def _runner_accepts_token(self) -> bool:
+    def _runner_accepts_token(self, runner: Runner) -> bool:
         """老 runner 不接 `token` 就照旧调用。
 
         为什么允许两种形状：`Runner` 协议是公开的（CLI / server / 测试各自装配）。
@@ -602,17 +638,12 @@ class TaskService:
         迁移期最不该做的就是这种"一次改全仓"的改动。新的 runner 接 token 就传，
         不接就退回今天的行为（取消退化为"只在任务状态上体现"）。
         """
-        cached = getattr(self, "_token_support", None)
-        if cached is not None:
-            return cached
         try:
-            params = inspect.signature(self._runner).parameters
-            accepts = "token" in params or any(
-                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            params = inspect.signature(runner).parameters
         except (TypeError, ValueError):
-            accepts = False
-        self._token_support = accepts
-        return accepts
+            return False
+        return "token" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     def _token_for(self, review_id: str, *, create: bool) -> CancellationToken | None:
         with self._lock:

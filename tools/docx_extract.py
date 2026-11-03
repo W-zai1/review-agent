@@ -135,6 +135,8 @@ def _para_props(p_el):
     first_line = None
     spacing_line = None
     spacing_rule = None
+    spacing_before = None
+    spacing_after = None
     if ppr is not None:
         _consume_rpr(_sub(ppr, "rPr"))          # 段落标记属性
         st = _sub(ppr, "pStyle")
@@ -169,6 +171,20 @@ def _para_props(p_el):
                 except ValueError:
                     pass
             spacing_rule = _attr(sp, "lineRule")
+            # 段前/段后间距（缇，1 磅 = 20 缇）。**不取会丢掉委托方最常规定的一项**：
+            # 「标题段前 12 磅、段后 6 磅」这类要求只能从这里拿到。
+            for attr, box in (("before", "before"), ("after", "after")):
+                raw = _attr(sp, attr)
+                if raw is None:
+                    continue
+                try:
+                    v = int(raw)
+                except ValueError:
+                    continue
+                if box == "before":
+                    spacing_before = v
+                else:
+                    spacing_after = v
 
     for r in _all(p_el, "r"):
         _consume_rpr(_sub(r, "rPr"))
@@ -179,6 +195,7 @@ def _para_props(p_el):
         "bold": bold, "pstyle": pstyle, "outline_lvl": outline_lvl,
         "first_line_chars": first_line_chars, "first_line": first_line,
         "spacing_line": spacing_line, "spacing_rule": spacing_rule,
+        "spacing_before": spacing_before, "spacing_after": spacing_after,
     }
 
 

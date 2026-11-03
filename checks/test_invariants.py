@@ -12,6 +12,7 @@
     python -m unittest discover -s checks -v
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -121,6 +122,54 @@ class LlmConfigMappingInvariants(unittest.TestCase):
         self.assertFalse(cfg.chunking)
         self.assertEqual(cfg.chunk_chars, 1234)
         self.assertEqual(cfg.chunk_overlap, 77)
+
+
+class LlmSecretStorageInvariants(unittest.TestCase):
+    """Key 只能存在于进程会话或环境变量，不能重新写进本地配置。"""
+
+    FAKE_KEY = "sk-" + "session-test-1234567890"
+
+    def tearDown(self):
+        llm_client.clear_session_api_key()
+
+    def test_ui_key_stays_in_process_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "llm.local.json"
+            with mock.patch.object(llm_client, "LOCAL_PATH", local), \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                llm_client.save_local_config({
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "model": "local-test",
+                    "api_key": self.FAKE_KEY,
+                })
+                persisted = local.read_text(encoding="utf-8")
+                self.assertNotIn("api_key", json.loads(persisted))
+                self.assertNotIn(self.FAKE_KEY, persisted)
+                self.assertEqual(llm_client.load_config().api_key, self.FAKE_KEY)
+
+    def test_environment_key_wins_over_legacy_disk_value(self):
+        env_key = "sk-" + "environment-test-1234567890"
+        legacy_key = "sk-" + "legacy-disk-test-1234567890"
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "llm.local.json"
+            local.write_text(json.dumps({
+                "base_url": "https://api.example.com/v1",
+                "model": "test-model",
+                "api_key": legacy_key,
+            }), encoding="utf-8")
+            with mock.patch.object(llm_client, "LOCAL_PATH", local), \
+                    mock.patch.dict(os.environ, {
+                        "REVIEW_AGENT_LLM_API_KEY": env_key,
+                    }, clear=True):
+                self.assertEqual(llm_client.load_config().api_key, env_key)
+
+    def test_review_child_env_gets_session_key(self):
+        llm_client.set_session_api_key(self.FAKE_KEY)
+        env = server._review_subprocess_env()
+        self.assertIsNotNone(env)
+        self.assertEqual(env["REVIEW_AGENT_LLM_API_KEY"], self.FAKE_KEY)
+        llm_client.clear_session_api_key()
+        self.assertIsNone(server._review_subprocess_env())
 
 
 class GoldenGuardInvariants(unittest.TestCase):

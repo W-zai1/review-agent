@@ -10,7 +10,7 @@ S4 的规则本身只有一句「非空 quote 必须逐字回查原文」，但�
     2. 节点（EvidenceAnalyzerNode）：阶段校验、缺原文即失败、产物形态、证据归属
     3. 历史等价（重放）：207 份报告的每条 quote，新规则的丢弃集合与旧实现逐条一致
 
-历史语料只在本地有（outputs/ 被 .gitignore 排除）；CI 跑前两层。
+历史等价测试已迁到 `test_historical_corpus.py`，这里只保留规则与节点测试。
 """
 import asyncio
 import json
@@ -169,52 +169,6 @@ class AdvanceIntegrationTests(unittest.TestCase):
         with self.assertRaises(InvariantViolation):
             self._advance(state, NodeResult.ok(evidence=(bogus,),
                                                output={"evidence_dropped": ()}))
-
-
-def historical_reports():
-    outputs = ROOT / "outputs"
-    if not outputs.is_dir():
-        return []
-    out = []
-    for path in sorted(outputs.rglob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and "review_id" in data and isinstance(
-                data.get("verdict"), str):
-            out.append(data)
-    return out
-
-
-@unittest.skipUnless(historical_reports(), "outputs/ 不存在（CI 无历史语料）")
-class HistoricalEquivalenceTests(unittest.TestCase):
-    """新规则必须和旧实现逐条等价——包括「空 quote 保留」这条容易写错的边界。"""
-
-    @staticmethod
-    def legacy_dropped(quote, text):
-        """旧实现 review.py S4（改造前）的原样规则，独立重写一遍用于对照。"""
-        q = quote
-        placeholder = isinstance(q, str) and q.startswith("（") and q.endswith("）")
-        return bool(q) and q not in text and not placeholder
-
-    def test_dropped_set_matches_old_implementation(self):
-        from review_agent.adapters.issue_codec import encode_issues
-
-        checked = 0
-        for report in historical_reports():
-            text = str(report.get("target_text") or "")
-            issues = report.get("issues") or []
-            findings = [e.finding for e in encode_issues(issues, run_id=RUN_ID)]
-            result = anchor_findings(findings, text, run_id=RUN_ID)
-            expected = {
-                f.id for f, raw in zip(findings, issues)
-                if self.legacy_dropped(raw.get("quote"), text)
-            }
-            self.assertEqual(set(result.dropped_ids), expected,
-                             f"{report['review_id']} 丢弃集合与旧实现不一致")
-            checked += len(findings)
-        self.assertGreater(checked, 0, "历史语料里一条 issue 都没有")
 
 
 if __name__ == "__main__":

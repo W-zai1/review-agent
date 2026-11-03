@@ -4,7 +4,7 @@
 
 设计目标：
   - 不引入 openai SDK，只用标准库，保持项目「零依赖」；
-  - base_url / model / api_key / 超时 / 重试全部走 config/llm.yaml + 环境变量；
+  - 普通配置走 config/llm.yaml + 本地覆盖；API Key 只接受环境变量或进程内会话；
   - 无凭据时 available=False，由 review.py 降级为纯规则审，绝不伪造 LLM 结论；
   - 不把密钥写进日志或报告（只输出 masked 形式）。
 
@@ -37,6 +37,25 @@ LOCAL_KEYS = {
     "temperature", "max_tokens", "max_input_chars", "max_issues_per_dim",
     "chunking", "chunk_overlap", "chunk_chars", "cache",
 }
+
+# 控制台手填的 Key 只在当前服务进程内有效。落盘配置永远不保存密钥；
+# 无人值守运行通过 REVIEW_AGENT_LLM_API_KEY 注入。
+_SESSION_API_KEY = ""
+
+
+def session_api_key():
+    return _SESSION_API_KEY
+
+
+def set_session_api_key(value):
+    global _SESSION_API_KEY
+    _SESSION_API_KEY = str(value or "").strip()
+    return _SESSION_API_KEY
+
+
+def clear_session_api_key():
+    global _SESSION_API_KEY
+    _SESSION_API_KEY = ""
 
 DEFAULTS = {
     "enabled": "auto",
@@ -325,21 +344,29 @@ def _to(value, cast, default):
 
 
 def read_local_config():
-    """读取前端保存的本地覆盖配置（config/llm.local.json）。"""
+    """读取本地非敏感覆盖配置；历史文件里的 api_key 只丢弃，不参与加载。"""
     if not LOCAL_PATH.exists():
         return {}
     try:
         data = json.loads(LOCAL_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        data.pop("api_key", None)
+        return data
     except Exception:
         return {}
 
 
 def save_local_config(patch):
-    """合并写入本地覆盖配置；值为 None 表示删除该键。"""
+    """合并写入非敏感本地配置；Key 只保留在进程内，不写盘。"""
+    if "api_key" in patch:
+        if patch["api_key"] in (None, ""):
+            clear_session_api_key()
+        else:
+            set_session_api_key(patch["api_key"])
     current = read_local_config()
     for key in LOCAL_KEYS:
-        if key not in patch:
+        if key == "api_key" or key not in patch:
             continue
         value = patch[key]
         if value is None:
@@ -358,6 +385,7 @@ def save_local_config(patch):
 
 
 def clear_local_config():
+    clear_session_api_key()
     try:
         LOCAL_PATH.unlink()
         return True
@@ -366,7 +394,8 @@ def clear_local_config():
 
 
 def load_config(use_llm=None):
-    """优先级：默认值 < config/llm.yaml < 环境变量 < 前端保存的本地覆盖。
+    """普通配置按默认值 < YAML < 环境变量 < 本地非敏感覆盖合并；
+    Key 只取环境变量或当前进程会话，旧本地文件中的 Key 字段直接忽略。
 
     use_llm=False 强制关闭；use_llm=True 强制启用。
     """
@@ -407,6 +436,9 @@ def load_config(use_llm=None):
         for key, value in local.items():
             if key in LOCAL_KEYS and value is not None:
                 raw[key] = value
+        source = "ui"
+    if session_api_key():
+        raw["api_key"] = session_api_key()
         source = "ui"
 
     base_url = str(_pick(raw.get("base_url"), DEFAULTS["base_url"]))

@@ -60,7 +60,7 @@ review-agent/
 │   ├── safety.yaml         #   SAFE-001~004
 │   ├── compliance.yaml     #   COMP-001~004 + LAW-001
 │   ├── logic.yaml          #   LOGIC-001~009
-│   ├── format.yaml         #   FORMAT-001~006（只声明查哪些维度，数值在 config/format_specs.yaml）
+│   ├── format.yaml         #   FORMAT-001~007（只声明查哪些维度，数值在 config/format_specs.yaml 或前端手填）
 │   └── style.yaml          #   STYLE-001~005（004 = 硬编码密钥 + lint）
 ├── knowledge/              # 事实库 / 法条库 / 政策基线
 │   ├── facts.json          #   机器可读事实断言（事实审比对用）
@@ -337,6 +337,7 @@ http://127.0.0.1:8000
 |---|---|---|
 | GET | `/api/targets` | 列出 `targets/` 与 `targets/uploads/` 待审文件 |
 | GET | `/api/reports` | 历史报告列表（含 verdict / stats / 目标文件名） |
+| GET | `/api/reports/trash` | 回收站列表（报告、删除时间、文件数与可恢复状态） |
 | GET | `/api/report?id=R-xxx` | 读取单份报告 JSON |
 | GET | `/api/integrity` | 校验 ledger 链 + 报告自洽，返回逐节点 hash 与状态 |
 | GET | `/api/rules` | 规则库（含维度、严重度、启用状态） |
@@ -355,7 +356,10 @@ http://127.0.0.1:8000
 | POST | `/api/llm/reset` | 清除本地覆盖，回到 YAML / 环境变量 |
 | POST | `/api/review {file}` | 同步运行 `review.py` 子进程，返回最新报告（兼容旧调用） |
 | POST | `/api/reports/favorite` | 收藏 / 取消收藏一份历史报告（`{id, favorite:true\|false}` → `config/favorites.json`） |
-| DELETE | `/api/report?id=R-xxx` | 删除历史报告（须 body 传 `confirm=R-xxx` 二次确认；文件移入 `outputs/.trash/`） |
+| POST | `/api/reports/trash/restore` | 从回收站恢复报告（按 manifest 原路搬回，并追加审计链恢复事件） |
+| DELETE | `/api/report?id=R-xxx` | 将历史报告移入回收站（须 body 传 `confirm=R-xxx`；界面一键执行、8 秒内可撤销） |
+| DELETE | `/api/reports/trash?id=R-xxx` | 彻底删除回收站中的报告（须 body 传 `confirm=R-xxx`） |
+| DELETE | `/api/reports/trash` | 清空回收站（须 body 传 `confirm="EMPTY"`） |
 
 > 接口契约（前端调用点 ↔ 后端路由 ↔ 字段）以 [`docs/API接口对照表.md`](docs/API接口对照表.md) 为单一事实来源；
 > `tests/test_api_contract.py` 起真实 server.py 逐字段断言，前端调的每个接口都在后端有对应代码。
@@ -588,6 +592,10 @@ Content-Type: application/octet-stream
 - 上传只新增待审对象，审查过程仍然不修改它（只读原则不变）。
 - 上传目录已加入 `.gitignore`，不会把用户文件提交进仓库。
 - 控制台只监听 `127.0.0.1`，上传接口不对外网开放。
+- **待审列表里的 ✕ 点一下就删，不弹确认框**。安全性不靠弹窗，靠两条：后端是软删除
+  （移入 `targets/uploads/.trash/`，可原位恢复）+ 提示条给 8 秒「撤销」。
+  被历史报告引用过的文件会在提示条上注明「N 份报告引用它，原文定位将失效」——
+  后果说清楚，但不停下来问。一次清十个测试上传物不该变成二十次点击。
 
 ---
 
@@ -721,25 +729,29 @@ python tools/llm_bench.py --skip-budget      # 快速回归
 
 ## 17. 历史报告管理与收藏（v0.6.3）
 
-### 17.1 删除历史报告（二次确认）
+### 17.1 删除历史报告（回收站 + 撤销）
 
-右栏历史列表每行悬停出现 🗑 按钮 → 弹出确认框说明影响 → 确认后删除。
+历史报告位于左侧工作区栏。每行可单独收藏或删除；删除会立即移入回收站，
+右下角保留 8 秒「撤销」。每行左侧的勾选框支持多选，「全选当前」可一次选中
+当前筛选结果，随后可批量收藏、取消收藏或移入回收站。批量删除会先显示一次
+汇总确认，完成后可从「回收站」逐份恢复。
 
-**两道防线**：
+历史栏顶部的「回收站（N）」列出已删除报告：
 
-| 层 | 机制 | 绕过后果 |
+| 动作 | 行为 | 保护 |
 |---|---|---|
-| UI | `#confirmModal` 弹窗 + 取消/确认按钮 | 无 |
-| 服务端 | `DELETE /api/report?id=` 必须带 body `{"confirm":"<报告ID>"}` | 返回 `{ok:false, need_confirm:true}`，拒绝删除 |
+| 恢复 | 按 manifest 记录的原始路径搬回报告、日志、V1 副本与状态文件 | 目标已存在时拒绝覆盖；搬移中断会回滚 |
+| 彻底删除 | 永久移除该报告在回收站中的全部文件 | 必须再次确认完整报告 ID |
+| 清空回收站 | 永久移除回收站全部内容 | 必须提交 `confirm="EMPTY"` |
 
-**删除对审计链的影响**：不删链、不重算 hash——`ledger/chain.log` 对应行**原位打墓碑**
-（加 `op="delete"`、`deleted_at`、`deleted_hash`），`seq` / `report_hash` / `prev_hash` 一律不动。
-因此**链条衔接分毫不变**，`tools/integrity.py verify` 依旧通过，而"这份报告被删过"留在链上可审计
-（`/api/integrity` 的 entries 中 `deleted=true`）。
+**删除与恢复对审计链的影响**：两者都只追加事件行；`seq` / `report_hash` /
+`prev_hash` 一律不动。恢复不会删掉原删除墓碑，而是追加 `op="restore"`，
+因此“删过、恢复过、又删过”的完整历史仍可审计，`tools/integrity.py verify` 依旧通过。
 
 删除时顺手把该报告从收藏表里摘掉——否则收藏视图里会留一个永远点不开的幽灵条目。
 
-文件不硬删：报告 JSON/Markdown 与 `logs/<id>/` 移入 `outputs/.trash/`，误删可自行移回。
+新删除会在 `outputs/.trash/.manifests/<id>.json` 记录每个文件的原位置和回收区位置。
+旧版本已删数据没有 manifest，服务端仍按历史文件命名兼容列表与恢复。
 
 ### 17.2 排序：只按时间，最新在最上面
 
@@ -761,7 +773,7 @@ GET /api/reports → 读取每份报告的 timestamp
 > 任何一项回到代码里都会失败——**半删的拖拽最糟**，用户会以为还能拖。
 >
 > 历史坑：旧实现把不在 `report_order.json` 里的新报告补到**末尾**，
-> 于是每份新报告都被压到 140 条列表最底部，右栏只露顶部几条——表现就是"历史报告不更新"
+> 于是每份新报告都被压到 140 条列表最底部，左侧历史栏只露顶部几条——表现就是"历史报告不更新"
 > （实测 `R-20261026-007/010/011` 排在 137 位之后）。
 
 ### 17.3 收藏（⭐）
@@ -802,7 +814,8 @@ POST /api/reports/favorite  {"id":"R-xxx","favorite":true|false}
 | 路径 | 作用 |
 |---|---|
 | `config/favorites.json` | 被收藏的报告 ID（`{"favorites": [...]}`，顺序无意义） |
-| `outputs/.trash/` | 已删报告与日志的回收区（可自行恢复） |
+| `outputs/.trash/` | 已删报告与日志的回收区（可从控制台恢复） |
+| `outputs/.trash/.manifests/` | 每份已删报告的原路径映射（恢复与彻底删除的依据） |
 | `config/report_order.json` | **已废弃**：旧拖拽顺序快照，不再读取 |
 
 ### 17.6 顺带修掉的真实 Bug
@@ -810,6 +823,30 @@ POST /api/reports/favorite  {"id":"R-xxx","favorite":true|false}
 `outputs/` 下曾出现 `llm-bench-*.json`（测评产物），被 `glob("*.json")` 当成历史报告扫进
 `/api/reports`（列表里出现 `id: null`）并让 `/api/integrity` 的 `ok` 变成 `false`。
 现约定：**历史报告只扫 `R-*.json`**，测评产物改放 `outputs/bench/`。
+
+### 17.7 点一条历史，右边立刻看到它
+
+> **2026-11-03 起布局调整**：历史列表不再是侧栏里的一条窄栏，而是独立页「历史报告」——
+> 左侧是列表（搜索、筛选、批量收藏/删除全保留），右侧是这份报告的「记录摘要」；
+> 正文仍在审查控制台的「审查结论」大区。**单击只换右栏记录，双击（或点
+> 「在审查控制台打开」）才切回控制台**。下面两条规则仍然适用，只是触发点从
+> "单击列表"变成了"打开报告"。设计取舍见 §42。
+
+历史列表在左侧栏，报告渲染在「审查结论」大区（即左侧栏右边）。点一条历史时固定做两件事：
+
+1. **切回「审查工作台」页**。以前只渲染不切页：停在「规则与学习 / 审计轨迹 /
+   可信校验」时点历史，报告被写进隐藏的 `page-review`，屏幕毫无反应，
+   用户只能得出"历史点坏了"的结论。
+2. **把报告滚到视野顶部**。停在工作台但已经往下翻过时，只换内容不回头，
+   得自己再滚回去。滚动目标由 `revealReportTop()` 计算，宽屏下走卡片内部的
+   滚动容器（`scrollHost()`），不是 `window`。
+
+被换掉的报告整块高度差异极大（几百字 ↔ 六千字），浏览器默认的 scroll anchoring
+会在同一帧里把"刚滚到顶"抵消掉（实测 600 → 562，只挪 38px），所以 `.result-card`
+显式设 `overflow-anchor: none`，滚动位置只由代码决定。
+
+`tests/test_api_contract.py::FrontendHistoryContractTests::test_history_click_shows_report_in_workspace`
+锁住这三件事（切页、滚动调用、`#resultCard` 锚点）。
 
 ---
 
@@ -1481,7 +1518,8 @@ python review.py targets/contract_001.md --no-llm \
   --purpose "帮我核对合同金额、大小写与付款条款是否一致"
 ```
 
-控制台里 `purpose` 存 localStorage，随 `/api/review/start` 提交；
+控制台里 `purpose` 只存在于本次会话（**不落 localStorage**：进入系统时输入框为空，
+上一次的目的不会悄悄并入下一次审查），随 `/api/review/start` 提交；
 预设了 5 个常用方向（承诺风险 / 金额核对 / 数据来源 / 合同要件 / 对外发布）。
 
 **目的也可以来自文件**：审查目的面板点「上传目的文件」，支持 PDF/Word/图片/ZIP/文本
@@ -1832,7 +1870,7 @@ python tools/changelog_guard.py --staged   # 只看暂存区，pre-commit 用
 ### 33.2 拆成两层
 
 ```
-rules/format.yaml            只声明「要查哪些维度」（FORMAT-001~006），不含量值
+rules/format.yaml            只声明「要查哪些维度」（FORMAT-001~007），不含量值
       ↓ spec_keys 指明依赖哪几个键
 config/format_specs.yaml     每个规格给出数值（字体/字号/缩进/行距/标题层级/图表编号）
       ↓ tools/format_spec.py 校验并解析
@@ -1903,6 +1941,70 @@ docx_format_checks.run_all(info, ridset, spec)
 
 **顺带修掉的一处**：`FrontendParityTests` 提取前端接口的正则不含 `-`，
 `/api/format-specs` 被截成 `/api/format`，误报"前端调了但后端没路由"。
+
+### 33.6 预设不够用的时候：改成「分项填写」（2026-11-03）
+
+§33 的结论是"换标准 = 改配置，不改代码"。但实际用起来还有一层不够：
+**预设只能覆盖已经被写进配置的那几种**。用户要的是「一级标题黑体三号、二级黑体四号、
+标题段前 12 磅、行距 2 倍」——这套要求既不是课程报告 v1，也没被谁写进 yaml，
+于是界面上只有一个「不判版式」和一个「课程报告 v1」可选，两个都不对。
+
+所以规格的**录入方式**从「选下拉」改成「填表单」：
+
+| | 原来 | 现在 |
+|---|---|---|
+| 入口 | `<select>`，选项来自 `/api/format-specs` | 「填写格式要求」按钮展开分项表单 |
+| 可选值 | 配置里写死的几套 | 正文字体/字号/首行缩进/行距、段前后、逐级标题、层级上限、图表编号 |
+| 生效范围 | 选中的那套（落盘在 config） | **只对这一次生效**，不写配置、不进版本库 |
+| 判定范围 | 规格里没写的项不判 | 同左：**填哪项判哪项，空着的不判**，并写进 limitations |
+
+为什么不把表单内容存进 `config/format_specs.yaml`：
+那份文件是"可复用的委托方标准"，改它要升 version，历史报告会因此显示"规格版本已变"。
+一次临时审查不该在版本账上留下痕迹。要复用的标准仍然走配置（那是 §33 的路径）。
+
+**单位换算**（用户填的 vs 后端要的）：
+
+| 界面填 | 后端字段 | 换算 |
+|---|---|---|
+| 字号 12（磅） | `body_size_halfpt` | ×2 → 24（半磅） |
+| 首行缩进 2（字符） | `first_line_chars` | ×100 → 200 |
+| 行距固定值 22（磅） | `line_twips` + `line_rule: exact` | ×20 → 440（缇） |
+| 行距 2（倍） | `line_multiple: 2` | 直传（后端按 line=480/240 比对） |
+| 段前/段后 12（磅） | `space_before_pt` / `space_after_pt` | 直传（后端 ×20 得缇） |
+
+**新增的判定能力**：
+
+1. `FORMAT-007` 段落间距（`space_before_pt`/`space_after_pt`/`space_scope`）。
+   为什么单独一条规则而不是塞进 FORMAT-004：行距是"行与行"、段间距是"段与段"，
+   一份标准完全可能只规定其中一个。作用对象必须显式（正文段 / 标题段）——
+   同一个"12 磅"，判正文和判标题是两件事。**未设置 spacing 的段落按 0 磅算**
+   （Word 的实际行为），所以"要求 0 磅"时它是达标的、"要求 12 磅"时它不达标。
+2. `heading_levels`：一级/二级/三级各自的字体字号。只判**显式设置**在 run 上的
+   字体字号；继承自 Heading 样式的段落**不判错**——`docx_extract` 只看段落内
+   rPr，读不到样式定义，把"读不到"当成"不符合"会让每份正常文档都被报一遍。
+3. `line_multiple`：倍数行距。没写 `line` 的段落按单倍算，要求 2 倍时**必须报**
+   （这条不能套用 §33.5 里"auto 时无 spacing 算过"的宽容——那是"只要求非固定值"，
+   和"明确要求 2 倍"不是一回事）。
+
+**顺带修掉一个会误报的边界**：`heading_max_level` 原来写
+`max(levels) >= max_level`，而 `levels` 是 1 基（Heading1→1）。
+结果规定"最多 3 级"时，**正好用到三级标题的合规文档被判超限**。
+改成 `>` 后，三级合规、四级才报。
+
+**接口**：`POST /api/review/start` 新增可选 `format_custom`（check 块，对象）。
+服务端在**建任务之前**用 `format_spec.build_custom()` 校验（与配置共用同一份
+`_KNOWN_KEYS` 白名单），错就返回 `{ok:false,error:"格式要求有误：…"}`，不发号。
+子进程侧走新参数 `--format-spec-json '<json>'`；报告 `format_spec{id:"custom",
+version:"custom",source:"本次审查手动填写（不入配置库）",criteria{…},desc}`——
+`desc` 是给人读的一句话（"正文字体 宋体、字号 12pt（小四）、行距 2 倍…"）。
+
+> 改了 `rules/format.yaml`（新增 FORMAT-007 + 补 spec_keys），
+> 因此 `config/rules_version.txt` 升到 `v1-2026-11-03-f7`。
+> 历史报告的规则版本与当前不一致时会按既有机制显示为 stale（黄），这是预期行为：
+> 它确实是按旧规则集判的。
+
+测试：`tests/test_format_custom.py` **36 项**（构建/校验 9、段落间距 5、逐级标题 6、
+倍数行距 4、服务端解析 3、前端契约 7、`run_one` 端到端 2）；`tests/test_format_spec.py` 27 项同步更新。
 
 ---
 
@@ -2675,3 +2777,66 @@ quote 里只要有实体（"豆包""华为"）就**原样保留 rule_id**。于�
 4. **不测"断言写错了但语料也错了"的情形。** 语料里若有一句错的和断言期望一致，
    它会被记成 `kept`——回测只能测"与语料的一致性"，不能替代人核来源。
 
+
+---
+
+## 42. 历史报告独立页：左列列表 / 右栏记录（2026-11-03）
+
+### 42.1 问题不在"能不能点开"，在"点一下要等于什么"
+
+上一版把历史报告塞在侧栏的 286px 窄栏里。后果是三个：
+
+1. **批量操作被压成三个 32px 的小方块**。它们确实能用，但一行里放不下
+   「收藏 / 取消 / 删除」，只能靠 `flex: 0 1 32px` 硬挤，文案缩到 9px。
+2. **报告卡只显示得下"编号 + 文件名 + 时间"**，severity 药丸要换行。
+3. 最关键的一条：**"看记录"和"打开正文"被合成了一个动作**。点一条历史 =
+   换掉控制台里的报告正文。用户其实经常只想确认"这份是什么时候、按哪版规则判的"，
+   却发现控制台里正在读的那篇已经被换走了。
+
+所以拆成两层：**历史页负责"档案"，控制台负责"正文"**。
+
+### 42.2 两栏的分工
+
+| 区域 | 回答的问题 | 数据来源 |
+|---|---|---|
+| 左侧列表 | 有哪些报告？哪些没过？我要批量处理哪几份 | `GET /api/reports` |
+| 右侧记录 | 这份报告在审什么、按哪版规则判的、有没有被动过 | `GET /api/report?id=` |
+| 审查控制台 | 逐条问题、原文标注、整改动作 | 同上，只是换了渲染方式 |
+
+右侧**不重画问题清单**：同一份问题清单在两个地方各画一遍，格式和编号迟早不一致
+（角标编号、维度配色都在控制台里有专门实现）。这里只给前 4 条做"够不够严重"的判断，
+剩下的一句"还有 N 条，进控制台看完整清单"。
+
+### 42.3 状态必须分开存
+
+`state.historyPreviewId` / `state.historyPreview` 与 `state.currentReport` 是**两套状态**：
+
+- `previewHistory()` 只写前者，只渲染右栏；
+- `openReportInConsole()` 才走 `selectReport()`，写后者并切页。
+
+混成一个字段的写法更短，但"翻档案"会变成"打开"，正是 42.1 第 3 条那个问题。
+删除/批量删除/外部刷新后如果预览的那份已不在列表里，右栏立刻清成空态——
+否则记录还挂着，点「打开」只能拿到 404。
+
+### 42.4 三个纯 CSS 的坑
+
+1. **`.integrity-bar` 卡了 `max-height: 35px` + 两行截断**，是按 8.5px 字号配的。
+   正文可读性上调到 11px 后，`✗ 报告内容校验异常` 只剩半行——最该被看见的告警
+   反而读不到。页内放开到 `max-height: none` + 四行。
+2. **`.btn` 全局 `width: 100%`**（给"开始审查"那种整行按钮用的）。右栏
+   「在审查控制台打开」直接变成一个占满半行的巨块，逼得"收藏/回收站"换行。
+   页内用 `.hd-actions .btn { width: auto }` 收回。
+3. **列表末尾必然切在某行中间**。硬切会被读成"卡片被切坏了"，加一层 12px 的
+   `mask-image` 淡出，读成"下面还有"。
+
+### 42.5 测试与实测
+
+- 契约测试改了名字也改了断言：`test_history_page_has_left_list_and_right_record`
+  锁「左侧有批量控件、右侧有记录区、DOM 顺序左→右、单击只预览不换页」。
+- `need_confirm` 那条断言从 `web/app.js` 移到 `server.py`：回收站重构后客户端
+  固定带 `confirm=<id>`，客户端已经不会走到 `need_confirm` 分支，断言留在原处
+  必然红（此前一直是遗留红项）。
+- CDP 实测（无头 Edge 1680×1050）：初始 60 行、右栏 `R-20261103-002`；
+  点第三行 → 右栏 `R-20261030-032`、`#resultView` 仍 hidden、tab 仍 `history`；
+  勾两行 → 「已选 2」且三个批量按钮解锁；点「在审查控制台打开」→ tab 变 `review`
+  且结论区渲染 `R-20261030-032`；返回历史页预览保留；搜 `contract` → 24 行。

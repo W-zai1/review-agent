@@ -41,20 +41,20 @@
 
 - rule_id: FORMAT-004
   dimension: format
-  desc: 正文行距应符合所选格式规格（固定值 lineRule=exact + 缇值，或要求非固定值）
+  desc: 正文行距应符合所选格式规格（固定值 lineRule=exact + 缇值、倍数 line_multiple，或要求非固定值）
   method: docx_format
   severity: minor
   source: 版式检查通用维度（数值来自所选格式规格）
-  spec_keys: [line_twips, line_rule]
+  spec_keys: [line_twips, line_rule, line_multiple]
   auto_fix: false
 
 - rule_id: FORMAT-005
   dimension: format
-  desc: 标题层级不得超过所选格式规格规定的最大级数；应有可识别的标题样式
+  desc: 标题层级不得超过所选格式规格规定的最大级数；各级标题的字体字号应符合规格（heading_levels）
   method: docx_format
   severity: minor
   source: 版式检查通用维度（数值来自所选格式规格）
-  spec_keys: [heading_max_level]
+  spec_keys: [heading_max_level, heading_levels, heading_font, heading_min_size_halfpt]
   auto_fix: false
 
 - rule_id: FORMAT-006
@@ -64,4 +64,13 @@
   severity: major
   source: 版式检查通用维度（与具体字体字号标准无关，任何格式要求都要求一致）
   spec_keys: [figref]
+  auto_fix: false
+
+- rule_id: FORMAT-007
+  dimension: format
+  desc: 段落间距（段前/段后，磅）应符合所选格式规格；作用对象由 space_scope 指定正文段或标题段
+  method: docx_format
+  severity: minor
+  source: 版式检查通用维度（数值来自所选格式规格）
+  spec_keys: [space_before_pt, space_after_pt, space_scope]
   auto_fix: false

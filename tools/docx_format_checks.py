@@ -226,11 +226,20 @@ def check_spacing(paras, body, info, ridset, spec=None):
         return []
     twips = (spec or {}).get("line_twips")
     rule = (spec or {}).get("line_rule")
-    if not twips and not rule:        # 规格没规定行距 → 这项不判
+    multiple = (spec or {}).get("line_multiple")
+    if not twips and not rule and not multiple:   # 规格没规定行距 → 这项不判
         return []
 
     def ok(p):
         got_rule = p.get("spacing_rule")
+        if multiple:
+            # 倍数行距 = lineRule 为 auto（或未设置=继承单倍）且 line = 倍数 × 240。
+            # 未设置 line/rule 的段落按单倍算：要求 2 倍时它不达标，不能当"没规定就放过"。
+            if got_rule == "exact":
+                return False
+            got = p.get("spacing_line")
+            eff = (got / 240) if got else 1.0
+            return abs(eff - multiple) < 0.02
         if rule == "exact":
             if got_rule != "exact":
                 return False
@@ -251,7 +260,9 @@ def check_spacing(paras, body, info, ridset, spec=None):
         for k, v in sorted(dist.items(),
                            key=lambda kv: ((kv[0][0] or 0), kv[0][1] or "")))
     p0 = bad[0]
-    if rule == "exact" and twips:
+    if multiple:
+        want = f"{multiple:g} 倍行距（line = {int(round(multiple * 240))}，lineRule=auto）"
+    elif rule == "exact" and twips:
         want = f"固定 {twips / 20:g} 磅（line={twips} 且 lineRule=exact）"
     elif rule == "auto":
         want = "非固定行距（lineRule 不能是 exact）"
@@ -264,14 +275,135 @@ def check_spacing(paras, body, info, ridset, spec=None):
         "docx_format:spacing")]
 
 
+def check_para_space(paras, body, ridset, spec=None):
+    """FORMAT-007 段前/段后间距（磅）。
+
+    只说"段前 12 磅"而不说作用对象是没有意义的：同一个数值，
+    检查正文段落和检查标题段落是两回事。所以 `space_scope` 决定比较哪一批段落
+    （默认 body）。**未设置 spacing 的段落按继承处理**：Word 里没写 before/after
+    就是 0 磅，所以要求"段前 0 磅"时它是达标的，而要求 12 磅时它不达标。
+    """
+    if "FORMAT-007" not in ridset:
+        return []
+    before = (spec or {}).get("space_before_pt")
+    after = (spec or {}).get("space_after_pt")
+    if before is None and after is None:
+        return []
+    scope = (spec or {}).get("space_scope") or "body"
+    if scope == "heading":
+        pool = [p for p in paras if not p.get("in_table") and _is_heading(p, spec)]
+    else:
+        pool = body
+    if not pool:
+        return []
+
+    def got_pt(p, key):
+        v = p.get(key)
+        return 0.0 if v is None else v / 20.0     # 缇 → 磅；未设置 = 0
+
+    fields = []
+    if before is not None:
+        fields.append(("spacing_before", before, "段前"))
+    if after is not None:
+        fields.append(("spacing_after", after, "段后"))
+
+    bad, details = [], []
+    for key, want, label in fields:
+        wrong = [p for p in pool if abs(got_pt(p, key) - want) > 0.5]
+        if wrong:
+            bad.extend(wrong)
+            actual = "、".join(f"{got_pt(p, key):g}磅" for p in wrong[:3])
+            details.append(f"{label}要求 {want} 磅，{len(wrong)}/{len(pool)} 段不符（如 {actual}）")
+    if not bad:
+        return []
+    p0 = bad[0]
+    scope_cn = "标题段" if scope == "heading" else "正文段"
+    return [_issue(
+        "FORMAT-007", _quote(p0), f"第 {paras.index(p0) + 1} 段（docx）",
+        f"{scope_cn}段落间距不符合要求：{'；'.join(details)}。"
+        f"示例段实际 before={p0.get('spacing_before')} after={p0.get('spacing_after')}（缇）",
+        "docx_format:paraspace",
+        )]
+
+
+def _para_heading_level(p):
+    """段落对应的标题级别（1 基）。只有真正的标题样式/大纲级别才算。
+
+    为什么不用"黑体+大字号"猜：那是视觉特征，不是层级信息。
+    猜出来的层级一旦进了 FORMAT-005，报告的"第几级标题格式不对"就无法核对。
+    """
+    st = p.get("pstyle")
+    if st in _heading_style_set() and st[-1].isdigit():
+        return int(st[-1])
+    if p.get("outline_lvl") is not None:
+        try:
+            return int(p["outline_lvl"]) + 1
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _check_heading_levels(paras, non_tbl, rules):
+    """逐级标题格式：一级黑体三号、二级黑体四号……
+
+    只判**显式设置**的字体/字号。原因：标题字体通常定义在 Word 的 Heading 样式里，
+    而 `docx_extract` 只看 run 级 rPr，读不到样式定义；把"读不到"当成"不符合"，
+    结果是每一份正常文档都被报一遍——误报会让整份清单失去可信度。
+    """
+    if not rules:
+        return []
+    by_level = {}
+    for p in non_tbl:
+        lv = _para_heading_level(p)
+        if lv:
+            by_level.setdefault(lv, []).append(p)
+
+    issues = []
+    for rule in rules:
+        lv = rule["level"]
+        pool = by_level.get(lv) or []
+        if not pool:
+            continue                    # 文档里没有这一级标题：不是格式错误
+        fonts = rule.get("font_east") or []
+        want_sz = rule.get("size_halfpt")
+        bad, why = [], []
+        for p in pool:
+            east = p.get("east_set") or set()
+            szs = p.get("sz_set") or set()
+            if fonts and east and not (east & set(fonts)):
+                bad.append(p)
+                why.append(f"字体 {'/'.join(sorted(east))}")
+                continue
+            if want_sz and szs and want_sz not in szs:
+                bad.append(p)
+                why.append(f"字号 {_fmt_sz(max(szs))}")
+        if not bad:
+            continue
+        want = []
+        if fonts:
+            want.append("字体 " + "/".join(fonts))
+        if want_sz:
+            want.append("字号 " + _fmt_sz(want_sz))
+        p0 = bad[0]
+        issues.append(_issue(
+            "FORMAT-005", _quote(p0), f"第 {paras.index(p0) + 1} 段（docx）",
+            f"{lv} 级标题 {len(bad)}/{len(pool)} 段格式不符合要求"
+            f"（要求 {'、'.join(want)}）：示例段实际 {why[0]}",
+            "docx_format:headinglevel", 0.9))
+    return issues
+
+
 def check_heading(paras, info, ridset, spec=None):
     if "FORMAT-005" not in ridset:
         return []
-    max_level = (spec or {}).get("heading_max_level")
-    if not max_level:                 # 规格没规定标题层级 → 这项不判
-        return []
-    hfont = _heading_font(spec)
     non_tbl = [p for p in paras if not p.get("in_table")]
+    issues = _check_heading_levels(
+        paras, non_tbl, (spec or {}).get("heading_levels") or [])
+
+    max_level = (spec or {}).get("heading_max_level")
+    if not max_level:                 # 规格没规定标题层级 → 这项不判（逐级仍照判）
+        return issues
+    hfont = _heading_font(spec)
     style_levels = sorted({
         int(p["pstyle"][-1]) for p in non_tbl
         if p.get("pstyle") and p["pstyle"] in _heading_style_set()
@@ -291,18 +423,20 @@ def check_heading(paras, info, ridset, spec=None):
         loc = f"第 {paras.index(first_head) + 1} 段（docx）" if first_head else "全文"
         ev = ("未检测到 Word 标题样式（Heading1-3 / 大纲级别）：全文标题仅靠手动字体与字号区分"
               f"（视觉字号 {visual_sizes} 半磅），机器无法确认标题层级是否满足「最多 {max_level} 级」。")
-        return [_issue(
+        issues.append(_issue(
             "FORMAT-005", quote, loc, ev, "docx_format:heading", 0.8,
-            "建议改用标题样式（标题 1/2/3）而不是手动加粗改字体，层级才能被识别与导航")]
+            "建议改用标题样式（标题 1/2/3）而不是手动加粗改字体，层级才能被识别与导航"))
+        return issues
     levels = style_levels or outline_levels
-    # levels 是 0 基（Heading1→0），所以 3 级标题的 max(levels)==2 < 3
-    if max(levels) >= max_level:
+    # levels 是 1 基（Heading1 → 1）。这里必须用 >：允许到 3 级时，
+    # 文档正好有三级标题是**合规**的，写成 >= 会把每一份合规文档都判成超限。
+    if max(levels) > max_level:
         p0 = paras[0] if paras else None
-        return [_issue(
+        issues.append(_issue(
             "FORMAT-005", _quote(p0) if p0 else "（文档首段）", "全文",
-            f"标题层级达 {max(levels) + 1} 级（样式 {levels}），超过规定的最多 {max_level} 级",
-            "docx_format:heading", 0.9)]
-    return []
+            f"标题层级达 {max(levels)} 级（样式 {levels}），超过规定的最多 {max_level} 级",
+            "docx_format:heading", 0.9))
+    return issues
 
 
 def _heading_style_set():
@@ -380,6 +514,7 @@ def run_all(info, ridset, spec=None):
     issues += check_size(paras, body, info, ridset, spec)
     issues += check_indent(paras, body, ridset, spec)
     issues += check_spacing(paras, body, info, ridset, spec)
+    issues += check_para_space(paras, body, ridset, spec)
     issues += check_heading(paras, info, ridset, spec)
     issues += check_figref(paras, text, ridset, spec)
     return issues

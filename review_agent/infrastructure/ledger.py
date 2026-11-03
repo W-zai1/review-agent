@@ -261,7 +261,8 @@ def tombstone(path: Path | str, target_seq: int, *,
         if target not in seqs:
             raise LedgerError(
                 f"墓碑指向不存在的序号 {target}（台账现有 {len(seqs)} 条报告记录）")
-        if any(int(t.get("target_seq", -1)) == target for t in tombstones(records)):
+        latest = _latest_marker(records, target)
+        if latest is not None and latest.get("op") == "delete":
             raise LedgerError(f"seq {target} 已有墓碑，重复删除不该再追加一次")
         record = {
             "op": "delete",
@@ -277,6 +278,57 @@ def tombstone(path: Path | str, target_seq: int, *,
     return record
 
 
+def restore(path: Path | str, target_seq: int, *,
+            actor: str = "web", reason: str = "",
+            ts: str | None = None,
+            timeout: float = DEFAULT_LOCK_TIMEOUT) -> dict[str, Any]:
+    """追加一条恢复事件，不改链上任何报告记录。
+
+    删除与恢复都必须是**追加事件**：恢复报告时如果删掉墓碑，原先的删除痕迹
+    就消失了；如果重写台账，后续整条链都会失去校验意义。最新事件决定当前
+    状态，因此“删除 → 恢复 → 再删除”仍然可以完整审计。
+    """
+    path = Path(path)
+    target = int(target_seq)
+    with ledger_lock(path.parent, timeout=timeout):
+        records = read_records(path)
+        seqs = {r.get("seq") for r in report_records(records)}
+        if target not in seqs:
+            raise LedgerError(
+                f"恢复事件指向不存在的序号 {target}（台账现有 {len(seqs)} 条报告记录）")
+        latest = _latest_marker(records, target)
+        if latest is None or latest.get("op") != "delete":
+            raise LedgerError(f"seq {target} 当前不在删除状态，不能恢复")
+        record = {
+            "op": "restore",
+            "target_seq": target,
+            "actor": str(actor or "web"),
+            "reason": str(reason or ""),
+            "ts": ts or now_iso(),
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return record
+
+
+def _latest_marker(records: Sequence[Mapping[str, Any]],
+                   target_seq: int) -> Mapping[str, Any] | None:
+    """返回目标报告最新的删除/恢复事件；历史原位墓碑也算初始删除。"""
+    latest: Mapping[str, Any] | None = None
+    for rec in records:
+        if is_tombstone(rec):
+            target = int(rec.get("target_seq") or -1)
+        elif rec.get("op") == "delete":
+            target = int(rec.get("seq") or -1)
+        else:
+            continue
+        if target == int(target_seq):
+            latest = rec
+    return latest
+
+
 # ---------------------------------------------------------------------------
 # 校验
 # ---------------------------------------------------------------------------
@@ -289,17 +341,28 @@ def verify(path: Path | str) -> tuple[bool, str, dict[str, Any]]:
     """
     path = Path(path)
     stats: dict[str, Any] = {"records": 0, "tombstones": 0,
-                             "legacy_tombstones": 0, "deleted": []}
+                             "legacy_tombstones": 0, "restores": 0,
+                             "events": 0, "deleted": [], "restored": []}
     if not path.exists():
         return False, "ledger 不存在", stats
     records = read_records(path)
     prev = "0" * 64
     expected_seq = 1
-    marks: list[int] = []
+    states: dict[int, str] = {}
     for rec in records:
         if is_tombstone(rec):
-            stats["tombstones"] += 1
-            marks.append(int(rec.get("target_seq") or -1))
+            op = rec.get("op")
+            if op not in ("delete", "restore"):
+                return (False, f"未知台账事件 {op!r}", stats)
+            target = int(rec.get("target_seq") or -1)
+            if op == "delete":
+                stats["tombstones"] += 1
+            else:
+                if states.get(target) != "delete":
+                    return (False, f"恢复事件没有对应的删除记录 @seq{target}", stats)
+                stats["restores"] += 1
+            states[target] = op
+            stats["events"] += 1
             continue
         seq = rec.get("seq")
         if seq != expected_seq:
@@ -308,20 +371,24 @@ def verify(path: Path | str) -> tuple[bool, str, dict[str, Any]]:
             return (False, f"链条断裂 @seq{seq}: prev_hash 不匹配", stats)
         if rec.get("op") == "delete":
             stats["legacy_tombstones"] += 1
-            stats["deleted"].append(seq)
+            states[int(seq)] = "delete"
         prev = str(rec.get("report_hash") or "")
         expected_seq += 1
     stats["records"] = expected_seq - 1
-    for target in marks:
+    for target in states:
         if not 1 <= target <= stats["records"]:
-            return (False, f"墓碑指向不存在的序号 {target}", stats)
-        stats["deleted"].append(target)
-    stats["deleted"] = sorted(set(stats["deleted"]))
+            return (False, f"删除/恢复事件指向不存在的序号 {target}", stats)
+    stats["deleted"] = sorted(seq for seq, op in states.items() if op == "delete")
+    stats["restored"] = sorted(seq for seq, op in states.items() if op == "restore")
     message = f"ledger 校验通过，共 {stats['records']} 条记录"
-    marks_total = stats["tombstones"] + stats["legacy_tombstones"]
+    marks_total = (stats["tombstones"] + stats["legacy_tombstones"]
+                   + stats["restores"])
     if marks_total:
-        # 两种墓碑都要报出来：只报独立行会让"原位墓碑 63 条"看起来像没删过东西
-        message += f"（含 {marks_total} 条墓碑）"
+        if stats["restores"]:
+            message += f"（含 {marks_total} 条删除/恢复事件）"
+        else:
+            # 两种墓碑都要报出来：只报独立行会让"原位墓碑 63 条"看起来像没删过东西
+            message += f"（含 {marks_total} 条墓碑）"
     return True, message + "，链完整", stats
 
 
@@ -355,6 +422,10 @@ def entries_for_api(path: Path | str) -> dict[str, Any]:
                 broken_at = expected_seq
         seq = rec.get("seq")
         mark = applied.get(int(seq)) if isinstance(seq, int) else None
+        legacy = rec.get("op") == "delete"
+        latest = mark or (rec if legacy else None)
+        deleted = bool(latest) and latest.get("op") == "delete"
+        restored = bool(mark) and mark.get("op") == "restore"
         entries.append({
             "seq": seq,
             "review_id": rec.get("review_id"),
@@ -364,12 +435,17 @@ def entries_for_api(path: Path | str) -> dict[str, Any]:
             "prev_hash_short": (rec.get("prev_hash") or "")[:12],
             "ts": rec.get("ts", ""),
             "ok": row_ok,
-            # 两种墓碑都归一到 deleted：旧版原位（行内 op=delete）+ 新版独立行
-            "op": "delete" if (mark or rec.get("op") == "delete") else "report",
-            "deleted": bool(mark) or rec.get("op") == "delete",
-            "deleted_at": (mark or {}).get("ts") or rec.get("deleted_at"),
-            "delete_reason": (mark or {}).get("reason") or rec.get("delete_reason"),
-            "legacy_tombstone": rec.get("op") == "delete" and not mark,
+            # 最新事件决定当前状态；历史原位墓碑作为没有独立事件时的初始状态。
+            "op": (latest or {}).get("op") or "report",
+            "deleted": deleted,
+            "restored": restored,
+            "deleted_at": ((mark or {}).get("ts") if mark
+                           else rec.get("deleted_at")) if deleted else None,
+            "delete_reason": ((mark or {}).get("reason") if mark
+                              else rec.get("delete_reason")) if deleted else None,
+            "restored_at": mark.get("ts") if restored else None,
+            "restore_reason": mark.get("reason") if restored else None,
+            "legacy_tombstone": legacy and not mark,
         })
         prev = str(rec.get("report_hash") or "")
         expected_seq += 1

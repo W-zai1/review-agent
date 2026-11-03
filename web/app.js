@@ -44,8 +44,8 @@ const state = {
   agent: "auto",
   scenarios: [],
   scenario: "",
-  formatSpecs: [],
-  formatSpec: "",
+  // 本次手填的格式要求（check 块）。只对本次生效，不落盘、不进配置库。
+  formatCustom: null,
   llm: null,
   llmHistory: [],
   backendDown: false,
@@ -58,6 +58,24 @@ const state = {
   pollBusy: false,
   tab: "review",
   purposeFiles: [],
+  historyQuery: "",
+  historyVerdict: "all",
+  historyLimit: 60,
+  historySelected: new Set(),
+  historyBatchBusy: false,
+  // 历史页右栏正在预览的报告（只是"看记录"，与 currentReport = 控制台正文）分开存：
+  // 混成一个字段会让"预览"变成"打开"，用户没点「在审查控制台打开」就被换了正文。
+  historyPreviewId: null,
+  historyPreview: null,
+  trash: [],
+};
+
+const PAGE_META = {
+  review: ["审查工作台", "Review Governance"],
+  history: ["历史报告", "Report Archive"],
+  rules: ["规则与学习", "Policy Studio"],
+  logs: ["审计轨迹", "Audit Trail"],
+  ledger: ["可信链校验", "Integrity Ledger"],
 };
 
 /* ---------------- 基础工具 ---------------- */
@@ -116,12 +134,31 @@ function markBackendDown(path) {
 }
 
 let toastTimer = null;
-function toast(message, isError) {
+function toast(message, isError, action) {
   const el = $("#toast");
-  el.textContent = message;
+  el.replaceChildren();
   el.className = "toast" + (isError ? " err" : "");
+  const text = document.createElement("span");
+  text.className = "toast-message";
+  text.textContent = message;
+  el.appendChild(text);
+  if (action && action.label && typeof action.onClick === "function") {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-action";
+    btn.textContent = action.label;
+    btn.addEventListener("click", async () => {
+      el.classList.add("hidden");
+      clearTimeout(toastTimer);
+      await action.onClick();
+    }, { once: true });
+    el.appendChild(btn);
+  }
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add("hidden"), 3600);
+  toastTimer = setTimeout(
+    () => el.classList.add("hidden"),
+    action ? (action.ttl || 8000) : 3600
+  );
 }
 
 function fmtBytes(size) {
@@ -162,15 +199,25 @@ function basename(path) {
 
 /* ---------------- Tab 切换 ---------------- */
 function switchTab(name) {
+  const changed = state.tab !== name;
   state.tab = name;
-  $$(".nav-tab").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
+  $$(".nav-tab").forEach((btn) => {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", String(active));
+  });
   $$(".page").forEach((page) => page.classList.toggle("active", page.id === `page-${name}`));
+  const meta = PAGE_META[name] || PAGE_META.review;
+  if ($("#pageTitle")) $("#pageTitle").textContent = meta[0];
+  document.title = `${meta[0]} · Review Workspace`;
   if (location.hash !== `#${name}`) {
     history.replaceState(null, "", `#${name}`);
   }
+  if (changed) window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   if (name === "logs") loadLogs(state.currentLog);
   if (name === "ledger") loadIntegrity();
   if (name === "rules") loadRules();
+  if (name === "history") enterHistoryPage();
 }
 
 function switchLog(name) {
@@ -181,50 +228,262 @@ function switchLog(name) {
 }
 
 /* ---------------- 待审对象 / 上传 ---------------- */
+function usableTargets() {
+  return state.targets.filter((t) => t.reviewable !== false);
+}
+
+/** 待审对象下拉的占位文案：没选中时显示它，并把可审数量报出来。 */
+function targetPlaceholder() {
+  const n = usableTargets().length;
+  if (!state.targets.length) return "暂无文件";
+  return n ? `请选择待审对象（${n} 个可审）` : "暂无可用待审对象";
+}
+
+/**
+ * 渲染待审对象列表（自定义下拉，不是原生 select）。
+ *
+ * 为什么不用 select：原生 `<option>` 里放不下按钮，而待审列表里堆的大多是
+ * 一次性上传物（测试文件、中间产物），必须能在列表里就地删掉，
+ * 否则只能去翻 targets/uploads 目录。
+ *
+ * 所有待审文件都可删除；机读标注仍保留「不可审」标签，但不再用锁挡住清理。
+ */
+function renderTargetMenu() {
+  const menu = $("#targetMenu");
+  if (!menu) return;
+  if (!state.targets.length) {
+    menu.innerHTML = '<div class="target-empty">还没有任何待审文件，先上传一份</div>';
+    return;
+  }
+  menu.innerHTML = state.targets.map((t) => {
+    const active = !!(state.selected && state.selected.rel === t.rel);
+    const locked = t.reviewable === false;
+    const tags = [
+      t.uploaded ? '<span class="target-tag">上传</span>' : "",
+      locked ? '<span class="target-tag is-lock">标注·不可审</span>' : "",
+    ].join("");
+    const right = `<button type="button" class="target-del" data-del="${esc(t.rel)}"
+                           title="点击即删除（移入回收区，提示条上可撤销）"
+                           aria-label="删除 ${esc(t.name)}">✕</button>`;
+    return `<div class="target-opt${active ? " is-active" : ""}${locked ? " is-locked" : ""}"
+                 role="option" tabindex="-1" aria-selected="${active}"
+                 data-rel="${esc(t.rel)}" title="${esc(t.rel)}">
+      <span class="target-opt-name">${esc(t.name)}${tags}</span>
+      <span class="target-opt-size">${fmtBytes(t.size)}</span>
+      ${right}
+    </div>`;
+  }).join("");
+}
+
 async function loadTargets(preferRel) {
   const data = await api("/api/targets");
   state.targets = data.items || [];
-  const select = $("#targetSelect");
-  select.innerHTML = "";
-  if (!state.targets.length) {
-    select.innerHTML = '<option value="">暂无文件</option>';
-    selectTarget(null);
-    return;
-  }
-  for (const item of state.targets) {
-    const option = document.createElement("option");
-    option.value = item.rel;
-    if (item.reviewable === false) {
-      // 机读标注（*.labels.json）是**标准答案**，不是待审原文：审它会把它写的
-      // 「某处有错」逐条当问题报出来。后端口径一致，这里只是提前说清楚。
-      option.textContent = `［标注·不可审］${item.name} · ${fmtBytes(item.size)}`;
-      option.disabled = true;
-      option.title = "机读标注（ground truth），不是待审原文；请选对应的原文文件";
-    } else {
-      option.textContent = `${item.uploaded ? "[上传] " : ""}${item.name} · ${fmtBytes(item.size)}`;
-    }
-    select.appendChild(option);
-  }
-  // 默认选中：优先「仍然可审的当前选择」→ 第一个可审对象。
+  renderTargetMenu();
+  // 只有两种情况下自动选中：上传后明确指定（preferRel）→ 选中它；
+  // 已经选过且仍然可审 → 保持不变。其余一律停在占位项，等用户自己选。
   // 绝不能直接取 items[0]：那会因字母序把 adversarial_*.labels.json 顶成默认值，
   // 用户以为在审刚上传的简历，实际审的是标注文件。
-  const usable = state.targets.filter((t) => t.reviewable !== false);
+  const usable = usableTargets();
   const keep = state.selected && usable.some((t) => t.rel === state.selected.rel)
     ? state.selected.rel
     : null;
   const rel = preferRel && usable.some((t) => t.rel === preferRel)
     ? preferRel
-    : (keep || (usable[0] ? usable[0].rel : null));
+    : keep;
   selectTarget(rel);
+}
+
+/* ---- 待审对象下拉：开合、选中、就地删除 ---- */
+
+function targetMenuOpen() {
+  const menu = $("#targetMenu");
+  return !!menu && !menu.classList.contains("hidden");
+}
+
+function setTargetMenuOpen(open) {
+  const menu = $("#targetMenu");
+  const btn = $("#targetSelect");
+  if (!menu || !btn) return;
+  menu.classList.toggle("hidden", !open);
+  btn.setAttribute("aria-expanded", String(open));
+  btn.classList.toggle("is-open", open);
+  if (open) {
+    // 打开时把当前选中项滚进视野：列表有几十条，选中的可能在第 20 行
+    const active = menu.querySelector(".target-opt.is-active");
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function initTargetPicker() {
+  const wrap = $("#targetPicker");
+  const btn = $("#targetSelect");
+  const menu = $("#targetMenu");
+  if (!wrap || !btn || !menu) return;
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setTargetMenuOpen(!targetMenuOpen());
+  });
+
+  // 委托绑定：列表每次删除后整体重渲染，逐行绑定会立刻失效
+  menu.addEventListener("click", (e) => {
+    const del = e.target.closest("[data-del]");
+    if (del) {
+      e.stopPropagation();
+      // 点 ✕ 就是删除，不弹二次确认：清理一次性上传物是高频动作，
+      // 每份都拦一道会让"连续删 10 个"变成 20 次点击。
+      // 安全性靠"软删除 + 8 秒撤销"保证，不靠弹窗。
+      deleteTarget(del.dataset.del);
+      return;
+    }
+    const row = e.target.closest("[data-rel]");
+    if (!row) return;
+    const item = state.targets.find((x) => x.rel === row.dataset.rel);
+    if (!item) return;
+    if (item.reviewable === false) {
+      toast("该文件是机读标注（标准答案），不能作为待审对象", true);
+      return;
+    }
+    selectTarget(item.rel);
+    setTargetMenuOpen(false);
+  });
+
+  // 点外面关掉、Esc 关掉：下拉没有遮罩，不收起来会一直挡着下面的设置
+  document.addEventListener("click", (e) => {
+    if (targetMenuOpen() && !wrap.contains(e.target)) setTargetMenuOpen(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && targetMenuOpen()) setTargetMenuOpen(false);
+  });
+}
+
+/**
+ * 删除待审文件：**不弹确认**，点掉就删。
+ *
+ * 原来这里会弹一个确认框，理由是"被历史报告引用过的文件要写清后果"。
+ * 但那个框拦的是高频清理动作（一次清 10 个测试上传物要弹 10 次），
+ * 而真正兜住误删的是两件事：后端是软删除（进 `targets/uploads/.trash/`），
+ * 前端提示条给 8 秒「撤销」。确认框在这两件之上没有增加安全性，只增加点击。
+ * 所以改成：直接删，把"被 N 份报告引用"这个后果搬到提示条上说，不停下来问。
+ */
+async function deleteTarget(rel) {
+  const item = state.targets.find((x) => x.rel === rel) || null;
+  const name = (item && item.name) || basename(rel);
+  // 必须在替换 state.targets 之前算：删完这个 item 就不在列表里了
+  const used = item ? (state.reports || []).filter((r) => reportMatchesTarget(r, item)) : [];
+  let data;
+  try {
+    data = await api(`/api/target?rel=${encodeURIComponent(rel)}`, { method: "DELETE" });
+  } catch (e) {
+    data = { ok: false, error: `删除失败：${e.message || e}` };
+  }
+  if (!data || !data.ok) {
+    toast((data && data.error) || "删除失败", true);
+    return false;
+  }
+  const wasSelected = !!(state.selected && state.selected.rel === rel);
+  state.targets = data.items || [];
+  renderTargetMenu();
+  if (wasSelected) selectTarget(null);       // 被删的就是当前选中项：回到未选择
+  else selectTarget(state.selected ? state.selected.rel : null);
+  setTargetMenuOpen(true);                   // 连续清理：删完不收起列表
+  const msg = used.length
+    ? `已删除 ${name} · ${used.length} 份报告引用它，原文定位将失效`
+    : `已删除 ${name}`;
+  toast(msg, false, {
+    label: "撤销",
+    ttl: used.length ? 12000 : 8000,         // 被引用过的多给一点时间反悔
+    onClick: () => restoreTarget(data.trashed),
+  });
+  return true;
+}
+
+async function restoreTarget(trashed) {
+  if (!trashed) return;
+  let data;
+  try {
+    data = await api("/api/target/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trashed }),
+    });
+  } catch (e) {
+    data = { ok: false, error: `撤销失败：${e.message || e}` };
+  }
+  if (!data || !data.ok) {
+    toast((data && data.error) || "撤销失败", true);
+    return;
+  }
+  state.targets = data.items || [];
+  selectTarget(state.selected ? state.selected.rel : null);
+  toast(`已恢复 ${data.name || ""}`.trim());
 }
 
 function selectTarget(rel) {
   const item = state.targets.find((x) => x.rel === rel) || null;
   state.selected = item;
-  const select = $("#targetSelect");
-  if (select && item) select.value = item.rel;
+  // rel 为空必须把按钮文案也拉回占位：只改 state 不改控件，界面显示 A、实际没选，
+  // 右侧文件卡和「开始审查」按钮的状态就全对不上了。
+  const text = $("#targetTriggerText");
+  if (text) text.textContent = item ? item.name : targetPlaceholder();
+  renderTargetMenu();
   renderFileChip();
+  renderWorkspaceContext();
   updateRunState();
+}
+
+function normalizeTargetPath(value) {
+  const raw = String(value || "").replace(/\\/g, "/");
+  const marker = "/targets/";
+  const at = raw.lastIndexOf(marker);
+  if (at >= 0) return raw.slice(at + 1);
+  if (raw.startsWith("targets/")) return raw;
+  return raw.replace(/^\.?\//, "");
+}
+
+function reportTargetPath(report) {
+  return String(
+    (report && report.target_path)
+    || (report && report.target && report.target.path)
+    || ""
+  );
+}
+
+function reportTimestamp(report) {
+  return String(
+    (report && report.timestamp)
+    || (report && report.generated_at)
+    || ""
+  );
+}
+
+function reportMatchesTarget(report, target) {
+  if (!report || !target) return false;
+  return normalizeTargetPath(reportTargetPath(report)) === normalizeTargetPath(target.rel);
+}
+
+function renderWorkspaceContext() {
+  const badge = $("#workspaceContext");
+  if (!badge) return;
+  const report = state.currentReport;
+  const target = state.selected;
+  badge.classList.remove("is-draft", "is-linked");
+  if (report && target && reportMatchesTarget(report, target)) {
+    badge.textContent = "当前报告与所选文件一致";
+    badge.classList.add("is-linked");
+    return;
+  }
+  if (report) {
+    const reportFile = report.target_name
+      || basename(reportTargetPath(report))
+      || "历史报告";
+    badge.textContent = target
+      ? `新审查草稿 · 下方报告来自 ${reportFile}`
+      : `正在查看历史报告 · ${reportFile}`;
+    badge.classList.add("is-draft");
+    return;
+  }
+  badge.textContent = target ? "等待发起新审查" : "尚未选择待审文件";
 }
 
 function renderFileChip() {
@@ -354,8 +613,31 @@ async function loadReports() {
   updateHistoryHead();
   renderHistory();
   populateLogSelect();
-  if (!state.currentReport && state.reports.length) {
-    await selectReport(state.reports[0].id, false);
+  // 预览的那份被别处删掉了：右栏不能还挂着它的记录（点开控制台会 404）
+  if (state.historyPreviewId
+      && !state.reports.some((r) => r.id === state.historyPreviewId)) {
+    clearHistoryPreview();
+  }
+  // 人就在历史页、右栏又是空的：顺手补上最新一份，别留一块空白让人以为坏了
+  if (!state.historyPreviewId && state.tab === "history" && state.reports.length) {
+    previewHistory(state.reports[0].id);
+  }
+  // 这里**故意不自动打开最新一份报告**：进入系统看到的应该是"可以开始做什么"，
+  // 不是上一次的结论。历史报告在「历史报告」页里，点一下就能看。
+  // （以前这里会 selectReport(reports[0])，导致每次进站都顶着上一份审查结果。）
+}
+
+/** 侧栏入口上的总量与构成（只看三个数，点进去才是列表）。 */
+function updateSidebarQuick() {
+  const count = $("#quickReportCount");
+  if (!count) return;
+  count.textContent = String(state.reports.length);
+  const sub = $("#quickReportSub");
+  if (sub) {
+    const failed = state.reports.filter((r) => r.verdict === "fail").length;
+    sub.textContent = state.reports.length
+      ? `未通过 ${failed} · 收藏 ${favCount()}`
+      : "还没有报告";
   }
 }
 
@@ -375,7 +657,7 @@ async function refreshReports(opts) {
   const btn = $("#historyRefresh");
   if (btn) btn.classList.add("busy");
   try {
-    await loadReports();
+    await Promise.all([loadReports(), loadTrash()]);
   } finally {
     if (btn) btn.classList.remove("busy");
   }
@@ -399,8 +681,8 @@ function statsPills(item) {
   return pills.join("");
 }
 
-/* 删除二次确认的待删 ID */
-let pendingDeleteId = null;
+/* 彻底删除确认：软删除直接执行，只有不可恢复动作进入这里。 */
+let pendingConfirmAction = null;
 
 /* 收藏视图：只看 ★ 的报告。纯前端筛选，服务端只负责记"哪些被收藏"。 */
 let favoritesOnly = false;
@@ -409,17 +691,90 @@ function favCount() {
   return state.reports.filter((r) => r.favorite).length;
 }
 
+function filteredHistoryItems() {
+  const query = String(state.historyQuery || "").trim().toLowerCase();
+  return state.reports.filter((r) => {
+    if (favoritesOnly && !r.favorite) return false;
+    if (state.historyVerdict !== "all" && r.verdict !== state.historyVerdict) return false;
+    if (!query) return true;
+    return [r.id, r.target_name, r.target_path, r.verdict, r.review_mode]
+      .some((value) => String(value || "").toLowerCase().includes(query));
+  });
+}
+
+function visibleHistoryItems() {
+  return filteredHistoryItems().slice(0, state.historyLimit);
+}
+
+function selectedHistoryIds() {
+  const visible = new Set(filteredHistoryItems().map((item) => item.id));
+  return Array.from(state.historySelected).filter((id) => visible.has(id));
+}
+
+function updateHistoryBatchControls() {
+  const ids = selectedHistoryIds();
+  const visible = visibleHistoryItems().map((item) => item.id);
+  const selectedVisible = visible.filter((id) => state.historySelected.has(id));
+  const selectAll = $("#historySelectAll");
+  if (selectAll) {
+    selectAll.disabled = !visible.length || state.historyBatchBusy;
+    selectAll.checked = !!visible.length && selectedVisible.length === visible.length;
+    selectAll.indeterminate = selectedVisible.length > 0
+      && selectedVisible.length < visible.length;
+  }
+  const count = $("#historySelectionCount");
+  if (count) count.textContent = `已选 ${ids.length}`;
+  ["historyBatchFavorite", "historyBatchUnfavorite", "historyBatchDelete"]
+    .forEach((id) => {
+      const btn = $(`#${id}`);
+      if (btn) btn.disabled = !ids.length || state.historyBatchBusy;
+    });
+}
+
+function pruneHistorySelection() {
+  const allowed = new Set(filteredHistoryItems().map((item) => item.id));
+  for (const id of Array.from(state.historySelected)) {
+    if (!allowed.has(id)) state.historySelected.delete(id);
+  }
+}
+
+/**
+ * 进入历史报告页。
+ *
+ * 右栏没有预览时自动显示最新一份的**记录摘要**（不是正文）——
+ * 这个页面本来就是翻旧报告用的，一进来空着等于每次都要多点一下。
+ * 已经预览过就重画一次（版本/哈希/校验状态可能变了），不重新请求接口。
+ * 全程不碰 `state.currentReport`：控制台里正在看的正文不因"翻档案"而被换掉。
+ */
+function enterHistoryPage() {
+  if (!state.reports.length) {
+    renderHistoryDetailEmpty("还没有历史报告", "跑一次审查后，报告会出现在这里。");
+    return;
+  }
+  if (!state.historyPreviewId) {
+    previewHistory(state.reports[0].id);
+  } else if (state.historyPreview) {
+    renderHistoryDetail(state.historyPreview);
+  }
+}
+
 /** 同步标题与 ⭐ 按钮的文案 / 按下态（列表变动后都要调）。 */
 function updateHistoryHead() {
+  updateSidebarQuick();
   const n = favCount();
+  const shown = filteredHistoryItems().length;
   const title = $("#historyTitle");
   if (title) {
-    title.textContent = favoritesOnly
-      ? `收藏（${n}）`
-      : `历史报告（${state.reports.length}）`;
+    const base = favoritesOnly ? `收藏（${n}）` : `历史报告（${state.reports.length}）`;
+    const filtering = !!String(state.historyQuery || "").trim()
+      || state.historyVerdict !== "all";
+    title.textContent = filtering ? `${base} · 筛选 ${shown}` : base;
   }
   const btn = $("#historyFavFilter");
-  if (!btn) return;
+  if (!btn) {
+    updateHistoryBatchControls();
+    return;
+  }
   // 标题已经写了"收藏（N）"，按钮就不再重复一遍数量，而是给"回到全部"的出路
   btn.textContent = favoritesOnly
     ? `← 全部（${state.reports.length}）`
@@ -429,27 +784,41 @@ function updateHistoryHead() {
   btn.title = favoritesOnly
     ? "当前只显示收藏，点一下回到全部报告"
     : "只看收藏过的报告；再点一次回到全部";
+  updateHistoryBatchControls();
 }
 
 function renderHistory() {
   const list = $("#historyList");
-  const shown = favoritesOnly
-    ? state.reports.filter((r) => r.favorite)
-    : state.reports;
-  if (!shown.length) {
+  pruneHistorySelection();
+  const filtered = filteredHistoryItems();
+  const shown = filtered.slice(0, state.historyLimit);
+  if (!filtered.length) {
     // 收藏视图为空时不能只说"点行右侧的 ☆"——这个视图里一条行都没有，没星可点
-    list.innerHTML = favoritesOnly
+    const filtering = !!String(state.historyQuery || "").trim()
+      || state.historyVerdict !== "all";
+    list.innerHTML = filtering
+      ? '<div class="history-empty">没有符合条件的报告<br><span class="history-empty-sub">调整关键词或审查结果筛选后再试</span></div>'
+      : favoritesOnly
       ? '<div class="history-empty">还没有收藏的报告<br><span class="history-empty-sub">点「← 全部」回到列表，再点行右侧的 ☆ 收藏</span></div>'
       : '<div class="history-empty">暂无历史报告</div>';
+    updateHistoryBatchControls();
     return;
   }
   list.innerHTML = shown.map((item) => {
     const verdict = VERDICT[item.verdict] || ["—", "verdict-warn", "dot-gray"];
-    const active = state.currentReport && state.currentReport.review_id === item.id;
+    const active = state.historyPreviewId
+      ? state.historyPreviewId === item.id
+      : !!(state.currentReport && state.currentReport.review_id === item.id);
     const fav = !!item.favorite;
-    return `<div class="history-row${active ? " active" : ""}" data-id="${esc(item.id)}">
+    const checked = state.historySelected.has(item.id);
+    return `<div class="history-row${active ? " active" : ""}${checked ? " is-checked" : ""}" data-id="${esc(item.id)}"
+      title="单击：在右侧看这份报告的记录；双击：直接进审查控制台看全文">
+      <label class="history-check" title="选择 ${esc(item.id)}">
+        <input type="checkbox" data-pick="${esc(item.id)}"
+               aria-label="选择报告 ${esc(item.id)}" ${checked ? "checked" : ""}>
+      </label>
       <div class="history-main">
-        <div class="history-id"><span class="status-dot ${verdict[2]}"></span>${esc(item.id)}</div>
+        <div class="history-id"><span class="status-dot ${verdict[2]}" title="${esc(verdict[0])}"></span>${esc(item.id)}</div>
         <div class="history-file">${esc(item.target_name || basename(item.target_path))} · ${relTime(item.timestamp)}</div>
         <div class="history-stats">${statsPills(item)}</div>
       </div>
@@ -457,10 +826,15 @@ function renderHistory() {
               aria-pressed="${fav ? "true" : "false"}"
               title="${fav ? "取消收藏" : "收藏这份报告（之后可在「★ 收藏」里快速找到）"}"
               aria-label="${fav ? "取消收藏" : "收藏"} ${esc(item.id)}">${fav ? "★" : "☆"}</button>
-      <button type="button" class="history-del" data-del="${esc(item.id)}" title="删除该报告" aria-label="删除 ${esc(item.id)}">🗑</button>
+      <button type="button" class="history-del" data-del="${esc(item.id)}" title="移入回收站（可撤销）" aria-label="将 ${esc(item.id)} 移入回收站">🗑</button>
     </div>`;
-  }).join("");
+  }).join("") + (filtered.length > shown.length
+    ? `<button type="button" class="history-more" data-history-more="1">
+         再显示 ${Math.min(60, filtered.length - shown.length)} 条 · 剩余 ${filtered.length - shown.length} 条
+       </button>`
+    : "");
   bindHistoryEvents();
+  updateHistoryBatchControls();
 }
 
 function bindHistoryEvents() {
@@ -468,9 +842,29 @@ function bindHistoryEvents() {
   list.querySelectorAll(".history-row").forEach((row) => {
     row.addEventListener("click", (e) => {
       // 星标和删除是行内按钮：不先排除会把"收藏"变成"打开报告"
-      if (e.target.closest(".history-del") || e.target.closest(".history-fav")) return;
-      selectReport(row.dataset.id, false);
+      if (e.target.closest(".history-del") || e.target.closest(".history-fav")
+          || e.target.closest(".history-check")) return;
+      previewHistory(row.dataset.id);
     });
+    // 双击 = 直接进控制台。单击只换右栏记录，不动正文——
+    // 这两件事差一个"我真的要看全文"的动作，混在一起会让人在翻档案时被换掉正文。
+    row.addEventListener("dblclick", (e) => {
+      if (e.target.closest(".history-del") || e.target.closest(".history-fav")
+          || e.target.closest(".history-check")) return;
+      openReportInConsole(row.dataset.id);
+    });
+  });
+  list.querySelectorAll("[data-pick]").forEach((box) => {
+    box.addEventListener("change", (e) => {
+      e.stopPropagation();
+      const id = box.dataset.pick;
+      if (box.checked) state.historySelected.add(id);
+      else state.historySelected.delete(id);
+      const row = box.closest(".history-row");
+      if (row) row.classList.toggle("is-checked", box.checked);
+      updateHistoryBatchControls();
+    });
+    box.addEventListener("click", (e) => e.stopPropagation());
   });
   list.querySelectorAll(".history-fav").forEach((btn) => {
     btn.addEventListener("click", (e) => {
@@ -479,12 +873,274 @@ function bindHistoryEvents() {
     });
   });
   list.querySelectorAll(".history-del").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      askDeleteReport(btn.dataset.del);
+      btn.disabled = true;
+      try {
+        await trashReport(btn.dataset.del);
+      } finally {
+        btn.disabled = false;
+      }
     });
   });
+  const more = list.querySelector("[data-history-more]");
+  if (more) {
+    more.addEventListener("click", () => {
+      state.historyLimit += 60;
+      renderHistory();
+      updateHistoryHead();
+    });
+  }
 }
+
+/* ---------------- 历史报告：右栏「记录摘要」 ---------------- */
+
+const HD_EMPTY_SUB =
+  "点左侧任一条：这里显示结论、待审对象、判定依据版本与审计哈希。" +
+  "要读原文标注和完整问题清单，再点「在审查控制台打开」。";
+
+function renderHistoryDetailEmpty(title, sub) {
+  const empty = $("#historyDetailEmpty");
+  const body = $("#historyDetailBody");
+  if (!empty || !body) return;
+  const t = empty.querySelector(".hd-empty-title");
+  if (t) t.textContent = title || "还没有选择报告";
+  const s = empty.querySelector(".hd-empty-sub");
+  if (s) s.textContent = sub == null ? HD_EMPTY_SUB : sub;
+  empty.classList.remove("hidden");
+  body.classList.add("hidden");
+  body.innerHTML = "";
+}
+
+function clearHistoryPreview() {
+  const had = !!state.historyPreviewId;
+  state.historyPreviewId = null;
+  state.historyPreview = null;
+  renderHistoryDetailEmpty(null, null);
+  if (had) renderHistory();
+}
+
+/**
+ * 在右栏预览一份报告的**记录**（不是正文）。
+ *
+ * 只有真的显示出来了才改 state.historyPreviewId 对应的高亮——接口失败时
+ * 左边那行亮着、右边一片空白，等于骗用户"已选中"。
+ */
+async function previewHistory(id) {
+  if (!id) return;
+  const body = $("#historyDetailBody");
+  const empty = $("#historyDetailEmpty");
+  if (!body || !empty) return;
+  state.historyPreviewId = id;
+  renderHistory();
+  empty.classList.add("hidden");
+  body.classList.remove("hidden");
+  body.innerHTML = '<div class="hd-loading">正在读取报告记录…</div>';
+  let data;
+  try {
+    data = await api("/api/report?id=" + encodeURIComponent(id));
+  } catch (e) {
+    data = { ok: false, error: `读取报告失败：${e && e.message ? e.message : e}` };
+  }
+  // 连点两条：只认最后一条，先回来的旧响应不能盖掉新选择
+  if (state.historyPreviewId !== id) return;
+  if (!data || !data.ok) {
+    state.historyPreview = null;
+    body.innerHTML = `<div class="hd-error">${esc((data && data.error) || "读取报告失败")}</div>`;
+    return;
+  }
+  state.historyPreview = data.report;
+  renderHistoryDetail(data.report);
+  revealActiveHistoryRow();
+}
+
+/** 从历史页跳进审查控制台看全文（单击只预览，这一步才是"打开"）。 */
+async function openReportInConsole(id) {
+  if (!id) return;
+  await selectReport(id, false);
+  toast(`已在审查控制台打开 ${id}`);
+}
+
+function hdHash(hash, n) {
+  const s = String(hash || "");
+  if (!s) return '<span class="hd-muted">—</span>';
+  const short = s.length > (n || 16) ? `${s.slice(0, n || 16)}…` : s;
+  return `<code class="hd-hash" title="${esc(s)}">${esc(short)}</code>`;
+}
+
+function hdKv(label, value, hint) {
+  return `<div class="hd-kv">
+    <div class="hd-kv-label">${esc(label)}</div>
+    <div class="hd-kv-value"${hint ? ` title="${esc(hint)}"` : ""}>${value}</div>
+  </div>`;
+}
+
+/**
+ * 渲染右栏记录摘要。
+ *
+ * 分工：这里只回答"这份报告是什么、依据什么判的、有没有被动过"，
+ * 逐条问题与原文标注留给控制台——同一份内容两个地方各画一遍，迟早不一致。
+ */
+function renderHistoryDetail(report) {
+  const body = $("#historyDetailBody");
+  const empty = $("#historyDetailEmpty");
+  if (!body || !report) return;
+  const rid = String(report.review_id || "");
+  const verdict = VERDICT[report.verdict] || ["—", "verdict-warn", "dot-gray"];
+  const inc = report.integrity || {};
+  const decision = report.decision || {};
+  const cov = report.coverage || {};
+  const stats = report.stats || {};
+  const issues = Array.isArray(report.issues) ? report.issues : [];
+  const target = report.target || {};
+  const item = state.reports.find((r) => r.id === rid) || {};
+  const favorite = !!item.favorite;
+  const agent = report.agent || {};
+  const laws = report.law_library || {};
+  const purpose = report.purpose || null;
+  const integrity = state.integrity || {};
+  const checked = ((integrity.reports || []).find((r) => r.id === rid)) || null;
+  const node = ((integrity.entries || []).find((e) => e.review_id === rid)) || null;
+
+  const targetPath = report.target_path || target.path || "";
+  const targetName = String(targetPath).split("/").pop() || "（未知待审对象）";
+  const when = report.timestamp || report.generated_at || "";
+  const mode = report.review_mode === "rule+llm" ? "规则 + 语义模型" : "纯规则";
+
+  // 完整性：三档分开写。旧版规则 ≠ 篡改，搅在一起用户会以为报告被改过
+  let integrityCls = "warn";
+  let integrityText = "未在审计链中找到这份报告（可能是更早版本的产物）";
+  if (checked) {
+    if (!checked.ok) {
+      integrityCls = "bad";
+      integrityText = `校验失败：${checked.detail || "报告内容与自身哈希不一致"}`;
+    } else if (checked.stale) {
+      integrityCls = "warn";
+      integrityText = `报告自洽，但基于旧版判定依据（规则 ${inc.rules_version || "?"}）——结论可能不再适用，需要时请重审`;
+    } else {
+      integrityCls = "ok";
+      integrityText = "报告自洽，规则版本与当前一致";
+    }
+  }
+
+  const issueRows = issues.slice(0, 4).map((it) => {
+    const dim = DIM_FULL[it.dimension] || it.dimension || "—";
+    const quote = String(it.quote || "").replace(/\s+/g, " ").slice(0, 90);
+    return `<li class="hd-issue">
+      <span class="hd-issue-dim">${esc(dim)}</span>
+      <span class="hd-issue-sev">${esc(it.severity || "")}</span>
+      <span class="hd-issue-text">${esc(quote)}${quote.length >= 90 ? "…" : ""}</span>
+    </li>`;
+  }).join("");
+
+  const reasons = (decision.reasons || []).slice(0, 4)
+    .map((r) => `<li>${esc(r)}</li>`).join("");
+
+  const lawLine = (laws.cited || []).length
+    ? `${(laws.cited || []).length} 条被引用 · ${(laws.skipped || []).length} 条未取到原文`
+    : (laws.available ? "已装载法条库，本次未引用条文" : "未装载法条库");
+
+  const limits = (report.limitations || []);
+  const limitList = limits.slice(0, 6).map((t) => `<li>${esc(t)}</li>`).join("");
+
+  body.innerHTML = `
+    <div class="hd-head">
+      <div class="hd-head-main">
+        <div class="hd-kicker">报告记录 · ${esc(report.engine || "architecture-v1")}</div>
+        <div class="hd-title-row">
+          <span class="verdict-chip ${verdict[1]}"><span class="status-dot ${verdict[2]}"></span>${esc(verdict[0])}</span>
+          <h2 class="hd-title">${esc(rid)}</h2>
+        </div>
+        <div class="hd-sub">${esc(targetName)} · ${esc(relTime(when))}</div>
+      </div>
+      <div class="hd-actions">
+        <button type="button" class="btn btn-primary hd-open" data-open-console="${esc(rid)}"
+                title="切到审查控制台，读原文标注与完整问题清单">在审查控制台打开 →</button>
+        <button type="button" class="hd-btn${favorite ? " on" : ""}" data-hd-fav="${esc(rid)}"
+                aria-pressed="${favorite ? "true" : "false"}">${favorite ? "★ 已收藏" : "☆ 收藏"}</button>
+        <button type="button" class="hd-btn hd-btn-danger" data-hd-trash="${esc(rid)}">移入回收站</button>
+      </div>
+    </div>
+
+    <div class="hd-verdict-note">
+      <b>裁定依据</b>
+      <span>${esc(decision.rationale || "该报告未写入裁定说明")}</span>
+      ${reasons ? `<ul class="hd-reasons">${reasons}</ul>` : ""}
+      ${decision.requires_human_review ? '<div class="hd-flag">需要人工复核</div>' : ""}
+    </div>
+
+    <div class="hd-sec">
+      <div class="hd-sec-title">这份报告在审什么</div>
+      <div class="hd-grid">
+        ${hdKv("待审对象", esc(targetName), targetPath)}
+        ${hdKv("路径", `<code class="hd-path" title="${esc(targetPath)}">${esc(targetPath)}</code>`)}
+        ${hdKv("类型 / 字数", `${esc(report.target_type || target.type || "—")} · ${cov.chars_total || target.chars || "—"} 字`)}
+        ${hdKv("审查方式", esc(mode))}
+        ${hdKv("审查 Agent", `${esc(agent.name || "—")}${agent.version ? ` v${esc(agent.version)}` : ""}`)}
+        ${hdKv("生成时间", esc(when || "—"), when)}
+      </div>
+    </div>
+
+    <div class="hd-sec">
+      <div class="hd-sec-title">判定依据的版本</div>
+      <div class="hd-grid">
+        ${hdKv("规则版本", esc(inc.rules_version || "—"))}
+        ${hdKv("知识库版本", esc(inc.knowledge_version || "—"))}
+        ${hdKv("Agent 版本", esc(inc.agent_version || agent.version || "—"))}
+        ${hdKv("运行编号", esc(report.run_id || "—"))}
+        ${hdKv("法条库", esc(lawLine))}
+        ${hdKv("覆盖范围", `${cov.chars_reviewed || 0} / ${cov.chars_total || 0} 字 · ${cov.text_coverage_pct == null ? "—" : cov.text_coverage_pct + "%"}${cov.complete === false ? "（未覆盖全文）" : ""}`)}
+      </div>
+    </div>
+
+    <div class="hd-sec">
+      <div class="hd-sec-title">这条结论怎么来的</div>
+      <div class="hd-stats-row">
+        ${hdStatChip("blocker", stats.blocker)}
+        ${hdStatChip("major", stats.major)}
+        ${hdStatChip("minor", stats.minor)}
+        ${hdStatChip("nit", stats.nit)}
+        <span class="hd-stat-total">共 ${issues.length} 条问题</span>
+      </div>
+      ${issueRows ? `<ul class="hd-issues">${issueRows}</ul>` : '<div class="hd-muted hd-nolist">这份报告没有列出问题条目</div>'}
+      ${issues.length > 4 ? `<div class="hd-more-hint">还有 ${issues.length - 4} 条，进入审查控制台看完整清单</div>` : ""}
+    </div>
+
+    <div class="hd-sec">
+      <div class="hd-sec-title">有没有被动过</div>
+      <div class="hd-integrity ${integrityCls}">${esc(integrityText)}</div>
+      <div class="hd-grid">
+        ${hdKv("报告哈希", hdHash(inc.report_hash, 24))}
+        ${hdKv("链上位置", node && node.seq ? `seq ${esc(node.seq)}` : '<span class="hd-muted">—</span>')}
+        ${hdKv("前序哈希", hdHash(node ? node.prev_hash : "", 24))}
+        ${hdKv("待审原文哈希", hdHash(inc.target_hash, 24))}
+      </div>
+    </div>
+
+    ${purpose ? `<div class="hd-sec">
+      <div class="hd-sec-title">审查目的</div>
+      <div class="hd-purpose">${esc(
+        typeof purpose === "string" ? purpose
+          : purpose.goal || purpose.text || purpose.summary || JSON.stringify(purpose)
+      )}</div>
+    </div>` : ""}
+
+    ${limits.length ? `<details class="hd-limits">
+      <summary>这份报告的边界（${limits.length} 条）</summary>
+      <ul>${limitList}</ul>
+    </details>` : ""}
+  `;
+
+  body.classList.remove("hidden");
+  if (empty) empty.classList.add("hidden");
+}
+
+function hdStatChip(key, value) {
+  const n = Number(value) || 0;
+  return `<span class="hd-stat hd-stat-${esc(key)}${n ? "" : " is-zero"}">
+    <b>${n}</b>${esc(key)}</span>`;
+}
+
 
 /**
  * 收藏 / 取消收藏一份报告。
@@ -515,6 +1171,7 @@ async function toggleFavorite(btn) {
     return;
   }
   item.favorite = want;
+  if (!want && favoritesOnly) state.historySelected.delete(id);
   // 只重渲染列表（标题计数要跟着变）；滚动位置手动保留，否则翻到中间一点就跳回顶部
   const keep = $("#historyList").scrollTop;
   renderHistory();
@@ -523,51 +1180,337 @@ async function toggleFavorite(btn) {
   toast(want ? `已收藏 ${id}` : `已取消收藏 ${id}`);
 }
 
-/* ---------------- 删除历史报告（二次确认） ---------------- */
-function askDeleteReport(id) {
-  const item = state.reports.find((r) => r.id === id);
-  pendingDeleteId = id;
-  $("#confirmSub").textContent = item
-    ? `${id} · ${item.target_name || basename(item.target_path)} · ${item.issues} 条异议 · ${item.review_mode || "-"}`
-    : id;
-  $("#confirmOk").disabled = false;
-  $("#confirmModal").classList.remove("hidden");
-}
-
-function closeConfirm() {
-  pendingDeleteId = null;
-  $("#confirmModal").classList.add("hidden");
-}
-
-async function confirmDeleteReport() {
-  const id = pendingDeleteId;
-  if (!id) return;
-  const btn = $("#confirmOk");
-  btn.disabled = true;
-  // 服务端同样要求 confirm=id，UI 的二次确认不是唯一防线
-  const data = await api("/api/report?id=" + encodeURIComponent(id), {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirm: id }),
-  });
-  btn.disabled = false;
-  if (!data.ok) {
-    if (data.need_confirm) {
-      closeConfirm();
-      toast(data.error || "需要二次确认", true);
-      return;
-    }
-    toast(data.error || "删除失败", true);
+async function setHistoryFavorites(ids, want) {
+  ids = Array.from(new Set(ids || []));
+  if (!ids.length || state.historyBatchBusy) return;
+  state.historyBatchBusy = true;
+  updateHistoryBatchControls();
+  let data;
+  try {
+    data = await api("/api/reports/favorites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, favorite: want }),
+    });
+  } catch (e) {
+    data = { ok: false, error: `批量收藏失败：${e.message || e}` };
+  } finally {
+    state.historyBatchBusy = false;
+  }
+  if (!data || !data.ok) {
+    updateHistoryBatchControls();
+    toast((data && data.error) || "批量收藏失败", true);
     return;
   }
-  closeConfirm();
+  const chosen = new Set(ids);
+  state.reports.forEach((item) => {
+    if (chosen.has(item.id)) item.favorite = want;
+  });
+  const keep = $("#historyList").scrollTop;
+  renderHistory();
+  $("#historyList").scrollTop = keep;
+  updateHistoryHead();
+  toast(want ? `已收藏 ${ids.length} 份报告` : `已取消收藏 ${ids.length} 份报告`);
+}
+
+function askDeleteSelectedReports() {
+  const ids = selectedHistoryIds();
+  if (!ids.length || state.historyBatchBusy) return;
+  openConfirm({
+    title: `删除所选 ${ids.length} 份历史报告？`,
+    subtitle: "这些报告会一起移入回收站",
+    warning: "删除后可到「回收站」逐份恢复。审计链中的删除记录仍会保留。",
+    confirmText: `移入回收站（${ids.length}）`,
+    onConfirm: () => deleteSelectedReports(ids),
+  });
+}
+
+async function deleteSelectedReports(ids) {
+  ids = Array.from(new Set(ids || []));
+  if (!ids.length || state.historyBatchBusy) return false;
+  state.historyBatchBusy = true;
+  updateHistoryBatchControls();
+  let data;
+  try {
+    data = await api("/api/reports/batch", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, confirm: "DELETE_SELECTED" }),
+    });
+  } catch (e) {
+    data = { ok: false, error: `批量删除失败：${e.message || e}` };
+  } finally {
+    state.historyBatchBusy = false;
+  }
+  const deleted = new Set((data && data.deleted) || []);
+  const failed = (data && data.failed) || [];
+  if (!deleted.size) {
+    updateHistoryBatchControls();
+    toast((data && data.error) || "批量删除失败", true);
+    return false;
+  }
+  deleted.forEach((id) => state.historySelected.delete(id));
+  if (state.currentReport && deleted.has(state.currentReport.review_id)) {
+    state.currentReport = null;
+    state.currentLog = null;
+    const view = $("#resultView");
+    if (view) view.classList.add("hidden");
+    setReviewViewState(true);
+  }
+  // 右栏正在预览的那份被删了：清掉，否则记录还挂着、点「打开」只能是 404
+  if (state.historyPreviewId && deleted.has(state.historyPreviewId)) {
+    clearHistoryPreview();
+  }
+  await Promise.all([loadReports(), loadIntegrity(), loadTrash()]);
+  renderWorkspaceContext();
+  if (failed.length) {
+    toast(`已删除 ${deleted.size} 份，${failed.length} 份失败：${failed[0].error}`, true);
+  } else {
+    toast(`已将 ${deleted.size} 份报告移入回收站，可在「回收站」恢复`);
+  }
+  return true;
+}
+
+/* ---------------- 回收站与撤销 ---------------- */
+async function loadTrash() {
+  try {
+    const data = await api("/api/reports/trash");
+    state.trash = (data && data.items) || [];
+  } catch (e) {
+    state.trash = [];
+  }
+  updateTrashCount();
+  renderTrash();
+}
+
+function updateTrashCount() {
+  const btn = $("#historyTrash");
+  if (!btn) return;
+  btn.textContent = `回收站（${state.trash.length}）`;
+}
+
+function renderTrash() {
+  const list = $("#trashList");
+  if (!list) return;
+  if (!state.trash.length) {
+    list.innerHTML = '<div class="trash-empty">回收站是空的<span>移入这里的报告可以恢复</span></div>';
+    $("#trashEmpty").disabled = true;
+    $("#trashSummary").textContent = "没有待处理的已删除报告。";
+    return;
+  }
+  $("#trashEmpty").disabled = false;
+  $("#trashSummary").textContent =
+    `共 ${state.trash.length} 份报告。恢复不会覆盖现有文件；彻底删除不可撤销。`;
+  list.innerHTML = state.trash.map((item) => {
+    const name = item.target_name || basename(item.target_path) || "未记录文件名";
+    return `<div class="trash-row" data-trash-id="${esc(item.id)}">
+      <div class="trash-main">
+        <div class="trash-id">${esc(item.id)}</div>
+        <div class="trash-file">${esc(name)}</div>
+        <div class="trash-meta">${esc(relTime(item.deleted_at))}移入 · ${Number(item.files) || 0} 个文件 · ${esc(fmtBytes(item.size))}</div>
+      </div>
+      <button type="button" class="trash-restore" data-trash-restore="${esc(item.id)}">恢复</button>
+      <button type="button" class="trash-purge" data-trash-purge="${esc(item.id)}">彻底删除</button>
+    </div>`;
+  }).join("");
+  list.querySelectorAll("[data-trash-restore]").forEach((btn) => {
+    btn.addEventListener("click", () => restoreTrashReport(btn.dataset.trashRestore));
+  });
+  list.querySelectorAll("[data-trash-purge]").forEach((btn) => {
+    btn.addEventListener("click", () => askPurgeTrash(btn.dataset.trashPurge));
+  });
+}
+
+async function openTrash() {
+  await loadTrash();
+  $("#trashModal").classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  $("#trashClose").focus();
+}
+
+function closeTrash() {
+  $("#trashModal").classList.add("hidden");
+  document.body.classList.toggle("modal-open", !!$(".modal:not(.hidden)"));
+}
+
+async function trashReport(id) {
+  let data;
+  try {
+    data = await api("/api/report?id=" + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: id }),
+    });
+  } catch (e) {
+    data = { ok: false, error: `移入回收站失败：${e.message || e}` };
+  }
+  if (!data || !data.ok) {
+    toast((data && data.error) || "移入回收站失败", true);
+    return;
+  }
   if (state.currentReport && state.currentReport.review_id === id) {
     state.currentReport = null;
     state.currentLog = null;
+    // 报告进了回收站，容器也要一起收起来：只清 state 会留下上一次的结论正文，
+    // 让人对着已删除的内容继续判断
+    const view = $("#resultView");
+    if (view) view.classList.add("hidden");
+    setReviewViewState(true);
+    renderWorkspaceContext();
   }
-  await loadReports();
-  await loadIntegrity();
-  toast(`已删除 ${id}（文件在 outputs/.trash/ 可找回）`);
+  await Promise.all([loadReports(), loadIntegrity(), loadTrash()]);
+  toast(`已将 ${id} 移入回收站`, false, {
+    label: "撤销",
+    ttl: 8000,
+    onClick: () => restoreTrashReport(id),
+  });
+}
+
+async function restoreTrashReport(id) {
+  let data;
+  try {
+    data = await api("/api/reports/trash/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  } catch (e) {
+    data = { ok: false, error: `恢复 ${id} 失败：${e.message || e}` };
+  }
+  if (!data || !data.ok) {
+    toast((data && data.error) || `恢复 ${id} 失败`, true);
+    return;
+  }
+  await Promise.all([loadReports(), loadIntegrity(), loadTrash()]);
+  if ($("#trashModal") && !$("#trashModal").classList.contains("hidden")) {
+    closeTrash();
+  }
+  await selectReport(id, false);
+  toast(`${id} 已恢复${data.ledger_restore ? "，审计链已记录恢复事件" : ""}`);
+}
+
+function openConfirm({ title, subtitle, warning, confirmText, onConfirm }) {
+  pendingConfirmAction = onConfirm;
+  $("#confirmTitle").textContent = title;
+  $("#confirmSub").textContent = subtitle || "";
+  $("#confirmWarn").textContent = warning || "";
+  $("#confirmOk").textContent = confirmText || "确认";
+  $("#confirmOk").disabled = false;
+  $("#confirmModal").classList.remove("hidden");
+  document.body.classList.add("modal-open");
+}
+
+function closeConfirm() {
+  pendingConfirmAction = null;
+  $("#confirmModal").classList.add("hidden");
+  document.body.classList.toggle("modal-open", !!$(".modal:not(.hidden)"));
+}
+
+function askPurgeTrash(id) {
+  const item = state.trash.find((row) => row.id === id);
+  openConfirm({
+    title: "彻底删除这份报告？",
+    subtitle: item ? `${id} · ${item.target_name || "未记录文件名"}` : id,
+    warning: "报告、日志与伴生文件将从回收站永久移除，无法再恢复。审计链中的删除记录仍会保留。",
+    confirmText: "彻底删除",
+    onConfirm: async () => {
+      let data;
+      try {
+        data = await api("/api/reports/trash?id=" + encodeURIComponent(id), {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirm: id }),
+        });
+      } catch (e) {
+        data = { ok: false, error: `彻底删除失败：${e.message || e}` };
+      }
+      if (!data || !data.ok) {
+        toast((data && data.error) || "彻底删除失败", true);
+        return false;
+      }
+      await loadTrash();
+      toast(`已彻底删除 ${id}`);
+      return true;
+    },
+  });
+}
+
+function askEmptyTrash() {
+  if (!state.trash.length) return;
+  openConfirm({
+    title: "清空回收站？",
+    subtitle: `将永久移除 ${state.trash.length} 份已删除报告`,
+    warning: "此操作不可撤销。各报告在审计链中的删除记录仍会保留。",
+    confirmText: "清空回收站",
+    onConfirm: async () => {
+      let data;
+      try {
+        data = await api("/api/reports/trash", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirm: "EMPTY" }),
+        });
+      } catch (e) {
+        data = { ok: false, error: `清空回收站失败：${e.message || e}` };
+      }
+      if (!data || !data.ok) {
+        toast((data && data.error) || "清空回收站失败", true);
+        return false;
+      }
+      await loadTrash();
+      toast("回收站已清空");
+      return true;
+    },
+  });
+}
+
+async function confirmDeleteReport() {
+  if (typeof pendingConfirmAction !== "function") return;
+  const btn = $("#confirmOk");
+  btn.disabled = true;
+  try {
+    const finished = await pendingConfirmAction();
+    if (finished) closeConfirm();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/**
+ * 把「审查结论」卡片滚进视野顶部。
+ *
+ * 宽屏下真正的滚动容器是卡片所在的 `overflow-y:auto` 盒子，`window` 根本滚不动
+ * （见 `scrollHost()` 的注释），所以不能直接 `window.scrollTo(0, 0)`：
+ * 那样在宽屏上等于什么都没做，用户点完历史还是停在半截的报告中间。
+ */
+function revealReportTop(immediate) {
+  const card = $("#resultCard");
+  if (!card) return;
+  const host = scrollHost(card);
+  const rect = card.getBoundingClientRect();
+  // 默认瞬间到位：这里换的是"另一份报告"，不是同一篇里的锚点跳转，
+  // 平滑滚动反而会让人先看半秒旧内容。而且平滑动画会被紧随其后的重排打断，
+  // 最终停在半路（headless/低帧率下更明显）。
+  const animate = immediate === false;
+  if (!host) {
+    const top = window.pageYOffset + rect.top - NAV_HEIGHT - 8;
+    window.scrollTo({ top: Math.max(0, top), behavior: animate ? "smooth" : "auto" });
+    return;
+  }
+  const offset = rect.top - host.getBoundingClientRect().top;
+  scrollHostTo(host, host.scrollTop + offset - 8, { immediate: !animate });
+}
+
+/** 让左栏里当前高亮的那条历史露出来（列表可能已滚到很下面） */
+function revealActiveHistoryRow() {
+  const row = $("#historyList .history-row.active");
+  if (!row) return;
+  const host = scrollHost(row);
+  if (!host) return;
+  const rr = row.getBoundingClientRect();
+  const hr = host.getBoundingClientRect();
+  if (rr.top >= hr.top && rr.bottom <= hr.bottom) return;   // 已经可见，别乱动
+  scrollHostTo(host, host.scrollTop + (rr.top - hr.top) - 8);
 }
 
 async function selectReport(id, switchToLogs) {
@@ -578,15 +1521,27 @@ async function selectReport(id, switchToLogs) {
   renderReport(data.report);
   renderHistory();
   if ($("#logSelect")) $("#logSelect").value = id;
-  if (state.targets.some((t) => t.rel === data.report.target_path)) {
-    selectTarget(data.report.target_path);
+  const matchedTarget = state.targets.find((t) => reportMatchesTarget(data.report, t));
+  if (matchedTarget) {
+    selectTarget(matchedTarget.rel);
+  } else {
+    renderWorkspaceContext();
   }
   if (!state.job || state.job.status !== "running") {
     state.job = null;
     renderProgress([], "");
   }
-  if (switchToLogs) switchTab("logs");
-  else if (state.tab === "logs") loadLogs(id);
+  // 点历史只有一个期望：右边立刻看到这份报告。所以这里必须做两件事——
+  // ① 切回工作台：以前停在「规则与学习 / 审计轨迹 / 可信校验」页时，
+  //    报告是渲染进隐藏的 page-review 的，屏幕上一点反应都没有（点了像坏掉）；
+  // ② 滚到报告顶部：已经停在工作台但往下翻过的时候，同样要能一眼看到结论。
+  if (switchToLogs) {
+    switchTab("logs");
+  } else {
+    if (state.tab !== "review") switchTab("review");
+    revealReportTop();
+    revealActiveHistoryRow();
+  }
 }
 
 /* ---------------- 原文标注 + 问题汇总 ---------------- */
@@ -1298,7 +2253,7 @@ async function markFalseNegative() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      kind: "false_negative", by: "console", target_path: report.target_path,
+      kind: "false_negative", by: "console", target_path: reportTargetPath(report),
       quote, dimension: $("#annoDim").value,
     }),
   });
@@ -1309,7 +2264,7 @@ async function markFalseNegative() {
 
 /* ---------------- 审查目的与目标证据 ---------------- *
  *
- * 输入侧：一句话目的（可选，存 localStorage）。
+ * 输入侧：一句话目的（可选，只存在于本次会话，不落 localStorage）。
  * 输出侧：意图 → 目标（找到/未找到）→ 逐字证据，点证据能在原文里定位。
  * 关键点：**「未找到」也要显示**。只列找到的，会让人以为没列出来的地方都干净。
  */
@@ -1386,10 +2341,9 @@ function refreshPurposeEntry() {
 function initPurpose() {
   const el = $("#purposeInput");
   if (!el) return;
-  try {
-    const saved = localStorage.getItem("ra_purpose") || "";
-    if (saved) el.value = saved;
-  } catch (e) { /* 隐私模式下 localStorage 不可用，忽略 */ }
+  // 以前这里会把上次填的目的从 localStorage 读回来。目的会派生目标、并入下一次
+  // 审查，跨会话复原等于让「上一次的输入」悄悄影响这一次的判定，所以进入系统一律空白
+  // （见 resetPurposeOnEnter）。
 
   const toggle = $("#purposeToggle");
   if (toggle) {
@@ -1397,13 +2351,11 @@ function initPurpose() {
       setPurposeOpen($("#purposePanel").classList.contains("hidden")));
   }
   el.addEventListener("input", () => {
-    try { localStorage.setItem("ra_purpose", el.value.slice(0, 300)); } catch (e) {}
     refreshPurposeEntry();
   });
   $$("#purposeChips .purpose-chip").forEach((chip) =>
     chip.addEventListener("click", () => {
       el.value = chip.dataset.purpose || chip.textContent;
-      try { localStorage.setItem("ra_purpose", el.value); } catch (e) {}
       el.focus();
       el.setSelectionRange(el.value.length, el.value.length);
       refreshPurposeEntry();
@@ -1743,7 +2695,7 @@ function renderStatusBar(report) {
   box.innerHTML = `<span class="rs-badge ${tone}" title="${esc(badgeDesc)}"><i></i>${esc(badge)}</span>
     <span class="rs-sid">审查结果 ${esc(report.review_id || "")}<span class="rs-tag">${esc(report.review_mode || "rule-only")}${agentName ? " · " + esc(agentName) : ""}</span></span>
     <div class="rs-meta">
-      <div>${esc(basename(report.target_path))} · ${esc(relTime(report.timestamp))}</div>
+      <div>${esc(basename(reportTargetPath(report))) || "未记录文件"} · ${esc(relTime(reportTimestamp(report)))}</div>
       <div>${covHtml}${covHtml ? '<span class="rs-sep">·</span>' : ""}${esc(issueText)}${scnChip}${fmtChip}</div>
     </div>`;
 }
@@ -2212,7 +3164,7 @@ function renderTech(report) {
 }
 
 function renderReport(report) {
-  $("#resultEmpty").classList.add("hidden");
+  setReviewViewState(false);
   $("#resultView").classList.remove("hidden");
   applyAgentMeta(report);
 
@@ -2236,6 +3188,17 @@ function renderReport(report) {
   if (card) card.scrollTop = 0;
 }
 
+/**
+ * 初始化态把「发起审查」放进主区域；一旦有进度或报告，再恢复左右分栏。
+ * 空报告卡本身仍保留，只作为状态容器与非初始化态的兜底，不再占满首屏。
+ */
+function setReviewViewState(isEmpty) {
+  const layout = $("#reviewLayout");
+  if (layout) layout.classList.toggle("is-empty", !!isEmpty);
+  const empty = $("#resultEmpty");
+  if (empty) empty.classList.toggle("hidden", !isEmpty);
+}
+
 /* ---------------- 完整性 / Ledger ---------------- */
 async function loadIntegrity() {
   const data = await api("/api/integrity");
@@ -2244,11 +3207,13 @@ async function loadIntegrity() {
   if (!data || data.ok === undefined) {
     bar.className = "integrity-bar";
     bar.textContent = "完整性状态未知";
+    bar.title = bar.textContent;
     return;
   }
   if (!data.entries || !data.entries.length) {
     bar.className = "integrity-bar";
     bar.textContent = "暂无审计记录，运行一次审查后生成。";
+    bar.title = bar.textContent;
   } else if (data.ok) {
     const stale = data.stale_count || 0;
     if (stale > 0) {
@@ -2270,6 +3235,7 @@ async function loadIntegrity() {
     const head = data.chain_ok ? "报告内容校验异常" : "审计链断裂";
     bar.innerHTML = `✗ ${head}${esc(broken)}<br>${esc(data.detail || "请检查 ledger 与 outputs")}`;
   }
+  bar.title = bar.innerText;
   renderLedger(data);
 }
 
@@ -2371,7 +3337,8 @@ function renderRules() {
       <td>${esc(rule.desc)}</td>
       <td><span class="issue-severity ${sev[1]}">${esc(rule.severity)}</span></td>
       <td>${execTag(rule.capability)}</td>
-      <td><div class="switch${rule.enabled ? " on" : ""}" role="switch"
+      <td><div class="switch${rule.enabled ? " on" : ""}" role="switch" tabindex="0"
+        aria-label="${esc(rule.rule_id)} ${rule.enabled ? "已启用" : "已停用"}"
         aria-checked="${rule.enabled}" data-rule="${esc(rule.rule_id)}"></div></td>
     </tr>`;
   }).join("");
@@ -2588,12 +3555,12 @@ async function loadLogs(id) {
   if ($("#logSelect")) $("#logSelect").value = data.id;
 
   const task = data.task || {};
-  const steps = task.steps || [];
+  const steps = (task.steps && task.steps.length ? task.steps : task.events) || [];
   const hasDetail = steps.some((s) => s.detail && Object.keys(s.detail).length);
   const staleHint = steps.length && !hasDetail
-    ? `<div class="log-stale">该次运行未记录步骤明细（旧版本日志）。`
+    ? `<div class="log-stale">该次运行未记录扩展步骤明细（旧版本日志）。`
       + `本次共 ${(data.decisions || []).length} 条决策、${(data.tools || []).length} 次工具调用，`
-      + `可在「决策 / 工具调用」页查看；重新审查一次即可看到每步内容。</div>`
+      + `可在「决策依据 / 工具调用」页查看。</div>`
     : "";
   panels.task.innerHTML = steps.length
     ? staleHint + steps.map((step) => {
@@ -2606,13 +3573,26 @@ async function loadLogs(id) {
           };
           body += `<div class="log-entry-body">${esc(JSON.stringify(summary, null, 2))}</div>`;
         }
-        const statusCls = step.status === "success" ? "ok"
-          : (step.status === "skipped" ? "skip" : "bad");
+        const status = step.status
+          || (step.ok === false ? "failed" : (step.ok === true ? "success" : "unknown"));
+        const statusCls = status === "success" ? "ok"
+          : (status === "skipped" ? "skip" : "bad");
+        const statusLabel = {
+          success: "成功", skipped: "跳过", failed: "失败", cancelled: "已取消",
+        }[status] || status;
+        const stage = step.stage || step.step || "步骤";
+        const node = step.name || step.node || "";
+        const notes = [].concat(step.errors || [], step.warnings || []);
+        if (notes.length) {
+          body += `<div class="log-entry-body">`
+            + notes.map((item) => `<div>· ${esc(item)}</div>`).join("")
+            + `</div>`;
+        }
         return `<div class="log-entry">
           <div class="log-entry-header">
             <span class="log-entry-title">
-              <span class="log-step-chip">${esc(step.step)}</span>${esc(step.name)}
-              <span class="log-status ${statusCls}">${esc(step.status || "success")}</span>
+              <span class="log-step-chip">${esc(stage)}</span>${esc(node)}
+              <span class="log-status ${statusCls}">${esc(statusLabel)}</span>
             </span>
             <span class="log-entry-time">${fmtClock(step.ts)} · ${step.latency_ms || 0}ms</span>
           </div>${body}
@@ -2701,28 +3681,56 @@ function renderProgress(steps, fileName) {
 function updateRunState() {
   const btn = $("#runBtn");
   const example = $("#exampleBtn");
+  const cancel = $("#cancelBtn");
+  const readiness = $("#runReadiness");
   const running = !!(state.job && state.job.status === "running");
   const hasFile = !!state.selected;
   const llmOk = !!(state.llm && state.llm.available);
   const down = !!state.backendDown;
-  btn.disabled = !hasFile || !llmOk || running;
+  btn.disabled = !hasFile || down || running;
   if (running) btn.textContent = "审查中…";
   else if (down) btn.textContent = "运行审查（控制台未连接）";
-  else if (!llmOk) btn.textContent = "运行审查（需配置 LLM）";
-  else btn.textContent = "运行审查";
+  else if (!llmOk) btn.textContent = "开始审查 · 纯规则";
+  else btn.textContent = "开始审查";
   btn.title = down ? "无法连接控制台后端：请重新运行 start-console.bat"
-    : !llmOk ? "请先配置 LLM" : !hasFile ? "请先选择或上传文件" : "";
+    : !hasFile ? "请先选择或上传文件"
+    : !llmOk ? "当前未配置模型，将使用纯规则审查" : "";
+  if (readiness) {
+    readiness.textContent = down
+      ? "控制台未连接，暂时无法发起审查"
+      : running
+        ? `正在审查 ${state.selected ? state.selected.name : ""}`.trim()
+        : hasFile
+          ? `已就绪 · ${state.selected.name}`
+          : "选择材料后即可开始";
+    readiness.classList.toggle("is-ready", hasFile && !down && !running);
+    readiness.classList.toggle("is-running", running);
+  }
   if (example) example.disabled = running;
+  if (cancel) cancel.classList.toggle("hidden", !running);
 }
 
 async function startReview(llmOverride) {
   if (!state.selected) { toast("请先选择或上传文件", true); return; }
   if (state.job && state.job.status === "running") return;
   const payload = { file: state.selected.rel };
+  if (llmOverride === undefined && !(state.llm && state.llm.available)) {
+    llmOverride = false;
+  }
   if (state.agent && state.agent !== "auto") payload.agent = state.agent;
   if (state.scenario) payload.scenario = state.scenario;
-  // 格式规格只对 .docx 有意义；不选就不传，让后端用默认 none（并写进 limitations）
-  if (state.formatSpec) payload.format_spec = state.formatSpec;
+  // 格式要求：只对 .docx 有意义；没填就不传，让后端用默认 none
+  // （并在报告 limitations 里写明"版式未判"）。
+  // 提交前再收一次并校验：面板里的错误提示可能被滚动遮住，
+  // 带着非法值出发只会拿回一个"任务失败"，不如在这里拦住并把人送回面板。
+  const fmtCollected = collectFormatCustom();
+  if (fmtCollected.errors.length) {
+    setFormatPanelOpen(true);
+    syncFormatForm();
+    toast(fmtCollected.errors[0], true);
+    return;
+  }
+  if (!formatCheckIsEmpty(fmtCollected.check)) payload.format_custom = fmtCollected.check;
   if (llmOverride === true || llmOverride === false) payload.llm = llmOverride;
   // 库外事实核验：默认勾选；关掉就只比对内置事实库（离线/涉密场景）
   const researchBox = document.getElementById("researchToggle");
@@ -2741,11 +3749,44 @@ async function startReview(llmOverride) {
   });
   if (!data.ok) { toast(data.error || "启动审查失败", true); return; }
   setPurposeOpen(false);       // 目的已随请求提交，收回面板腾出空间
-  state.job = { id: data.job_id, status: "running", report_id: null };
-  $("#resultEmpty").classList.add("hidden");
+  state.job = {
+    id: data.job_id,
+    review_id: data.review_id || null,
+    status: "running",
+    report_id: data.review_id || null,
+  };
+  setReviewViewState(false);
   renderProgress([], state.selected.name);
   updateRunState();
   pollJob();
+}
+
+async function cancelReview() {
+  if (!state.job || state.job.status !== "running") return;
+  const btn = $("#cancelBtn");
+  btn.disabled = true;
+  btn.textContent = "正在取消…";
+  try {
+    const data = await api("/api/review/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job: state.job.id, review_id: state.job.review_id || "" }),
+    });
+    if (!data || !data.ok) {
+      toast((data && data.error) || "取消失败", true);
+      return;
+    }
+    pausePoll();
+    state.job = { ...state.job, status: "cancelled" };
+    renderProgress([], "");
+    updateRunState();
+    toast("审查任务已取消");
+  } catch (e) {
+    toast("取消失败：" + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "取消任务";
+  }
 }
 
 function schedulePoll(delay) {
@@ -2993,7 +4034,7 @@ async function loadLlmStatus() {
   const bannerText = $("#llmBannerText");
   if (bannerText) {
     bannerText.textContent =
-      "⚠️ 检测到 LLM 模型未配置，「运行审查」按钮已暂停使用。配置后即可开始审查。";
+      "当前未启用语义模型，仍可直接运行纯规则审查；配置后可获得语义层结果。";
   }
   $("#llmDot").className = "status-dot " + (ok ? "dot-green" : "dot-gray");
   $("#llmText").textContent = ok ? `LLM · ${state.llm.model}` : "LLM 未配置";
@@ -3237,6 +4278,55 @@ async function resetLlm() {
 }
 
 /* ---------------- 初始化 ---------------- */
+
+/**
+ * 把结果区拉回"刚打开系统"的样子。
+ *
+ * 为什么不复用 renderReport(null)：那是"渲染一份空报告"，会留下上一次的
+ * 状态条、目标、证据块（各块只是内容变空，容器还在），看起来像一份残缺的报告。
+ * 这里直接切到 #resultEmpty 空状态，语义清楚：还没有审查结果。
+ *
+ * 清掉的是**上一次的结论**（报告、选中的文件、进度条），右栏历史列表照旧保留。
+ */
+function resetWorkspaceView() {
+  pausePoll();
+  state.currentReport = null;
+  state.job = null;
+  const view = $("#resultView");
+  if (view) view.classList.add("hidden");
+  setReviewViewState(true);
+  const progress = $("#progressCard");
+  if (progress) progress.classList.add("hidden");
+  // 选中项一并清掉：走 selectTarget 而不是直接改 state，才能把按钮文案（占位）
+  // 与列表高亮一起复位
+  selectTarget(null);
+  renderHistory();
+  renderProgress([], "");
+}
+
+/**
+ * 进入系统 = 全新一次审查：上一次填的审查目的、传的目的文件都清掉。
+ *
+ * 目的不是装饰——它会派生目标、并入下一次审查。跟着页面留下来，等于让
+ * 「上一次的输入」悄悄改变这一次的判定，而这在界面上看不见。
+ * 目的文件暂存在 state/purpose_uploads/，服务端不会自动回收，所以这里显式删。
+ */
+async function resetPurposeOnEnter() {
+  const el = $("#purposeInput");
+  if (el) el.value = "";
+  try { localStorage.removeItem("ra_purpose"); } catch (e) { /* 隐私模式，忽略 */ }
+  // 先按服务端的列表重拉一次：initPurpose 里的加载是异步的，不能赌它已经跑完
+  await loadPurposeFiles();
+  const staged = (state.purposeFiles || []).slice();
+  for (const f of staged) {
+    try {
+      await api(`/api/purpose/files?id=${encodeURIComponent(f.id)}`, { method: "DELETE" });
+    } catch (e) { /* 删不掉不阻断启动，下面以服务端返回的列表为准 */ }
+  }
+  if (staged.length) await loadPurposeFiles();
+  else refreshPurposeEntry();
+}
+
 async function init() {
   $$(".nav-tab").forEach((btn) =>
     btn.addEventListener("click", () => switchTab(btn.dataset.tab))
@@ -3296,6 +4386,12 @@ async function init() {
     sw.setAttribute("aria-checked", String(result.enabled));
     toast(`${result.rule_id} 已${result.enabled ? "启用" : "停用"}`);
   });
+  $("#rulesBody").addEventListener("keydown", (e) => {
+    const sw = e.target.closest(".switch");
+    if (!sw || (e.key !== "Enter" && e.key !== " ")) return;
+    e.preventDefault();
+    sw.click();
+  });
 
   syncViewportMetrics();
   // 窗口尺寸变化会改导航换行/页脚高度，重新量一次（rAF 去抖，拖拽窗口时不做无用功）
@@ -3311,16 +4407,10 @@ async function init() {
   initUpload();
   // 待审对象下拉必须真的生效：这里原来漏了监听，用户在下拉里选了 A，
   // 界面显示 A、state.selected 却还是 B，点运行时审的是 B（本次事故的直接原因）。
-  $("#targetSelect").addEventListener("change", (e) => {
-    const item = state.targets.find((x) => x.rel === e.target.value);
-    if (item && item.reviewable === false) {
-      toast("该文件是机读标注（标准答案），不能作为待审对象", true);
-      if (state.selected) e.target.value = state.selected.rel;
-      return;
-    }
-    selectTarget(e.target.value);
-  });
+  // 现在是自定义下拉，监听在 initTargetPicker 里（行点击 → selectTarget）。
+  initTargetPicker();
   $("#runBtn").addEventListener("click", () => startReview());
+  $("#cancelBtn").addEventListener("click", cancelReview);
   $("#annoMissBtn").addEventListener("click", markFalseNegative);
   $("#exampleBtn").addEventListener("click", runExample);
   $("#logSelect").addEventListener("change", (e) => {
@@ -3352,18 +4442,87 @@ async function init() {
   $("#confirmModal").querySelectorAll("[data-close]").forEach((el) =>
     el.addEventListener("click", closeConfirm)
   );
+  $("#historyTrash").addEventListener("click", openTrash);
+  $("#trashClose").addEventListener("click", closeTrash);
+  $("#trashEmpty").addEventListener("click", askEmptyTrash);
+  $("#trashModal").querySelectorAll("[data-close]").forEach((el) =>
+    el.addEventListener("click", closeTrash)
+  );
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if (!$("#confirmModal").classList.contains("hidden")) {
+      closeConfirm();
+      return;
+    }
+    if (!$("#trashModal").classList.contains("hidden")) {
+      closeTrash();
+      return;
+    }
     if (!$("#llmModal").classList.contains("hidden")) closeLlmModal();
-    if (!$("#confirmModal").classList.contains("hidden")) closeConfirm();
   });
   $("#themeBtn").addEventListener("click", () => toast("深色模式开发中"));
 
   // 历史列表的手动/被动刷新：命令行跑完审查后页面不会自己更新
   $("#historyRefresh").addEventListener("click", () => refreshReports({ force: true }));
+  $("#historySearch").addEventListener("input", (e) => {
+    state.historyQuery = e.target.value;
+    state.historyLimit = 60;
+    state.historySelected.clear();
+    renderHistory();
+    updateHistoryHead();
+  });
+  $("#historyFilter").addEventListener("change", (e) => {
+    state.historyVerdict = e.target.value;
+    state.historyLimit = 60;
+    state.historySelected.clear();
+    renderHistory();
+    updateHistoryHead();
+  });
+  $("#historySelectAll").addEventListener("change", (e) => {
+    const visible = visibleHistoryItems();
+    visible.forEach((item) => {
+      if (e.target.checked) state.historySelected.add(item.id);
+      else state.historySelected.delete(item.id);
+    });
+    renderHistory();
+  });
+  $("#historyBatchFavorite").addEventListener("click", () =>
+    setHistoryFavorites(selectedHistoryIds(), true));
+  $("#historyBatchUnfavorite").addEventListener("click", () =>
+    setHistoryFavorites(selectedHistoryIds(), false));
+  $("#historyBatchDelete").addEventListener("click", askDeleteSelectedReports);
+  // 右栏记录里的三个动作：打开控制台 / 收藏 / 移入回收站。
+  // 用委托而不是内联 onclick：右栏每次预览都整块重画，逐次绑定迟早漏一个。
+  $("#historyDetail").addEventListener("click", async (e) => {
+    const open = e.target.closest("[data-open-console]");
+    if (open) { openReportInConsole(open.dataset.openConsole); return; }
+    const fav = e.target.closest("[data-hd-fav]");
+    if (fav) {
+      const id = fav.dataset.hdFav;
+      const item = state.reports.find((r) => r.id === id);
+      if (!item || fav.disabled) return;
+      fav.disabled = true;
+      await setHistoryFavorites([id], !item.favorite);
+      if (state.historyPreview && state.historyPreview.review_id === id) {
+        renderHistoryDetail(state.historyPreview);
+      }
+      return;
+    }
+    const trash = e.target.closest("[data-hd-trash]");
+    if (trash) {
+      const id = trash.dataset.hdTrash;
+      if (trash.disabled) return;
+      trash.disabled = true;
+      await trashReport(id);
+    }
+  });
+  const quick = $("#quickHistoryBtn");
+  if (quick) quick.addEventListener("click", () => switchTab("history"));
   // ⭐ 只看收藏：纯前端筛选，不重新请求（收藏状态随 /api/reports 一起来）
   $("#historyFavFilter").addEventListener("click", () => {
     favoritesOnly = !favoritesOnly;
+    state.historyLimit = 60;
+    state.historySelected.clear();
     updateHistoryHead();
     renderHistory();
     if (favoritesOnly && !favCount()) {
@@ -3388,14 +4547,19 @@ async function init() {
   await loadTargets();
   await loadAgents();
   await loadScenarios();
-  await loadFormatSpecs();
+  initFormatForm();
   await loadRules();
   await loadIntegrity();
+  await loadTrash();
   await loadReports();
-  renderProgress([], "");
-
+  // 进入系统 = 初始化界面：不带着上一次的报告、文件、进度、审查目的。
+  // 必须在各 load* 之后调用——它们会填下拉、渲染历史，先清后填等于白清。
+  resetWorkspaceView();
+  await resetPurposeOnEnter();
   const initialTab = (location.hash || "").replace("#", "");
-  if (["review", "rules", "logs", "ledger"].includes(initialTab)) switchTab(initialTab);
+  if (["review", "history", "rules", "logs", "ledger"].includes(initialTab)) {
+    switchTab(initialTab);
+  }
   if (new URLSearchParams(location.search).get("llm") === "1") openLlmModal();
 }
 
@@ -3474,54 +4638,229 @@ async function loadScenarios() {
   sync();
 }
 
-/** 格式规格（docx 版式按哪套标准判）。
+/** 格式规格（docx 版式按什么数值判）。
  *
- * 为什么要选：字体/字号/行距没有"通用正确答案"，只有"委托方要求"。
- * 「宋体小四、固定 22 磅」是某份课程报告的标准，换份期刊就全变。
- * 不选 = 不判这几项，并在报告 limitations 写明「未报出 ≠ 合规」。
+ * 为什么不给预设下拉：字体/字号/行距没有"通用正确答案"，只有"委托方要求"。
+ * 「宋体小四、固定 22 磅」是某份课程报告的标准，换份期刊就全变；
+ * 预设只能覆盖写死的几种，用户遇到第三种就没法填。所以改成**分项表单**：
+ * 填哪项判哪项，空着的不判（并由报告 limitations 写明「未判 ≠ 合规」）。
+ *
+ * 只对本次生效，不写进 config/format_specs.yaml——那边放的是可复用的标准，
+ * 把每次手填的东西写进去，配置文件会变成一次性输入的垃圾桶。
  */
-async function loadFormatSpecs() {
-  const sel = $("#formatSpecSelect");
+
+/** 读一个数字输入框：空串 → null；非法 → NaN（由 collect 报错）。 */
+function fmtNum(sel, scale = 1) {
+  const el = $(sel);
+  if (!el) return null;
+  const raw = String(el.value || "").trim();
+  if (!raw) return null;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return Number.NaN;
+  return v * scale;
+}
+
+/** 逗号/顿号/空格分隔的字体名 → 数组。 */
+function fmtFonts(sel) {
+  const el = $(sel);
+  if (!el) return null;
+  const list = String(el.value || "")
+    .split(/[,，、;；\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length ? list : null;
+}
+
+/**
+ * 把表单读成后端认的 check 块（键名必须与 tools/format_spec.py 的 _KNOWN_KEYS 一致）。
+ * 返回 { check, errors[] }；errors 非空时不发请求。
+ */
+function collectFormatCustom() {
+  const errors = [];
+  const check = {};
+
+  const fonts = fmtFonts("#fmtBodyFont");
+  if (fonts) check.body_font_east = fonts;
+
+  const size = fmtNum("#fmtBodySize", 2);          // 磅 → 半磅
+  if (size !== null) {
+    if (!Number.isFinite(size) || size <= 0) errors.push("正文字号必须是大于 0 的磅值");
+    else check.body_size_halfpt = Math.round(size);
+  }
+
+  const indent = fmtNum("#fmtIndent", 100);        // 字符 → 字符×100
+  if (indent !== null) {
+    if (!Number.isFinite(indent) || indent < 0) errors.push("首行缩进必须是非负字符数");
+    else check.first_line_chars = Math.round(indent);
+  }
+
+  const mode = ($("#fmtLineMode") || {}).value || "";
+  if (mode) {
+    const val = fmtNum("#fmtLineValue");
+    if (val === null) {
+      errors.push("选了行距方式就要填数值（固定值填磅，倍数填 1.5、2 这样的倍数）");
+    } else if (!Number.isFinite(val) || val <= 0) {
+      errors.push("行距数值必须大于 0");
+    } else if (mode === "exact") {
+      check.line_twips = Math.round(val * 20);     // 磅 → 缇
+      check.line_rule = "exact";
+    } else {
+      check.line_multiple = val;
+    }
+  }
+
+  const before = fmtNum("#fmtSpaceBefore");
+  if (before !== null) {
+    if (!Number.isFinite(before) || before < 0) errors.push("段前间距必须是非负磅值");
+    else check.space_before_pt = Math.round(before);
+  }
+  const after = fmtNum("#fmtSpaceAfter");
+  if (after !== null) {
+    if (!Number.isFinite(after) || after < 0) errors.push("段后间距必须是非负磅值");
+    else check.space_after_pt = Math.round(after);
+  }
+  if ("space_before_pt" in check || "space_after_pt" in check) {
+    const scope = ($("#fmtSpaceScope") || {}).value;
+    check.space_scope = scope === "heading" ? "heading" : "body";
+  }
+
+  const maxLevel = fmtNum("#fmtMaxLevel");
+  if (maxLevel !== null) {
+    if (!Number.isFinite(maxLevel) || maxLevel < 1 || maxLevel > 9) {
+      errors.push("标题最多级数必须是 1~9 的整数");
+    } else check.heading_max_level = Math.round(maxLevel);
+  }
+
+  const levels = [];
+  document.querySelectorAll("#fmtLevels .fmt-level").forEach((row) => {
+    const lv = Number(row.dataset.level);
+    const fontInput = row.querySelector(".fmt-h-font");
+    const sizeInput = row.querySelector(".fmt-h-size");
+    const item = { level: lv };
+    const fs = String((fontInput && fontInput.value) || "").trim();
+    if (fs) {
+      const list = fs.split(/[,，、;；\s]+/).map((s) => s.trim()).filter(Boolean);
+      if (list.length) item.font_east = list;
+    }
+    const raw = String((sizeInput && sizeInput.value) || "").trim();
+    if (raw) {
+      const v = Number(raw) * 2;
+      if (!Number.isFinite(v) || v <= 0) errors.push(`标题 ${lv} 的字号必须是大于 0 的磅值`);
+      else item.size_halfpt = Math.round(v);
+    }
+    if (item.font_east || item.size_halfpt) levels.push(item);
+  });
+  if (levels.length) check.heading_levels = levels;
+
+  const figref = $("#fmtFigref");
+  if (figref && figref.checked) check.figref = true;
+
+  return { check, errors };
+}
+
+/**
+ * 只有「图表编号一致」时算没填。
+ *
+ * 理由：FORMAT-006 与字体字号无关，任何规格下都会判（连 `none` 也保留它）。
+ * 把它当成"用户填了一项格式要求"，会让面板一打开就显示"已填写 1 项"，
+ * 也会让后端生成一条"未包含字体/字号…"的 limitations——全是被自己制造出来的噪音。
+ * 反过来，用户**取消勾选**并填了别的项时，check 里就没有 figref，
+ * 后端的 check_figref 因此跳过：这是"明确不要判图表编号"的表达方式。
+ */
+function formatCheckIsEmpty(check) {
+  const keys = Object.keys(check || {});
+  return !keys.length || (keys.length === 1 && keys[0] === "figref");
+}
+
+/** 面板收起时把「本次会判什么」写回标签，免得人以为填了就一定判了。 */
+function syncFormatForm() {
+  const panel = $("#formatPanel");
+  const btn = $("#formatToggle");
   const hint = $("#formatSpecHint");
-  if (!sel) return;
-  let data;
-  try {
-    data = await api("/api/format-specs");
-  } catch (e) {
-    data = { ok: false, error: `读取格式规格失败：${e && e.message ? e.message : e}` };
+  const summary = $("#fmtSummary");
+  if (!panel || !btn) return;
+  const { check, errors } = collectFormatCustom();
+  const empty = formatCheckIsEmpty(check);
+  const keys = empty ? [] : Object.keys(check);
+  const open = !panel.classList.contains("hidden");
+  state.formatCustom = empty ? null : check;
+
+  const label = keys.length ? `已填写 ${keys.length} 项` : "填写格式要求";
+  const text = $("#formatToggleText");
+  if (text) text.textContent = label;
+  btn.classList.toggle("has-value", keys.length > 0);
+  btn.setAttribute("aria-expanded", String(open));
+
+  if (summary) {
+    summary.textContent = errors.length
+      ? errors[0]
+      : (keys.length ? `本次按 ${keys.length} 项判定；未填的项不判` : "未填写：本次不判版式");
+    summary.classList.toggle("is-error", errors.length > 0);
   }
-  if (!data || !data.ok) {
-    sel.innerHTML = '<option value="">（格式规格读取失败）</option>';
-    sel.disabled = true;
-    if (hint) {
-      hint.textContent = (data && data.error) || "格式规格读取失败";
-      hint.classList.add("is-error");
-    }
-    return;
+  if (hint) {
+    hint.classList.toggle("is-error", errors.length > 0);
+    hint.textContent = errors.length
+      ? errors[0]
+      : (keys.length
+        ? "仅对 .docx 生效；未填的项不判（不等于「已合规」）"
+        : "仅对 .docx 生效。没填的项本次不判（不等于「已合规」）。");
   }
-  const items = data.items || [];
-  state.formatSpecs = items;
-  const usable = items.filter((x) => x.id !== (data.default || "none"));
-  sel.innerHTML = [`<option value="">不判版式（默认）</option>`]
-    .concat(usable.map((x) => `<option value="${esc(x.id)}">${esc(x.name)}`
-      + (x.checks && x.checks.length ? `（${esc(x.checks.join("/"))}）` : "")
-      + `</option>`))
-    .join("");
-  sel.disabled = !usable.length;
-  const sync = () => {
-    state.formatSpec = sel.value;
-    const it = items.find((x) => x.id === sel.value);
-    hint.classList.remove("is-error");
-    if (!it) {
-      hint.textContent = "仅对 .docx 生效：不判字体/字号/行距";
-      hint.classList.remove("is-warn");
-      return;
-    }
-    hint.textContent = `${it.desc}${it.source ? "｜出处：" + it.source : ""}`;
-    hint.classList.toggle("is-warn", (it.disabled_count || 0) > 0);
-  };
-  sel.addEventListener("change", sync);
-  sync();
+}
+
+function setFormatPanelOpen(open) {
+  const panel = $("#formatPanel");
+  const btn = $("#formatToggle");
+  if (!panel) return;
+  panel.classList.toggle("hidden", !open);
+  if (btn) {
+    btn.setAttribute("aria-expanded", String(open));
+    btn.classList.toggle("is-open", open);
+  }
+}
+
+function initFormatForm() {
+  const panel = $("#formatPanel");
+  const toggle = $("#formatToggle");
+  if (!panel || !toggle) return;
+
+  toggle.addEventListener("click", () => {
+    setFormatPanelOpen(panel.classList.contains("hidden"));
+    syncFormatForm();
+  });
+
+  // 行距方式决定数值框能不能填：选"不规定"时把数值一并清掉，
+  // 否则会出现"方式没选、但 line_twips 还在"的半截状态。
+  const mode = $("#fmtLineMode");
+  const value = $("#fmtLineValue");
+  if (mode && value) {
+    mode.addEventListener("change", () => {
+      const on = !!mode.value;
+      value.disabled = !on;
+      if (!on) value.value = "";
+      else value.placeholder = mode.value === "exact" ? "22（磅）" : "2（倍）";
+      syncFormatForm();
+    });
+  }
+
+  const clear = $("#fmtClear");
+  if (clear) {
+    clear.addEventListener("click", () => {
+      panel.querySelectorAll("input[type=text], input[type=number]").forEach((el) => {
+        el.value = "";
+      });
+      if (mode) mode.value = "";
+      if (value) { value.disabled = true; value.value = ""; }
+      const scope = $("#fmtSpaceScope");
+      if (scope) scope.value = "body";
+      const fig = $("#fmtFigref");
+      if (fig) fig.checked = true;
+      syncFormatForm();
+    });
+  }
+
+  panel.addEventListener("input", syncFormatForm);
+  panel.addEventListener("change", syncFormatForm);
+  syncFormatForm();
 }
 
 document.addEventListener("DOMContentLoaded", init);

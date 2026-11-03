@@ -3,470 +3,765 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>审查 Agent 控制台</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <meta name="theme-color" content="#102522">
+  <title>审查工作台 · Review Workspace</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23dff4a9'/%3E%3Cpath d='M20 18h24v6H26v8h15v6H26v8h18v6H20z' fill='%23102522'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/workspace.css">
 </head>
 <body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="nav-left">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">审</div>
+          <div class="brand-copy">
+            <div class="brand-name">审查工作台</div>
+            <div class="brand-sub">Review Workspace</div>
+          </div>
+        </div>
+        <div class="nav-title">审查 Agent 控制台</div>
+      </div>
 
-<!-- 顶部导航 -->
-<div class="nav">
-  <div class="nav-left">
-    <div class="logo">R</div>
-    <div class="nav-title">审查 Agent 控制台</div>
-    <div class="nav-tabs">
-      <button class="nav-tab active" data-tab="review">审查台</button>
-      <button class="nav-tab" data-tab="rules">规则库</button>
-      <button class="nav-tab" data-tab="logs">审计日志</button>
-      <button class="nav-tab" data-tab="ledger">校验 Ledger</button>
-    </div>
-  </div>
-  <div class="nav-right">
-    <button class="llm-pill" id="llmPill" type="button" title="配置大模型 API">
-      <span class="status-dot dot-gray" id="llmDot"></span>
-      <span id="llmText">LLM 未配置</span>
-    </button>
-    <button class="icon-btn" id="themeBtn" type="button" title="深色模式（开发中）">🌙</button>
-  </div>
-</div>
+      <div class="sidebar-nav-wrap">
+        <div class="sidebar-label">Workspace</div>
+        <div class="nav-tabs" role="tablist" aria-label="系统页面">
+          <button class="nav-tab active" data-tab="review" type="button" role="tab" aria-selected="true">审查工作台</button>
+          <button class="nav-tab" data-tab="history" type="button" role="tab" aria-selected="false">历史报告</button>
+          <button class="nav-tab" data-tab="rules" type="button" role="tab" aria-selected="false">规则与学习</button>
+          <button class="nav-tab" data-tab="logs" type="button" role="tab" aria-selected="false">审计轨迹</button>
+          <button class="nav-tab" data-tab="ledger" type="button" role="tab" aria-selected="false">可信链校验</button>
+        </div>
+      </div>
 
-<!-- LLM 未配置横幅 -->
-<div class="llm-banner hidden" id="llmBanner">
-  <span id="llmBannerText">⚠️ 检测到 LLM 模型未配置，「运行审查」按钮已暂停使用。配置后即可开始审查。</span>
-  <button type="button" id="llmBannerBtn">立即配置</button>
-</div>
-
-<div class="container">
-
-  <!-- ========== TAB 1: 审查台 ========== -->
-  <div class="page active" id="page-review">
-    <div class="grid-review">
-
-      <!-- 左栏：上传 -->
-      <div class="card">
-        <div class="card-title">待审对象</div>
-
-        <!-- 上传入口默认收起：左栏高度受视口限制，常驻一大块虚线框会把
-             「审查目的」「运行审查」挤到滚动区外。点按钮才展开拖拽区与格式说明。 -->
-        <button class="entry-toggle upload-toggle" id="uploadToggle" type="button"
-                aria-expanded="false" aria-controls="uploadBox">
-          <span class="entry-toggle-ico" aria-hidden="true">＋</span>
-          <span class="entry-toggle-text">
-            <b>上传文件</b>
-            <span class="entry-toggle-sub" id="uploadToggleSub">点击展开上传区，也可直接把文件拖进来</span>
+      <!-- 历史报告已移到独立页（左侧列表 / 右侧记录），侧栏只留入口与总量，
+           不再把一份份报告卡塞进这条 286px 的窄栏。 -->
+      <section class="sidebar-quick" aria-label="历史报告入口">
+        <div class="sidebar-label">Archive</div>
+        <button class="quick-card" id="quickHistoryBtn" type="button"
+                title="打开历史报告：左侧选，右侧看记录">
+          <span class="quick-num" id="quickReportCount">0</span>
+          <span class="quick-copy">
+            <b>历史报告</b>
+            <span id="quickReportSub">左侧选、右侧看记录</span>
           </span>
-          <span class="entry-toggle-caret" aria-hidden="true">▾</span>
+          <span class="quick-arrow" aria-hidden="true">→</span>
         </button>
+      </section>
 
-        <div class="upload-box hidden" id="uploadBox">
-          <div class="upload-main"><span class="upload-ico">📄</span>拖拽文件到这里，或点击选择</div>
-          <div class="upload-hint">文本 ≤ 2 MB　·　文档 / 图片 / ZIP ≤ 20 MB</div>
-          <div class="upload-formats">
-            <div class="fmt-row">
-              <span class="fmt-label">文本/代码</span>
-              <span class="fmt">.txt</span><span class="fmt">.md</span><span class="fmt">.py</span><span class="fmt">.js</span><span class="fmt">.json</span><span class="fmt">.yaml</span><span class="fmt-more">等</span>
-            </div>
-            <div class="fmt-row">
-              <span class="fmt-label">文档</span>
-              <span class="fmt">.pdf</span><span class="fmt">.docx</span><span class="fmt">.doc</span><span class="fmt">.rtf</span>
-            </div>
-            <div class="fmt-row">
-              <span class="fmt-label">图片</span>
-              <span class="fmt">.png</span><span class="fmt">.jpg</span><span class="fmt">.gif</span><span class="fmt">.webp</span><span class="fmt">.tiff</span><span class="fmt">.heic</span>
-            </div>
-            <div class="fmt-row">
-              <span class="fmt-label">压缩包</span>
-              <span class="fmt">.zip</span><span class="fmt-note">递归展开 · 成员 ≤ 200</span>
-            </div>
-          </div>
+      <div class="sidebar-foot">
+        <div class="sidebar-label">Runtime</div>
+        <div class="nav-right">
+          <button class="llm-pill" id="llmPill" type="button" title="配置审查模型">
+            <span class="status-dot dot-gray" id="llmDot"></span>
+            <span id="llmText">连接状态读取中</span>
+          </button>
         </div>
-        <input type="file" id="fileInput" class="hidden"
-               accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
-
-        <div class="file-chip hidden" id="fileChip">
-          <div>
-            <div id="fileName"></div>
-            <div class="file-meta" id="fileMeta"></div>
-          </div>
-          <span class="remove" id="fileRemove" title="移除文件">✕</span>
-        </div>
-
-        <div class="pick-row">
-          <label for="targetSelect">或从已有对象选择</label>
-          <select id="targetSelect"></select>
-        </div>
-
-        <div class="pick-row">
-          <label for="agentSelect">审查 Agent（判定标准）</label>
-          <select id="agentSelect">
-            <option value="auto">自动路由（推荐）</option>
-          </select>
-          <div class="agent-hint" id="agentHint">按文件类型自动选择 Agent</div>
-        </div>
-
-        <!-- 审查情境：同一份材料，用途不同，该问的问题不同。
-             简历初筛不核验"四六级是不是真的"（要核查只能索要原件），
-             把这类条目报出来只会淹没真正能改的矛盾。关了什么会写进报告。 -->
-        <div class="pick-row">
-          <label for="scenarioSelect">审查情境（用哪套规则）</label>
-          <select id="scenarioSelect">
-            <option value="">通用（全部规则）</option>
-          </select>
-          <div class="agent-hint" id="scenarioHint">全部规则参与（默认）</div>
-        </div>
-
-        <!-- 格式规格：Word 版式按**哪一份委托方标准**判。
-             「正文必须宋体小四、固定 22 磅」是某份课程报告的要求，不是通用真理；
-             换份期刊/换个学校就全变。所以标准不进规则库，在这里选。
-             不选 = 不判字体字号行距（「没报出问题」≠「版式合规」，会写进报告）。 -->
-        <div class="pick-row">
-          <label for="formatSpecSelect">格式规格（Word 版式按哪套标准）</label>
-          <select id="formatSpecSelect">
-            <option value="">不判版式（默认）</option>
-          </select>
-          <div class="agent-hint" id="formatSpecHint">仅对 .docx 生效：不判字体/字号/行距</div>
-        </div>
-
-        <!-- 审查目的与上传同一套「按钮 + 展开」：收起时把已填内容写在副标题上，
-             否则用户会忘记自己设过目的（目的直接决定报告里多出一整块证据）。 -->
-        <button class="entry-toggle purpose-toggle" id="purposeToggle" type="button"
-                aria-expanded="false" aria-controls="purposePanel">
-          <span class="entry-toggle-ico" aria-hidden="true">🎯</span>
-          <span class="entry-toggle-text">
-            <b>审查目的<span class="entry-opt">可选</span></b>
-            <span class="entry-toggle-sub" id="purposeToggleSub">点击填写：这份文本想干什么</span>
-          </span>
-          <span class="entry-toggle-caret" aria-hidden="true">▾</span>
-        </button>
-
-        <div class="purpose-panel hidden" id="purposePanel">
-          <textarea id="purposeInput" rows="3" maxlength="300"
-                    placeholder="这份文本想干什么？例：这是给客户的报价邮件，帮我找有没有承诺过头的地方"></textarea>
-          <div class="purpose-hint" id="purposeHint">填了目的，报告会按目的派生审查目标并给出原文证据</div>
-
-          <!-- 目的也可以来自文件：上传说明材料（PDF/Word/图片/ZIP/文本），
-               提取文字后并入目的——长篇的审查要求不必手打 300 字。
-               交互刻意与「待审对象上传」对齐：整块虚线区可点选、可拖放、
-               可一次多选，并把支持格式直接列出来（后端白名单与待审上传同一份）。 -->
-          <div class="purpose-files" id="purposeFiles">
-            <div class="purpose-files-head">
-              <span class="purpose-files-title"><span aria-hidden="true">📎</span> 目的文件<span class="entry-opt">可选</span></span>
-              <span class="purpose-files-hint">提取文字后并入本次目的 · 每份前 2000 字 · 最多 5 个</span>
-            </div>
-
-            <button type="button" class="upload-box purpose-drop" id="purposeFileBtn"
-                    title="上传目的说明文件：PDF / Word / 图片 / ZIP / 文本，可一次多选；提取文字后并入本次审查目的">
-              <span class="upload-main"><span class="upload-ico">📎</span>拖拽文件到这里，或点击选择（可多选）</span>
-              <span class="upload-hint">审查要求 / 检查清单 / 客户邮件 · 提取文字后并入目的</span>
-              <span class="upload-formats" aria-hidden="true">
-                <span class="fmt-row">
-                  <span class="fmt-label">文本/代码</span>
-                  <span class="fmt">.txt</span><span class="fmt">.md</span><span class="fmt">.py</span><span class="fmt">.json</span><span class="fmt">.yaml</span><span class="fmt-more">等</span>
-                </span>
-                <span class="fmt-row">
-                  <span class="fmt-label">文档</span>
-                  <span class="fmt">.pdf</span><span class="fmt">.docx</span><span class="fmt">.doc</span><span class="fmt">.rtf</span>
-                </span>
-                <span class="fmt-row">
-                  <span class="fmt-label">图片</span>
-                  <span class="fmt">.png</span><span class="fmt">.jpg</span><span class="fmt">.gif</span><span class="fmt">.webp</span><span class="fmt">.tiff</span>
-                </span>
-                <span class="fmt-row">
-                  <span class="fmt-label">压缩包</span>
-                  <span class="fmt">.zip</span><span class="fmt-note">递归展开·成员并入同一目的</span>
-                </span>
-              </span>
-            </button>
-
-            <div class="purpose-file-status hidden" id="purposeFileStatus"></div>
-            <div class="purpose-file-list" id="purposeFileList"></div>
-          </div>
-          <input type="file" id="purposeFileInput" class="hidden" multiple
-                 accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
-
-          <div class="purpose-chips" id="purposeChips">
-            <button type="button" class="purpose-chip" data-purpose="这是给客户的报价邮件，帮我找有没有承诺过头的地方">承诺风险</button>
-            <button type="button" class="purpose-chip" data-purpose="帮我核对合同金额、大小写与付款条款是否一致">金额核对</button>
-            <button type="button" class="purpose-chip" data-purpose="帮我找出没有标注来源和统计口径的数据">数据来源</button>
-            <button type="button" class="purpose-chip" data-purpose="检查这份合同缺哪些必备条款、违约责任是否明确">合同要件</button>
-            <button type="button" class="purpose-chip" data-purpose="这是要对外发布的内容，找出需要改的口语化与绝对化表述">对外发布</button>
-          </div>
-          <div class="purpose-foot">
-            <span class="purpose-count" id="purposeCount">0 / 300</span>
-            <button type="button" class="purpose-clear" id="purposeClear">清空</button>
-          </div>
-        </div>
-
-        <!-- 操作按钮常驻底部：左栏内容比视口高时，按钮不能被挤到滚动区外面 -->
-        <div class="left-actions">
-          <label class="research-toggle" title="对事实库外的数字/日期主张，联网检索来源并核验；关闭则只比对内置事实库">
-            <input type="checkbox" id="researchToggle" checked>
-            <span>联网核验库外事实</span>
-          </label>
-          <button class="btn btn-primary" id="runBtn" type="button" disabled>运行审查（需配置 LLM）</button>
-          <button class="btn btn-example" id="exampleBtn" type="button">✨ 用示例文件试跑</button>
+        <div class="sidebar-version">
+          <span>本地受控工作区</span>
+          <span>v0.9.2</span>
         </div>
       </div>
+    </aside>
 
-      <!-- 中栏：进度 + 结果 -->
-      <div class="card result-card">
-        <div class="card-title">审查进度与裁定</div>
-
-        <div class="progress-card hidden" id="progressCard">
-          <div class="progress-title" id="progressTitle">等待开始审查…</div>
-          <div class="steps" id="steps"></div>
+    <main class="app-stage">
+      <header class="topbar">
+        <div class="topbar-title">
+          <span class="topbar-eyebrow">Review Governance</span>
+          <h1 id="pageTitle">审查工作台</h1>
         </div>
-
-        <div class="empty-state" id="resultEmpty">
-          <div class="empty-ico">🔍</div>
-          <div>还没有审查结果</div>
-          <div class="empty-sub">选择文件后运行审查，或点击历史报告查看往期裁定。</div>
+        <div class="topbar-actions">
+          <span class="connection-chip">本地工作区 · 数据不出站</span>
+          <button class="icon-btn" id="themeBtn" type="button" title="界面主题" aria-label="界面主题">◐</button>
         </div>
+      </header>
 
-        <!-- 结果区：一块完整的「裁定」界面，模块自上而下
-             ① 状态条 —— 这份东西能不能用；② 审查目的 —— 拿什么标准判；
-             ③ 裁定 —— 逐项结论；④ 对照矩阵 —— 要求与候选的硬对照；
-             ⑤ 证据 / 原文标注 / 问题汇总 / 问题清单 —— 支撑结论的原文。
-             结构对齐「裁定结果样本/审查进度与裁定-简洁版.html」：审查一结束
-             renderReport() 直接渲染这一套，不再先出一版旧样式再改。 -->
-        <div id="resultView" class="hidden">
-          <div class="rs-bar" id="rsStatus"></div>
+      <div class="llm-banner hidden" id="llmBanner" role="status">
+        <span id="llmBannerText">当前未启用语义模型，运行审查时将使用纯规则模式。</span>
+        <button type="button" id="llmBannerBtn">配置模型</button>
+      </div>
 
-          <section class="rs-sec hidden" id="purposeBlock"></section>
-          <section class="rs-sec hidden" id="verdictBlock"></section>
-          <section class="rs-sec hidden" id="matrixBlock"></section>
-          <section class="rs-sec hidden" id="evidenceBlock"></section>
-
-          <section class="rs-sec anno-block hidden" id="annotatedBlock">
-            <div class="anno-head">
-              <span class="anno-title">原文标注</span>
-              <span class="anno-legend" id="annoLegend"></span>
-              <span class="anno-hint" id="annoHint"></span>
-              <span class="anno-learn">
-                <select id="annoDim" title="漏检问题的维度">
-                  <option value="logic">逻辑</option>
-                  <option value="fact">事实</option>
-                  <option value="compliance">合规</option>
-                  <option value="safety">安全</option>
-                  <option value="style">风格</option>
-                </select>
-                <button class="btn-anno" id="annoMissBtn" type="button"
-                        title="先在原文中选中一句有问题的文字，再点这里">标注漏检</button>
-              </span>
+      <div class="container">
+        <!-- 审查工作台 -->
+        <section class="page active" id="page-review">
+          <div class="page-intro">
+            <div class="page-intro-copy">
+              <div class="page-kicker">Review Command Center</div>
+              <h2>把每一份材料，审到有据可查</h2>
+              <p>选择待审对象与判定标准，查看结论、证据、整改建议和历史版本。</p>
             </div>
-            <div class="anno-text" id="annotatedText"></div>
-          </section>
+            <div class="page-stamp">可追溯 · 可复核 · 可学习</div>
+          </div>
 
-          <section class="rs-sec summary-block hidden" id="summaryBlock">
-            <div class="anno-title">问题汇总 · 按类型归类</div>
-            <div id="issueSummary"></div>
-          </section>
+          <div class="review-layout is-empty" id="reviewLayout">
+            <div class="review-main">
+              <section class="result-card" id="resultCard" aria-label="审查结果">
+                <div class="panel-head">
+                  <div class="panel-head-copy">
+                    <span class="panel-eyebrow">DECISION REPORT</span>
+                    <h2>审查结论</h2>
+                    <p>先看能否使用，再核对目标、证据与整改动作。</p>
+                  </div>
+                  <div class="result-panel-actions">
+                    <div class="workspace-context" id="workspaceContext">正在载入报告上下文</div>
+                  </div>
+                </div>
 
-          <section class="rs-sec hidden" id="actionPlan"></section>
+                <div class="progress-card hidden" id="progressCard">
+                  <div class="progress-top">
+                    <div class="progress-title" id="progressTitle">等待开始审查…</div>
+                    <button class="progress-cancel hidden" id="cancelBtn" type="button">取消任务</button>
+                  </div>
+                  <div class="steps" id="steps"></div>
+                </div>
 
-          <section class="rs-sec hidden" id="researchBlock"></section>
+                <div class="empty-state" id="resultEmpty">
+                  <div class="empty-ico">⌕</div>
+                  <div>还没有审查结果</div>
+                  <div class="empty-sub">在右侧选择待审对象后点「开始审查」；历史报告在「历史报告」页，左侧勾选可批量管理。</div>
+                </div>
 
-          <section class="rs-sec hidden" id="issueList"></section>
+                <div id="resultView" class="hidden">
+                  <div class="rs-bar" id="rsStatus"></div>
+                  <section class="rs-sec hidden" id="purposeBlock"></section>
+                  <section class="rs-sec hidden" id="verdictBlock"></section>
+                  <section class="rs-sec hidden" id="matrixBlock"></section>
+                  <section class="rs-sec hidden" id="evidenceBlock"></section>
 
-          <div id="excludedBlock" class="rs-sec limitations hidden"></div>
-          <div id="limitations" class="rs-sec limitations hidden"></div>
+                  <section class="rs-sec anno-block hidden" id="annotatedBlock">
+                    <div class="anno-head">
+                      <span class="anno-title">原文标注</span>
+                      <span class="anno-legend" id="annoLegend"></span>
+                      <span class="anno-hint" id="annoHint"></span>
+                      <span class="anno-learn">
+                        <label class="sr-only" for="annoDim">漏检问题的维度</label>
+                        <select id="annoDim" title="漏检问题的维度">
+                          <option value="logic">逻辑</option>
+                          <option value="fact">事实</option>
+                          <option value="compliance">合规</option>
+                          <option value="safety">安全</option>
+                          <option value="style">风格</option>
+                        </select>
+                        <button class="btn-anno" id="annoMissBtn" type="button"
+                                title="先在原文中选中一句有问题的文字，再点这里">标注漏检</button>
+                      </span>
+                    </div>
+                    <div class="anno-text" id="annotatedText"></div>
+                  </section>
 
-          <div class="rs-tech" id="rsTech"></div>
+                  <section class="rs-sec summary-block hidden" id="summaryBlock">
+                    <div class="anno-title">问题汇总 · 按类型归类</div>
+                    <div id="issueSummary"></div>
+                  </section>
+
+                  <section class="rs-sec hidden" id="actionPlan"></section>
+                  <section class="rs-sec hidden" id="researchBlock"></section>
+                  <section class="rs-sec hidden" id="issueList"></section>
+                  <div id="excludedBlock" class="rs-sec limitations hidden"></div>
+                  <div id="limitations" class="rs-sec limitations hidden"></div>
+                  <div class="rs-tech" id="rsTech"></div>
+                </div>
+              </section>
+            </div>
+
+            <aside class="review-rail" aria-label="审查设置与历史">
+              <section class="card intake-card">
+                <div class="panel-head">
+                  <div class="panel-head-copy">
+                    <span class="panel-eyebrow">REVIEW INTAKE · NEW REVIEW</span>
+                    <h3>发起一次审查</h3>
+                    <p>先放入材料，再明确判定口径。本次选择只影响即将开始的审查。</p>
+                  </div>
+                  <div class="intake-head-aside">
+                    <span class="intake-status">本地受控</span>
+                    <span class="intake-head-note">材料不外发 · 过程可追溯</span>
+                  </div>
+                </div>
+
+                <div class="source-block">
+                  <section class="intake-panel intake-panel-source" aria-labelledby="intakeSourceTitle">
+                    <div class="intake-panel-head">
+                      <span class="intake-step">01</span>
+                      <div>
+                        <h4 id="intakeSourceTitle">选择审查材料</h4>
+                        <p>上传一份新文件，或从已有待审对象中继续。</p>
+                      </div>
+                    </div>
+
+                  <button class="entry-toggle upload-toggle" id="uploadToggle" type="button"
+                          aria-expanded="false" aria-controls="uploadBox">
+                    <span class="entry-toggle-ico" aria-hidden="true">↑</span>
+                    <span class="entry-toggle-text">
+                      <b>上传新文件</b>
+                      <span class="entry-toggle-sub" id="uploadToggleSub">点击展开，也可以直接拖入文件</span>
+                    </span>
+                    <span class="entry-toggle-caret" aria-hidden="true">⌄</span>
+                  </button>
+
+                  <div class="upload-box hidden" id="uploadBox">
+                    <div class="upload-main"><span class="upload-ico">↑</span>拖拽文件到这里，或点击选择</div>
+                    <div class="upload-hint">文本 ≤ 2 MB · 文档 / 图片 / ZIP ≤ 20 MB</div>
+                    <div class="upload-formats">
+                      <div class="fmt-row"><span class="fmt-label">文本/代码</span><span class="fmt">.txt</span><span class="fmt">.md</span><span class="fmt">.py</span><span class="fmt">.json</span><span class="fmt-more">等</span></div>
+                      <div class="fmt-row"><span class="fmt-label">文档</span><span class="fmt">.pdf</span><span class="fmt">.docx</span><span class="fmt">.doc</span><span class="fmt">.rtf</span></div>
+                      <div class="fmt-row"><span class="fmt-label">图片</span><span class="fmt">.png</span><span class="fmt">.jpg</span><span class="fmt">.webp</span><span class="fmt-more">等</span></div>
+                      <div class="fmt-row"><span class="fmt-label">压缩包</span><span class="fmt">.zip</span><span class="fmt-note">递归展开</span></div>
+                    </div>
+                  </div>
+                  <input type="file" id="fileInput" class="hidden"
+                         accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
+
+                  <div class="file-chip hidden" id="fileChip">
+                    <div>
+                      <div id="fileName"></div>
+                      <div class="file-meta" id="fileMeta"></div>
+                    </div>
+                    <span class="remove" id="fileRemove" title="移除文件">✕</span>
+                  </div>
+
+                  <div class="pick-row pick-target">
+                    <div class="intake-field-label">
+                      <label id="targetPickLabel">已有待审对象</label>
+                      <span>从工作区直接选择</span>
+                    </div>
+                    <!-- 自定义下拉而不是原生 select：原生 option 里放不了删除按钮，
+                         而待审列表里堆的大多是临时上传物，必须能就地清掉。 -->
+                    <div class="target-pick" id="targetPicker">
+                      <button class="target-trigger" id="targetSelect" type="button"
+                              aria-haspopup="listbox" aria-expanded="false"
+                              aria-labelledby="targetPickLabel">
+                        <span class="target-trigger-text" id="targetTriggerText">正在载入…</span>
+                        <span class="target-trigger-caret" aria-hidden="true">⌄</span>
+                      </button>
+                      <div class="target-menu hidden" id="targetMenu" role="listbox"
+                           aria-labelledby="targetPickLabel"></div>
+                    </div>
+                  </div>
+
+                  <div class="source-capabilities" aria-label="材料支持范围">
+                    <div class="source-capability">
+                      <span class="source-capability-ico" aria-hidden="true">▤</span>
+                      <div>
+                        <b>多格式摄取</b>
+                        <span>文档、图片、文本与压缩包</span>
+                      </div>
+                    </div>
+                    <div class="source-capability">
+                      <span class="source-capability-ico" aria-hidden="true">⌂</span>
+                      <div>
+                        <b>本地受控</b>
+                        <span>材料留在工作区，结果可追溯</span>
+                      </div>
+                    </div>
+                  </div>
+                  </section>
+
+                  <section class="intake-panel intake-panel-settings" aria-labelledby="intakeSettingsTitle">
+                    <div class="intake-panel-head">
+                      <span class="intake-step">02</span>
+                      <div>
+                        <h4 id="intakeSettingsTitle">设定判定口径</h4>
+                        <p>选择执行标准与审查情境，也可以补充本次任务目标。</p>
+                      </div>
+                    </div>
+
+                    <div class="intake-criteria-grid">
+                      <div class="pick-row pick-agent">
+                        <label for="agentSelect">审查 Agent / 判定标准</label>
+                        <select id="agentSelect">
+                          <option value="auto">自动路由（推荐）</option>
+                        </select>
+                        <div class="agent-hint" id="agentHint">按文件类型自动选择判定标准</div>
+                      </div>
+
+                      <div class="pick-row pick-scenario">
+                        <label for="scenarioSelect">审查情境</label>
+                        <select id="scenarioSelect">
+                          <option value="">通用（全部规则）</option>
+                        </select>
+                        <div class="agent-hint" id="scenarioHint">全部规则参与（默认）</div>
+                      </div>
+                    </div>
+
+                  <div class="pick-row pick-format">
+                    <div class="fmt-head">
+                      <label id="formatPickLabel">文档格式规格</label>
+                      <button class="fmt-toggle" id="formatToggle" type="button"
+                              aria-expanded="false" aria-controls="formatPanel"
+                              aria-labelledby="formatPickLabel">
+                        <span id="formatToggleText">填写格式要求</span>
+                        <span class="fmt-caret" aria-hidden="true">⌄</span>
+                      </button>
+                    </div>
+                    <div class="agent-hint" id="formatSpecHint">仅对 .docx 生效。没填的项本次不判（不等于「已合规」）。</div>
+
+                    <!-- 分项表单而不是预设下拉：格式要求是"这一份委托方的规定"，
+                         预设只能覆盖写死的几种。填哪项判哪项，空着的不判。 -->
+                    <div class="format-panel hidden" id="formatPanel">
+                      <div class="fmt-sect">
+                        <div class="fmt-sect-title">正文</div>
+                        <div class="fmt-grid">
+                          <label class="fmt-field">
+                            <span>中文字体</span>
+                            <input id="fmtBodyFont" type="text" autocomplete="off"
+                                   placeholder="宋体, SimSun">
+                          </label>
+                          <label class="fmt-field">
+                            <span>字号（磅）</span>
+                            <input id="fmtBodySize" type="number" min="1" step="0.5"
+                                   placeholder="12 = 小四">
+                          </label>
+                          <label class="fmt-field">
+                            <span>首行缩进（字符）</span>
+                            <input id="fmtIndent" type="number" min="0" step="0.5"
+                                   placeholder="2">
+                          </label>
+                          <label class="fmt-field">
+                            <span>行距</span>
+                            <span class="fmt-inline">
+                              <select id="fmtLineMode" aria-label="行距方式">
+                                <option value="">不规定</option>
+                                <option value="exact">固定值（磅）</option>
+                                <option value="multiple">倍数</option>
+                              </select>
+                              <input id="fmtLineValue" type="number" min="0.5" step="0.5"
+                                     placeholder="22 / 2" aria-label="行距数值" disabled>
+                            </span>
+                          </label>
+                        </div>
+                      </div>
+
+                      <div class="fmt-sect">
+                        <div class="fmt-sect-title">段落间距</div>
+                        <div class="fmt-grid">
+                          <label class="fmt-field">
+                            <span>段前（磅）</span>
+                            <input id="fmtSpaceBefore" type="number" min="0" step="1"
+                                   placeholder="留空不判">
+                          </label>
+                          <label class="fmt-field">
+                            <span>段后（磅）</span>
+                            <input id="fmtSpaceAfter" type="number" min="0" step="1"
+                                   placeholder="留空不判">
+                          </label>
+                          <label class="fmt-field">
+                            <span>作用对象</span>
+                            <select id="fmtSpaceScope">
+                              <option value="body">正文段落</option>
+                              <option value="heading">标题段落</option>
+                            </select>
+                          </label>
+                        </div>
+                      </div>
+
+                      <div class="fmt-sect">
+                        <div class="fmt-sect-title">标题</div>
+                        <div class="fmt-grid">
+                          <label class="fmt-field">
+                            <span>最多几级</span>
+                            <input id="fmtMaxLevel" type="number" min="1" max="9" step="1"
+                                   placeholder="3">
+                          </label>
+                        </div>
+                        <div class="fmt-levels" id="fmtLevels">
+                          <div class="fmt-level" data-level="1">
+                            <span class="fmt-lv">标题 1</span>
+                            <input class="fmt-h-font" type="text" autocomplete="off"
+                                   placeholder="字体，如 黑体" aria-label="标题1字体">
+                            <input class="fmt-h-size" type="number" min="1" step="0.5"
+                                   placeholder="磅" aria-label="标题1字号">
+                          </div>
+                          <div class="fmt-level" data-level="2">
+                            <span class="fmt-lv">标题 2</span>
+                            <input class="fmt-h-font" type="text" autocomplete="off"
+                                   placeholder="字体，如 黑体" aria-label="标题2字体">
+                            <input class="fmt-h-size" type="number" min="1" step="0.5"
+                                   placeholder="磅" aria-label="标题2字号">
+                          </div>
+                          <div class="fmt-level" data-level="3">
+                            <span class="fmt-lv">标题 3</span>
+                            <input class="fmt-h-font" type="text" autocomplete="off"
+                                   placeholder="字体" aria-label="标题3字体">
+                            <input class="fmt-h-size" type="number" min="1" step="0.5"
+                                   placeholder="磅" aria-label="标题3字号">
+                          </div>
+                        </div>
+                        <div class="fmt-tip">逐级标题只判「显式设置」的字体字号；继承 Word 标题样式的段落不判错。</div>
+                      </div>
+
+                      <div class="fmt-sect">
+                        <label class="fmt-check">
+                          <input type="checkbox" id="fmtFigref" checked>
+                          <span>图表编号与正文引用一致</span>
+                        </label>
+                      </div>
+
+                      <div class="fmt-foot">
+                        <span class="fmt-summary" id="fmtSummary">未填写：本次不判版式</span>
+                        <button type="button" class="fmt-clear" id="fmtClear">清空</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button class="entry-toggle purpose-toggle" id="purposeToggle" type="button"
+                          aria-expanded="false" aria-controls="purposePanel">
+                    <span class="entry-toggle-ico" aria-hidden="true">◎</span>
+                    <span class="entry-toggle-text">
+                      <b>审查目的<span class="entry-opt">可选</span></b>
+                      <span class="entry-toggle-sub" id="purposeToggleSub">说明这份材料想解决什么问题</span>
+                    </span>
+                    <span class="entry-toggle-caret" aria-hidden="true">⌄</span>
+                  </button>
+
+                  <div class="purpose-panel hidden" id="purposePanel">
+                    <textarea id="purposeInput" rows="3" maxlength="300"
+                              aria-label="审查目的"
+                              placeholder="例：这是给客户的报价邮件，帮我找有没有承诺过头的地方"></textarea>
+                    <div class="purpose-hint" id="purposeHint">填写目的后，报告会按目的派生目标并返回原文证据</div>
+
+                    <div class="purpose-files" id="purposeFiles">
+                      <div class="purpose-files-head">
+                        <span class="purpose-files-title">目的文件<span class="entry-opt">可选</span></span>
+                        <span class="purpose-files-hint">每份前 2000 字 · 最多 5 个</span>
+                      </div>
+                      <button type="button" class="upload-box purpose-drop" id="purposeFileBtn"
+                              title="上传目的说明文件，可多选">
+                        <span class="upload-main">⇧ 拖入或选择要求、检查清单、客户邮件</span>
+                        <span class="upload-hint">提取文字后并入下一次审查目的</span>
+                      </button>
+                      <div class="purpose-file-status hidden" id="purposeFileStatus"></div>
+                      <div class="purpose-file-list" id="purposeFileList"></div>
+                    </div>
+                    <input type="file" id="purposeFileInput" class="hidden" multiple
+                           accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.go,.java,.cpp,.c,.pdf,.docx,.docm,.doc,.rtf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.heic,.zip">
+
+                    <div class="purpose-chips" id="purposeChips">
+                      <button type="button" class="purpose-chip" data-purpose="这是给客户的报价邮件，帮我找有没有承诺过头的地方">承诺风险</button>
+                      <button type="button" class="purpose-chip" data-purpose="帮我核对合同金额、大小写与付款条款是否一致">金额核对</button>
+                      <button type="button" class="purpose-chip" data-purpose="帮我找出没有标注来源和统计口径的数据">数据来源</button>
+                      <button type="button" class="purpose-chip" data-purpose="检查这份合同缺哪些必备条款、违约责任是否明确">合同要件</button>
+                      <button type="button" class="purpose-chip" data-purpose="这是要对外发布的内容，找出需要改的口语化与绝对化表述">对外发布</button>
+                    </div>
+                    <div class="purpose-foot">
+                      <span class="purpose-count" id="purposeCount">0 / 300</span>
+                      <button type="button" class="purpose-clear" id="purposeClear">清空</button>
+                    </div>
+                  </div>
+                  </section>
+
+                  <div class="left-actions">
+                    <div class="left-actions-copy">
+                      <label class="research-toggle" title="对事实库外的数字/日期主张进行检索核验">
+                        <input type="checkbox" id="researchToggle" checked>
+                        <span>联网核验库外事实</span>
+                      </label>
+                      <span class="run-readiness" id="runReadiness">选择材料后即可开始</span>
+                    </div>
+                    <div class="left-actions-buttons">
+                      <button class="btn btn-example" id="exampleBtn" type="button">用示例文件试跑</button>
+                      <button class="btn btn-primary" id="runBtn" type="button" disabled>开始审查</button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+        <!-- 历史报告：左侧列表（含批量操作）/ 右侧该份报告的记录摘要 -->
+        <section class="page" id="page-history">
+          <div class="page-intro">
+            <div class="page-intro-copy">
+              <div class="page-kicker">Report Archive</div>
+              <h2>历史报告</h2>
+              <p>左侧按时间浏览、勾选批量管理；右侧看这份报告的结论、判定依据版本与审计哈希，再一键进入审查控制台看全文。</p>
+            </div>
+            <div class="page-stamp">只读 · 可追溯</div>
+          </div>
+
+          <div class="history-page">
+            <aside class="history-browser" id="historyPane" aria-label="历史报告列表">
+              <section class="history-card" aria-label="历史报告">
+                <div class="history-card-head">
+                  <div class="history-card-title">
+                    <span class="panel-eyebrow">REPORT HISTORY</span>
+                    <span class="history-card-name" id="historyTitle">历史报告</span>
+                  </div>
+                  <div class="history-tools">
+                    <button type="button" class="history-fav-filter" id="historyFavFilter"
+                            aria-pressed="false" title="只看收藏报告">收藏</button>
+                    <button type="button" class="history-trash-filter" id="historyTrash"
+                            title="查看并恢复已移入回收站的报告">回收站</button>
+                    <button type="button" class="history-refresh" id="historyRefresh"
+                            title="刷新历史报告">刷新</button>
+                  </div>
+                </div>
+
+                <div class="history-batch" aria-label="批量操作">
+                  <label class="history-select-all">
+                    <input type="checkbox" id="historySelectAll">
+                    <span>全选当前</span>
+                  </label>
+                  <span class="history-selection-count" id="historySelectionCount">已选 0</span>
+                  <div class="history-batch-actions">
+                    <button type="button" id="historyBatchFavorite" disabled>收藏</button>
+                    <button type="button" id="historyBatchUnfavorite" disabled>取消</button>
+                    <button type="button" class="danger" id="historyBatchDelete" disabled>删除</button>
+                  </div>
+                </div>
+
+                <div class="history-toolbar">
+                  <label class="history-search">
+                    <span class="sr-only">搜索历史报告</span>
+                    <input id="historySearch" type="search" placeholder="搜索文件、报告编号" autocomplete="off">
+                  </label>
+                  <label>
+                    <span class="sr-only">筛选审查结果</span>
+                    <select class="history-filter" id="historyFilter">
+                      <option value="all">全部结果</option>
+                      <option value="fail">FAIL</option>
+                      <option value="warn">WARN</option>
+                      <option value="pass">未发现</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div id="historyList"></div>
+                <div class="integrity-bar" id="integrityBar">正在校验审计链…</div>
+              </section>
+            </aside>
+
+            <section class="history-detail" id="historyDetail" aria-label="历史报告记录">
+              <div class="history-detail-empty" id="historyDetailEmpty">
+                <div class="hd-empty-ico" aria-hidden="true">▤</div>
+                <p class="hd-empty-title">还没有选择报告</p>
+                <p class="hd-empty-sub">
+                  点左侧任一条：这里显示结论、待审对象、判定依据版本与审计哈希。
+                  要读原文标注和完整问题清单，再点「在审查控制台打开」。
+                </p>
+              </div>
+              <div class="history-detail-body hidden" id="historyDetailBody"></div>
+            </section>
+          </div>
+        </section>
+
+        <!-- 规则与学习 -->
+        <section class="page" id="page-rules">
+          <div class="page-intro">
+            <div class="page-intro-copy">
+              <div class="page-kicker">Policy Studio</div>
+              <h2>规则与学习</h2>
+              <p>查看每条规则的执行方式、严重度与启用状态，并审阅学习闭环产生的候选规则。</p>
+            </div>
+            <div class="page-stamp">判定标准可配置</div>
+          </div>
+
+          <div class="card">
+            <div class="rules-head">
+              <div>
+                <span class="panel-eyebrow">RULE LIBRARY</span>
+                <div class="card-title" id="rulesTitle">规则库</div>
+              </div>
+              <button class="pending-toggle" id="pendingToggle" type="button"
+                      aria-expanded="false" aria-controls="pendingPanel"
+                      title="查看待人工审核的规则候选">
+                <span class="pending-dot" aria-hidden="true"></span>
+                <span>待人工审核</span>
+                <span class="pending-badge" id="pendingBadge">0</span>
+              </button>
+            </div>
+            <div class="pending-panel" id="pendingPanel" hidden></div>
+            <div class="filter-bar" id="ruleFilters">
+              <button class="filter-chip active" data-dim="all" type="button">全部</button>
+              <button class="filter-chip" data-dim="fact" type="button">事实</button>
+              <button class="filter-chip" data-dim="logic" type="button">逻辑</button>
+              <button class="filter-chip" data-dim="safety" type="button">安全</button>
+              <button class="filter-chip" data-dim="compliance" type="button">合规</button>
+              <button class="filter-chip" data-dim="style" type="button">风格</button>
+              <button class="filter-chip" data-dim="format" type="button">格式</button>
+            </div>
+            <div class="table-wrap">
+              <table class="rules">
+                <thead>
+                  <tr>
+                    <th scope="col" style="width:105px;">规则 ID</th>
+                    <th scope="col" style="width:75px;">维度</th>
+                    <th scope="col">规则描述</th>
+                    <th scope="col" style="width:90px;">严重度</th>
+                    <th scope="col" style="width:105px;">执行方式</th>
+                    <th scope="col" style="width:55px;">启用</th>
+                  </tr>
+                </thead>
+                <tbody id="rulesBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 审计轨迹 -->
+        <section class="page" id="page-logs">
+          <div class="page-intro">
+            <div class="page-intro-copy">
+              <div class="page-kicker">Audit Trail</div>
+              <h2>审计轨迹</h2>
+              <p>查看一次审查中的任务步骤、决策依据、工具调用与成本信息。</p>
+            </div>
+            <div class="page-stamp">全过程留痕</div>
+          </div>
+
+          <div class="card">
+            <div class="logs-head">
+              <div>
+                <span class="panel-eyebrow">TRACE DETAIL</span>
+                <div class="card-title" id="logsTitle">审计日志</div>
+              </div>
+              <label>
+                <span class="sr-only">选择审查报告</span>
+                <select id="logSelect" class="log-select"></select>
+              </label>
+            </div>
+
+            <div class="log-subtabs" role="tablist" aria-label="日志类型">
+              <button class="log-subtab active" data-log="task" type="button">任务步骤</button>
+              <button class="log-subtab" data-log="decision" type="button">决策依据</button>
+              <button class="log-subtab" data-log="tool" type="button">工具调用</button>
+              <button class="log-subtab" data-log="cost" type="button">成本记录</button>
+            </div>
+
+            <div class="log-content active" id="log-task"></div>
+            <div class="log-content" id="log-decision"></div>
+            <div class="log-content" id="log-tool"></div>
+            <div class="log-content" id="log-cost"></div>
+          </div>
+        </section>
+
+        <!-- 可信链 -->
+        <section class="page" id="page-ledger">
+          <div class="page-intro">
+            <div class="page-intro-copy">
+              <div class="page-kicker">Integrity Ledger</div>
+              <h2>可信链校验</h2>
+              <p>校验报告哈希、前后节点衔接与规则版本，确认历史结论是否仍然完整可靠。</p>
+            </div>
+            <div class="page-stamp">SHA-256 · 追加式账本</div>
+          </div>
+
+          <div class="card">
+            <div class="panel-head">
+              <div class="panel-head-copy">
+                <span class="panel-eyebrow">LEDGER HEALTH</span>
+                <h2>审计链状态</h2>
+                <p id="ledgerIntro">当前链状态：加载中…</p>
+              </div>
+            </div>
+            <div class="chain-visual" id="chainVisual"></div>
+            <div class="verify-result" id="verifyResult"></div>
+            <div class="ledger-meta" id="ledgerMeta"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <div id="llmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="llmTitle">
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel">
+      <div class="modal-head">
+        <div>
+          <h2 id="llmTitle">配置审查模型</h2>
+          <p class="modal-sub">支持 OpenAI 兼容端点。未配置时可使用纯规则模式完成审查。</p>
         </div>
+        <button type="button" class="icon-btn" id="llmClose" title="关闭" aria-label="关闭">✕</button>
       </div>
 
-      <!-- 右栏：历史 -->
-      <div class="card">
-        <div class="card-title history-head">
-          <span id="historyTitle">历史报告（0）</span>
-          <span class="history-tools">
-            <button type="button" class="history-fav-filter" id="historyFavFilter"
-                    aria-pressed="false"
-                    title="只看收藏过的报告；再点一次回到全部">★ 收藏</button>
-            <button type="button" class="history-refresh" id="historyRefresh"
-                    title="重新拉取历史报告列表（在命令行或其他窗口跑完审查后，本页不会自己知道）">⟳ 刷新</button>
-          </span>
-        </div>
-        <div id="historyList"></div>
-        <div class="legend">
-          <span><span class="status-dot dot-red"></span> FAIL</span>
-          <span><span class="status-dot dot-yellow"></span> WARN</span>
-          <span><span class="status-dot dot-green"></span> PASS</span>
-        </div>
-        <div class="integrity-bar" id="integrityBar">加载中…</div>
-      </div>
+      <form id="llmForm" novalidate>
+        <label class="form-field">
+          <span>服务商</span>
+          <select id="llmProvider"></select>
+        </label>
+        <div class="provider-hint" id="providerHint"></div>
 
+        <label class="form-field">
+          <span>Base URL</span>
+          <input id="llmBaseUrl" type="url" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="form-field">
+          <span>模型</span>
+          <input id="llmModel" type="text" list="llmModelList" placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
+          <datalist id="llmModelList"></datalist>
+        </label>
+        <label class="form-field">
+          <span>API Key</span>
+          <input id="llmKey" type="password" placeholder="留空表示保留已保存的 Key" autocomplete="new-password">
+        </label>
+        <label class="check"><input type="checkbox" id="llmClearKey"> 清除已保存的 Key</label>
+        <label class="check"><input type="checkbox" id="llmEnabled"> 启用模型语义审</label>
+
+        <div class="llm-history hidden" id="llmHistoryWrap">
+          <div class="llm-history-title">最近使用</div>
+          <div class="llm-history-list" id="llmHistoryList"></div>
+        </div>
+
+        <details class="advanced">
+          <summary>高级参数</summary>
+          <div class="advanced-grid">
+            <label class="form-field"><span>超时（秒）</span><input id="llmTimeout" type="number" min="1" max="600" step="1"></label>
+            <label class="form-field"><span>最大输出 Token</span><input id="llmMaxTokens" type="number" min="16" max="8192" step="1"></label>
+          </div>
+        </details>
+
+        <div class="llm-status" id="llmStatusLine">正在读取配置…</div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost" id="llmReset">恢复默认</button>
+          <span class="spacer"></span>
+          <button type="button" class="btn btn-ghost" id="llmTest">测试连接</button>
+          <button type="submit" class="btn-save" id="llmSave">保存配置</button>
+        </div>
+      </form>
     </div>
   </div>
 
-  <!-- ========== TAB 2: 规则库 ========== -->
-  <div class="page" id="page-rules">
-    <div class="card">
-      <div class="rules-head">
-        <div class="card-title" id="rulesTitle">规则库</div>
-        <!-- 右上角：待人工审核的规则候选。数量 = 门禁没拒、也还没人下决定的那些。 -->
-        <button class="pending-toggle" id="pendingToggle" type="button"
-                aria-expanded="false" aria-controls="pendingPanel"
-                title="学习闭环产出的候选规则，必须先由人看过类型与证据才能晋升">
-          <span class="pending-dot" aria-hidden="true"></span>
-          <span>待人工审核</span>
-          <span class="pending-badge" id="pendingBadge">0</span>
-        </button>
-      </div>
-      <div class="pending-panel" id="pendingPanel" hidden></div>
-      <div class="filter-bar" id="ruleFilters">
-        <button class="filter-chip active" data-dim="all" type="button">全部</button>
-        <button class="filter-chip" data-dim="fact" type="button">事实审查</button>
-        <button class="filter-chip" data-dim="safety" type="button">安全审查</button>
-        <button class="filter-chip" data-dim="compliance" type="button">合规审查</button>
-        <button class="filter-chip" data-dim="style" type="button">风格审查</button>
-      </div>
-      <table class="rules">
-        <thead>
-          <tr>
-            <th style="width:110px;">规则 ID</th>
-            <th style="width:90px;">维度</th>
-            <th>规则描述</th>
-            <th style="width:90px;">严重度</th>
-            <th style="width:120px;" title="确定性=代码执行；声明式=pattern 引擎执行；仅提示=只给模型的提示">执行方式</th>
-            <th style="width:60px;">启用</th>
-          </tr>
-        </thead>
-        <tbody id="rulesBody"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- ========== TAB 3: 审计日志 ========== -->
-  <div class="page" id="page-logs">
-    <div class="card">
-      <div class="logs-head">
-        <div class="card-title" id="logsTitle">审计日志</div>
-        <select id="logSelect" class="log-select"></select>
-      </div>
-
-      <div class="log-subtabs">
-        <button class="log-subtab active" data-log="task" type="button">任务日志</button>
-        <button class="log-subtab" data-log="decision" type="button">决策日志</button>
-        <button class="log-subtab" data-log="tool" type="button">工具日志</button>
-        <button class="log-subtab" data-log="cost" type="button">成本日志</button>
-      </div>
-
-      <div class="log-content active" id="log-task"></div>
-      <div class="log-content" id="log-decision"></div>
-      <div class="log-content" id="log-tool"></div>
-      <div class="log-content" id="log-cost"></div>
-    </div>
-  </div>
-
-  <!-- ========== TAB 4: 校验 Ledger ========== -->
-  <div class="page" id="page-ledger">
-    <div class="card">
-      <div class="card-title">Ledger 审计链校验</div>
-      <div class="ledger-intro" id="ledgerIntro">当前链状态：加载中…</div>
-      <div class="chain-visual" id="chainVisual"></div>
-      <div class="verify-result" id="verifyResult"></div>
-      <div class="ledger-meta" id="ledgerMeta"></div>
-    </div>
-  </div>
-
-</div>
-
-<footer class="footer">
-  审查 Agent Demo · SHA-256 防无意改动与事后抵赖 · 防恶意篡改需数字签名（v1.0）
-</footer>
-
-<div id="toast" class="toast hidden"></div>
-
-<!-- LLM 配置弹窗 -->
-<div id="llmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="llmTitle">
-  <div class="modal-backdrop" data-close="1"></div>
-  <div class="modal-panel">
-    <div class="modal-head">
-      <div>
-        <h2 id="llmTitle">大模型 API 配置</h2>
-        <p class="modal-sub">OpenAI 兼容端点。保存后立即生效，审查时按维度调用；不配置则纯规则审。</p>
-      </div>
-      <button type="button" class="icon-btn" id="llmClose" title="关闭" aria-label="关闭">✕</button>
-    </div>
-
-    <form id="llmForm" novalidate>
-      <label class="form-field">
-        <span>服务商</span>
-        <select id="llmProvider"></select>
-      </label>
-      <div class="provider-hint" id="providerHint"></div>
-
-      <label class="form-field">
-        <span>Base URL</span>
-        <input id="llmBaseUrl" type="url" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false">
-      </label>
-      <label class="form-field">
-        <span>模型</span>
-        <input id="llmModel" type="text" list="llmModelList" placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
-        <datalist id="llmModelList"></datalist>
-      </label>
-      <label class="form-field">
-        <span>API Key</span>
-        <input id="llmKey" type="password" placeholder="留空表示保留已保存的 Key" autocomplete="new-password">
-      </label>
-      <label class="check"><input type="checkbox" id="llmClearKey"> 清除已保存的 Key</label>
-      <label class="check"><input type="checkbox" id="llmEnabled"> 启用大模型语义审（关闭则纯规则）</label>
-
-      <div class="llm-history hidden" id="llmHistoryWrap">
-        <div class="llm-history-title">最近使用（点击可切回）</div>
-        <div class="llm-history-list" id="llmHistoryList"></div>
-      </div>
-
-      <details class="advanced">
-        <summary>高级</summary>
-        <div class="advanced-grid">
-          <label class="form-field"><span>超时（秒）</span><input id="llmTimeout" type="number" min="1" max="600" step="1"></label>
-          <label class="form-field"><span>max_tokens</span><input id="llmMaxTokens" type="number" min="16" max="8192" step="1"></label>
+  <div id="trashModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="trashTitle">
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel trash-panel">
+      <div class="modal-head">
+        <div>
+          <h2 id="trashTitle">回收站</h2>
+          <p class="modal-sub" id="trashSummary">正在读取已删除报告…</p>
         </div>
-      </details>
-
-      <div class="llm-status" id="llmStatusLine">加载中…</div>
-
+        <button type="button" class="icon-btn" id="trashClose" title="关闭" aria-label="关闭">✕</button>
+      </div>
+      <div class="trash-list" id="trashList"></div>
       <div class="modal-actions">
-        <button type="button" class="btn-ghost" id="llmReset">恢复默认</button>
+        <button type="button" class="btn btn-ghost btn-danger-text" id="trashEmpty" disabled>清空回收站</button>
         <span class="spacer"></span>
-        <button type="button" class="btn-ghost" id="llmTest">测试连接</button>
-        <button type="submit" class="btn-save" id="llmSave">保存</button>
+        <button type="button" class="btn btn-ghost" id="trashCloseFoot" data-close="1">关闭</button>
       </div>
-    </form>
-  </div>
-</div>
-
-<!-- 删除历史报告：二次确认 -->
-<div id="confirmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
-  <div class="modal-backdrop" data-close="1"></div>
-  <div class="modal-panel">
-    <div class="modal-head">
-      <div>
-        <h2 id="confirmTitle">确认删除历史报告</h2>
-        <p class="modal-sub" id="confirmSub"></p>
-      </div>
-      <button type="button" class="icon-btn" id="confirmClose" title="关闭" aria-label="关闭">✕</button>
-    </div>
-
-    <div class="confirm-warn">
-      此操作不可撤销（可在回收区自行找回），具体影响：
-      <ul>
-        <li>报告 JSON / Markdown 与审查日志移入 <code>outputs/.trash/</code></li>
-        <li>审计链上该节点标记为「已删除」，链的衔接保持不变、不会断裂</li>
-        <li>该报告将从历史列表与台账清单中消失</li>
-      </ul>
-    </div>
-
-    <div class="modal-actions">
-      <span class="spacer"></span>
-      <button type="button" class="btn-ghost" id="confirmCancel">取消</button>
-      <button type="button" class="btn-danger" id="confirmOk">确认删除</button>
     </div>
   </div>
-</div>
 
-<script src="/static/config.js"></script>
-<script src="/static/app.js"></script>
+  <div id="confirmModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-panel">
+      <div class="modal-head">
+        <div>
+          <h2 id="confirmTitle">确认删除历史报告</h2>
+          <p class="modal-sub" id="confirmSub"></p>
+        </div>
+        <button type="button" class="icon-btn" id="confirmClose" title="关闭" aria-label="关闭">✕</button>
+      </div>
+      <div class="confirm-warn" id="confirmWarn"></div>
+      <div class="modal-actions">
+        <span class="spacer"></span>
+        <button type="button" class="btn btn-ghost" id="confirmCancel">取消</button>
+        <button type="button" class="btn-danger" id="confirmOk">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/config.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

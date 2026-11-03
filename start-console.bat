@@ -99,19 +99,28 @@ echo   Python: %PY%
 call :log "python=%PY%"
 
 REM ---------- port check ----------
+:port_loop
 netstat -an 2>nul | findstr /c:":%PORT% " | findstr "LISTENING" >nul
-if not errorlevel 1 goto :reuse
+if not errorlevel 1 goto :check_running
 
+goto :start_server
+
+:check_running
+call :server_matches_source
+if not errorlevel 1 goto :reuse_ok
+
+echo [INFO] Port %PORT% is running an older console; starting current code on the next free port.
+call :log "stale console on %PORT%; trying another port"
+set /a PORT+=1
+if %PORT% GTR 65535 goto :port_busy
+goto :port_loop
+
+:start_server
 echo [INFO] Starting review console on port %PORT% ...
 call :log "starting server on %PORT%"
 start "ReviewAgent Console" "%PY%" %PYARGS% "%~dp0server.py" --port %PORT%
 goto :wait
 
-:reuse
-where curl >nul 2>nul
-if errorlevel 1 goto :reuse_ok
-curl -s -f -o nul --max-time 1 "http://127.0.0.1:%PORT%/api/targets"
-if errorlevel 1 goto :port_busy
 :reuse_ok
 echo [INFO] Port %PORT% is already serving the console; reusing it.
 call :log "reuse existing console on %PORT%"
@@ -151,6 +160,11 @@ call :log "ERROR: pyyaml failed"
 if defined CHECKONLY exit /b 2
 pause
 exit /b 1
+
+:server_matches_source
+"%PY%" %PYARGS% -c "import hashlib,json,pathlib,sys,urllib.request; want=hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); have=json.load(urllib.request.urlopen('http://127.0.0.1:%PORT%/api/health',timeout=1)).get('fingerprint'); raise SystemExit(0 if have == want else 1)" "%~dp0server.py" >nul 2>nul
+if errorlevel 1 exit /b 1
+exit /b 0
 
 :log
 echo [%time%] %~1>>"%LOG%"

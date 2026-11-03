@@ -1,9 +1,10 @@
 # Review Agent 架构 v1
 
-> 状态（2026-11-01，批次 1「工程底线」）：**六层骨架全部落地，旧流程仍是默认路径**。
+> 状态（2026-11-03）：**默认执行链路已是 v1；legacy 冻结为只读回滚路径**。
 > `review_agent/` 已提供领域模型、运行时（六节点 + 编排器 + 检查点）、Application Service
-> （含 Task / Report / Audit）、工具注册表与适配器；但 `--engine` 缺省仍是 `legacy`，
-> `tools/` 的 43 个模块尚未逐个迁移。
+> （含 Task / Report / Audit）、工具注册表与适配器；`--engine` 缺省为 `v1`，
+> `legacy` 仅用于回滚与差异验证（不再增加功能）。
+> `tools/` 的 46 个模块尚未逐个迁移。
 > 逐段迁移的顺序与验收标准见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)；
 > 切流（V1 接管）+ 证据可信度 + 工程闭环的排期见
 > [V1-架构收口与整改方案.md](V1-架构收口与整改方案.md)。

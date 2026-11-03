@@ -13,7 +13,7 @@ REFACTOR_PLAN 阶段 2 的验收标准是「每个节点都能单独测试」。
     3. **历史一致**：拿 207 份历史报告的 findings 重放，裁定必须与报告一致；
        不一致只允许是已登记的那 5 份（旧版本在「库外事实未核完」时错给了 pass）。
 
-历史语料只在本地有（outputs/ 被 .gitignore 排除）；CI 跑前两组。
+历史回放已迁到 `test_historical_corpus.py`，这里只保留确定性节点测试。
 """
 import asyncio
 import sys
@@ -40,11 +40,6 @@ from review_agent.domain import (                      # noqa: E402
 )
 from review_agent.runtime import NodeContext, NodeResult, RunState, advance  # noqa: E402
 from review_agent.runtime.nodes import DecisionEngineNode, build_decision  # noqa: E402
-
-try:                                                    # discover -s checks 与包导入都成立
-    from test_legacy_adapter import KNOWN_VERDICT_DEVIATIONS
-except ImportError:                                     # pragma: no cover
-    from checks.test_legacy_adapter import KNOWN_VERDICT_DEVIATIONS
 
 REVIEW_ID = "R-20261030-001"
 RUN_ID = f"{REVIEW_ID}-RUN01"
@@ -177,66 +172,6 @@ class AdvanceIntegrationTests(unittest.TestCase):
         state = decision_state([])
         with self.assertRaises(InvalidTransition):
             self._advance(state, NodeResult.fail("模型不可用"))
-
-
-def historical_reports():
-    outputs = ROOT / "outputs"
-    if not outputs.is_dir():
-        return []
-    import json
-    out = []
-    for path in sorted(outputs.rglob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and "review_id" in data and isinstance(
-                data.get("verdict"), str):
-            out.append(data)
-    return out
-
-
-@unittest.skipUnless(historical_reports(), "outputs/ 不存在（CI 无历史语料）")
-class HistoricalReplayTests(unittest.TestCase):
-    """双跑：拿历史报告的 findings 重放裁定，只允许已登记的偏差。"""
-
-    def test_replay_reproduces_historical_verdicts(self):
-        from review_agent.adapters.issue_codec import encode_issues
-
-        unexpected = []
-        for report in historical_reports():
-            findings = [e.finding for e in encode_issues(
-                report.get("issues") or [], run_id=RUN_ID)]
-            research = report.get("research") or {}
-            decision = build_decision(
-                findings, run_id=RUN_ID,
-                external_unverified=bool(research.get("unverified")
-                                         or research.get("needs_confirm")))
-            if decision.verdict.value == report["verdict"]:
-                continue
-            if report["review_id"] in KNOWN_VERDICT_DEVIATIONS:
-                continue
-            unexpected.append((report["review_id"], report["verdict"],
-                               decision.verdict.value))
-        self.assertEqual(unexpected, [], "出现未解释的历史裁定差异")
-
-    def test_known_deviation_list_is_not_stale(self):
-        """登记清单里的每一条都必须真的还能复现差异，否则说明清单该删了。"""
-        from review_agent.adapters.issue_codec import encode_issues
-
-        still_diff = set()
-        for report in historical_reports():
-            findings = [e.finding for e in encode_issues(
-                report.get("issues") or [], run_id=RUN_ID)]
-            research = report.get("research") or {}
-            decision = build_decision(
-                findings, run_id=RUN_ID,
-                external_unverified=bool(research.get("unverified")
-                                         or research.get("needs_confirm")))
-            if decision.verdict.value != report["verdict"]:
-                still_diff.add(report["review_id"])
-        self.assertLessEqual(KNOWN_VERDICT_DEVIATIONS, still_diff,
-                             "清单里有已不再偏差的报告，请同步更新")
 
 
 if __name__ == "__main__":

@@ -2507,6 +2507,8 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
             type_override=None, agent_id=None, purpose=None, purpose_max=None,
             purpose_notes=None, scenario=None, format_spec=None,
             research_enabled=False, review_id=None):
+    # FROZEN（问题 1 / 第一阶段）：legacy 是只读回滚实现。
+    # 这里只接受安全与数据损坏修复；新能力一律进 v1（ReviewApplication）。
     t0 = time.perf_counter()
     # 非 UTF-8（GBK/UTF-16）不能让整个进程崩掉：按候选编码依次尝试。
     try:
@@ -4219,6 +4221,15 @@ ENGINE_ENV = "REVIEW_ENGINE"
 ENGINES = ("legacy", "v1", "shadow")
 DEFAULT_ENGINE = "v1"
 
+# 问题 1（P0）第一阶段：legacy 冻结为「只读回滚实现」。
+# 冻结 ≠ 删除：入口保留（回滚与差异验证要用），但不再接受新功能；
+# 新能力只进 v1。显式跑 legacy 时必须在 stderr 说明这一点，
+# 避免有人把回滚路径当成仍在演进的正式链路。
+LEGACY_FROZEN = True
+LEGACY_FROZEN_NOTICE = (
+    "[engine] legacy 已冻结：仅用于回滚与差异验证，不再增加功能；"
+    "正式执行链路是 v1（--engine v1，默认）。")
+
 
 def _take_engine(args):
     """从 argv 里取出 `--engine X` / `--engine=X`，缺省读环境变量，再缺省 v1。
@@ -4246,6 +4257,9 @@ def _take_engine(args):
     if engine not in ENGINES:
         print(f"未知引擎：{engine!r}；可选：{' / '.join(ENGINES)}")
         sys.exit(2)
+    if engine == "legacy" and LEGACY_FROZEN:
+        # 走 stderr：stdout 要留给 REVIEW_RESULT 行，不能被提示语插队。
+        print(LEGACY_FROZEN_NOTICE, file=sys.stderr, flush=True)
     return engine, rest
 
 
@@ -5159,10 +5173,30 @@ def main():
         print(f"未知审查情境：{scenario}；可选：{opts}")
         sys.exit(2)
     format_spec = None
+    if "--format-spec-json" in args:
+        i = args.index("--format-spec-json")
+        if i + 1 < len(args):
+            raw_json = args[i + 1]
+            del args[i:i + 2]
+            try:
+                format_spec = json.loads(raw_json)
+            except json.JSONDecodeError as e:
+                print(f"--format-spec-json 不是合法 JSON：{e}")
+                sys.exit(2)
+            if not isinstance(format_spec, dict):
+                print("--format-spec-json 必须是对象（check 块）")
+                sys.exit(2)
+        else:
+            del args[i]
+            print("--format-spec-json 缺少取值")
+            sys.exit(2)
     if "--format-spec" in args:
         i = args.index("--format-spec")
         if i + 1 < len(args):
-            format_spec = args[i + 1]
+            # 同时给了 --format-spec-json 时以 json 为准：它是更精确的那一个
+            # （前端已经按分项表单算好了数值），id 只是它的来源说明。
+            if not isinstance(format_spec, dict):
+                format_spec = args[i + 1]
             del args[i:i + 2]
         else:
             del args[i]

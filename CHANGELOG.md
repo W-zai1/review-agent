@@ -42,7 +42,185 @@
 
 ---
 
+# 2026-11-03
+
+### 2026-11-03 · 修改 · 任务生命周期收口到 TaskService（server 保留子进程隔离）
+
+- **文件**：`review_agent/application/tasks.py`（新增 `start_review_with` / `start_async_with`，`_execute` 接受 per-call runner；原 `start_review` / `start_async` 委托，签名不变）、`server.py`（新增 `_task_service` / `_SubprocessRunner` / `_watch_cancel`；`_start_review` 与同步 `/api/review` 改走 TaskService；`_cancel_review` 改 `service.cancel`；`_recover_jobs` 改 `service.recover`；删除 `_finish_sync_task` 与 server 侧任务状态写入）、`checks/test_server_tasks.py`（替身接缝从 `_run_review_job` 移到 Runner 注入，断言意图不变）、`checks/test_subprocess_runner.py`（新增 5 项）、`docs/整改报告-第一阶段.md`（新增）
+- **改了什么**：
+  1. 任务创建、幂等、并发闸门、取消、超时、恢复只有 `TaskService` 一套语义；`server.py` 不再 import 或调用 `finish_task` / `mark_task` / `recover_tasks`（引用数 0）。
+  2. `_SubprocessRunner` 是 Runner 适配层，内部仍是 `Popen(review.py)`：进程隔离保留。取消/超时令牌由 TaskService 置位，`_watch_cancel` 先 terminate、10 秒不退再 kill。
+  3. `_run_review_job` 只起进程、盯令牌、把结果折成 `TaskOutcome`，不再写任务记录；`JOBS` 仅前端视图。
+  4. 同步 `/api/review` 与异步 `/api/review/start` 走同一条链；响应字段保持（`ok/report/id/elapsed/timeout/review_id/error_kind`）。
+  5. 建 `TaskService` 加锁：两个 HTTP 线程同时首次调用会各建一个实例，导致「取消」拿到的令牌不属于正在执行的实例。
+- **为什么**：甲方问题 2：`server.py` 自己写创建/取消/超时/恢复，而 `TaskService` 在生产零调用——同一件事两套业务语义。此前的「按任务记录做闸门」只统一了事实来源，没有统一生命周期；本次按甲方要求用 Runner 接口做适配层，没有砍掉子进程隔离。
+- **验证**：`checks` 全量 **829 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1）**；临时副本起真实 server 走 HTTP：异步 start → `status=done / task_status=completed / 6 步`、同步 `/api/review` → `ok / verdict=warn / elapsed=1.0s`、`/api/integrity` → `chain_ok=true / entries=2`、任务记录 `completed/finalize/v1` 且幂等键存在；`checks.test_subprocess_runner` 5 项覆盖成功/失败/缺报告/取消 terminate/命令行参数；`checks.test_server_tasks` 16 项。真实 `outputs/`、`ledger/` 未写入（全部在临时副本）。
+
+### 2026-11-03 · 修改 · legacy 冻结为只读回滚实现
+
+- **文件**：`review.py`（`LEGACY_FROZEN` / `LEGACY_FROZEN_NOTICE`、`_take_engine` 提示、`run_one` 冻结注释）、`checks/test_legacy_freeze.py`（新增 8 项）、`docs/ARCHITECTURE.md` §状态
+- **改了什么**：`--engine legacy`（或 `REVIEW_ENGINE=legacy`）时向 **stderr** 打印一次「legacy 已冻结：仅用于回滚与差异验证，不再增加功能；正式执行链路是 v1」。默认引擎、非法值 exit 2、legacy 入口、shadow 双跑均不变；未删除任何代码路径。`docs/ARCHITECTURE.md` 状态行从「旧流程仍是默认路径」改为「默认 v1；legacy 只读回滚」，工具模块数按实测 43→46 更正。
+- **为什么**：甲方问题 1 第一阶段要求「固定 legacy 为只读回滚实现，不再增加功能」。此前默认值已切到 v1，但代码里没有任何边界标记：回滚路径看起来仍像可继续演进的正式链路。冻结必须可见（跑的时候提示、读代码时注释），否则下一个人仍会把新能力加进 `run_one`。
+- **验证**：`python -m unittest checks.test_legacy_freeze checks.test_engine_switch -v` → **21 项 OK**；临时副本对 3 份 selftest 语料跑 `--engine shadow` 双跑 → **3/3 双跑一致**（`unexplained=0`，verdict 分别 fail/warn/warn）；`py_compile` OK。真实 `outputs/`、`ledger/` 未写入（全部在临时副本）。
+
+### 2026-11-03 · 修改 · 历史回放改用显式语料，公开检查不再扫描运行报告
+
+- **文件**：新增 `checks/history_corpus.py`（显式语料加载与完整性校验）、`checks/test_historical_corpus.py`（集中历史回放）；`checks/test_decision_node.py`、`checks/test_cross_review_node.py`、`checks/test_evidence_node.py`、`checks/test_issue_codec.py`、`checks/test_legacy_adapter.py`（移除各自隐式扫描 `outputs/` 的历史回放，断言原样迁移）
+- **改了什么**：历史回放只在显式设置 `REVIEW_AGENT_HISTORY_DIR` 时运行；未设置时跳过，设置后目录缺失、坏 JSON、文件名与 `review_id` 不一致、重复报告或缺少五个已登记偏差样本都直接失败。公开 `checks` 不再根据用户保留的报告数量改变结果。
+- **为什么**：旧测试对 `outputs/` 的发现口径不一致：部分只看顶层而跳过，部分递归读到残缺语料后运行，最终出现无法复现的“历史偏差清单过期”；测试数据来源和执行层级也没有明确边界。
+- **验证**：全量 `checks` 816 项 OK（跳过 11；其中历史回放因未配置显式语料跳过）；全量 `tests` 686 项 OK（跳过 1）；显式把不完整目录设为历史语料时按预期立即报错。
+
+### 2026-11-03 · 修复 · LLM Key 不再写入本地配置，改为会话或环境注入
+
+- **文件**：`tools/llm_client.py`（会话 Key、读写剥离 `api_key`、环境变量优先）、`server.py`（同步/异步审查子进程继承会话 Key）、`checks/test_invariants.py`（新增 3 项安全不变量）、`tests/test_api_contract.py`（Key 保存后磁盘无明文断言）、`config/llm.local.json`（移除 `api_key` 字段，保留其余非敏感配置）
+- **改了什么**：控制台手工填写的 Key 只保存在服务进程内存；本地 JSON 只持久化端点、模型、超时等非敏感项；`REVIEW_AGENT_LLM_API_KEY` 优先于旧磁盘配置；Web 启动审查子进程时通过环境传递会话 Key，不进入命令行、日志或报告。服务重启后需重新填写 UI Key，无人值守运行继续使用环境变量。
+- **为什么**：`config/llm.local.json` 曾含明文 Key，且本地 Key 会覆盖新设置的环境变量，导致轮换后仍可能继续使用旧凭据；控制台保存配置也会把新 Key 写回磁盘。
+- **验证**：`python tools/secret_scan.py` 扫描 222 个文件、命中 0；凭据/端点/密钥扫描定向测试 38 项 OK；LLM 配置与 API 安全测试 16 项 OK；全量 `tests` 686 项 OK（跳过 1）；全量 `checks` 运行 811 项，仅保留与本轮无关的历史语料缺失失败 1 项（跳过 6）。
+
+### 2026-11-03 · 修改 · 文档格式规格从「选预设」改成「分项填写」
+
+- **文件**：`web/index.html`（`.pick-format` 换成 `#formatPanel` 分项表单，删 `#formatSpecSelect`）、`web/app.js`（删 `loadFormatSpecs`，新增 `collectFormatCustom` / `syncFormatForm` / `initFormatForm` / `formatCheckIsEmpty`；`payload.format_custom` 替换 `payload.format_spec`）、`web/workspace.css`（`.format-panel` / `.fmt-*` 一套）、`tools/format_spec.py`（新增 `build_custom` / `resolve` / `describe_check`，白名单加 5 个键，`apply` 接受 dict 规格）、`tools/docx_extract.py`（提取 `spacing_before` / `spacing_after`）、`tools/docx_format_checks.py`（`check_spacing` 支持 `line_multiple`、`check_heading` 支持 `heading_levels`、新增 `check_para_space`）、`tools/rule_exec.py`（登记 FORMAT-007 执行器）、`rules/format.yaml`（+FORMAT-007，FORMAT-004/005 补 `spec_keys`）、`config/rules_version.txt`（`v1-2026-10-28-a5` → `v1-2026-11-03-f7`）、`server.py`（`format_custom` 解析 + `--format-spec-json` + 幂等指纹纳入自定义要求）、`review.py`（新参数 `--format-spec-json`）、`tests/test_format_custom.py`（新增 34 项）、`tests/test_format_spec.py`、`tests/test_docx_format.py`（夹具支持 `before`/`after`）、`README.md` §33.6、`docs/API接口对照表.md`
+- **改了什么**：
+  1. 格式规格从下拉（`不判版式` / `课程报告 v1`）改成「填写格式要求」展开的分项表单：正文字体、字号（磅）、首行缩进（字符）、行距（固定值/倍数）、段前段后（磅）+ 作用对象、最多几级 + 标题 1/2/3 各自的字体字号、图表编号一致。**填哪项判哪项，空着的不判**。
+  2. 只对本次生效：不写 `config/format_specs.yaml`，随 `POST /api/review/start` 的 `format_custom` 提交；服务端在建任务前用 `format_spec.build_custom()` 校验，错误返回 `格式要求有误：…` 且不发号。
+  3. 单位换算在 `collectFormatCustom` 里一次算清：字号磅 ×2 → 半磅、缩进字符 ×100、固定行距磅 ×20 → 缇、倍数直传、段间距磅直传。
+  4. 新增 `FORMAT-007` 段落间距（`space_before_pt` / `space_after_pt` / `space_scope`），`docx_extract` 补取 `<w:spacing w:before/after>`；**未设置 spacing 的段落按 0 磅算**（Word 实际行为）。
+  5. 新增 `heading_levels` 逐级标题判定：只判显式写在 run 上的字体字号，继承 Heading 样式的段落不判错（`docx_extract` 读不到样式定义，把"读不到"当"不符合"会每份文档都误报）。
+  6. 新增 `line_multiple` 倍数行距：无 `line` 的段落按单倍算，要求 2 倍时必须报。
+  7. **修掉一个会误报的边界**：`heading_max_level` 原写 `max(levels) >= max_level`，而 `levels` 是 1 基，导致"最多 3 级"时正好用到三级标题的合规文档被判超限；改成 `>`。
+  8. 幂等指纹纳入自定义要求（`custom:<check 的规范化 JSON>`）：同一文件只改行距要求也算新任务，否则会幂等命中旧任务、拿回按旧要求判的结论。
+  9. `tools/rule_exec.py` 登记 FORMAT-007 的执行器。不登记的话 `capability()` 会把它算成 `prompt_only`（"仅提示"），而它其实有确定性执行器——报告里的执行方式会与实际不符。
+- **为什么**：用户截图指出「需要将文档格式模块转化为可输入模块，比如写入准则多级标题，间隔 2 磅等，不是选择默认和 v1 设定好的」。预设只能覆盖已经写进 yaml 的那几套，用户遇到的第三种要求就无处可填；而他举的「多级标题」「间隔」这两类，正是原规格完全不支持的维度（只有 `heading_max_level` 一个数字、没有段间距）。
+- **验证**：全量 **686 项 OK**（`discover -s tests`，507s，skipped=1）。新增 `tests/test_format_custom.py` **36 项**：构建/校验 9（空表、未知键 `body_size_pt`、负数、级别越界/重复/只有 level、scope 非法、`段前 0 磅`必须允许）、段落间距 5（不符/相符/缺省按 0/要求 0 磅/作用对象只查标题段）、逐级标题 6（字体不符、字号不符、继承不报、缺级不报、**三级合规**、四级超限）、倍数行距 4、服务端解析 3、前端契约 7、run_one 端到端 2、其余（字段存在、预设下拉已删、`payload.format_custom`、单位换算串、前端键名 ⊆ 后端白名单）。CDP 实测（无头 Edge 1680×2100）：填 11 项后面板显示「已填写 11 项」，`collectFormatCustom()` 得到 `{body_font_east:["宋体","SimSun"], body_size_halfpt:24, first_line_chars:200, line_twips:440, line_rule:"exact", space_before_pt:12, space_after_pt:6, space_scope:"heading", heading_max_level:3, heading_levels:[{level:1,font_east:["黑体"],size_halfpt:32},{level:2,…28}], figref:true}`；字号填 0 → `errors:["正文字号必须是大于 0 的磅值"]`；行距切倍数 2 → `line_multiple:2` 且 `line_twips` 消失；点「清空」→ 只剩 `{figref:true}` 且按钮回到「填写格式要求」（只有图表编号时不传 custom，等价于 `none`）。
+
+### 2026-11-03 · 修复 · 「审查 Agent」与「审查情境」两列下拉没对齐
+
+- **文件**：`web/workspace.css`
+- **改了什么**：`.pick-row` 加 `align-content: start`。
+- **为什么**：`.source-block` 是两列 grid，同一行里的两个 `.pick-row` 被 stretch 成等高（103.59px）；grid 默认 `align-content: normal`（= stretch）会把多出来的高度**摊给 label 和 select 两行**。说明文字只有一行的右列（「审查情境」）因此把 select 拉高 6px 并下移 6px，和左边对不齐。改成 `start` 后多余高度留在 hint 下方。
+- **验证**：CDP 量 `getBoundingClientRect`：修复前 `#agentSelect` top=503.2 / height=39，`#scenarioSelect` top=509.2 / height=45；修复后两者均为 **top=503.2 / height=39**。截图核对两框上边缘齐平、说明文字起点一致。
+
+### 2026-11-03 · 修改 · 待审对象 ✕ 改为点一下直接删，去掉二次确认
+
+- **文件**：`web/app.js`（删 `askDeleteTarget()`；`deleteTarget()` 承担引用后果提示；✕ 的 `title` 改文案）、`tests/test_api_contract.py`（+3 条断言）、`README.md` §13.3
+- **改了什么**：
+  1. 待审对象下拉里每行的 ✕ 从「弹 `openConfirm` → 点确认 → 删」改成「点一下直接删」，`askDeleteTarget()` 整个函数删除。
+  2. `deleteTarget()` 在替换 `state.targets` **之前**先算引用它的历史报告数（`reportMatchesTarget`），删完把后果写进提示条：`已删除 X · N 份报告引用它，原文定位将失效`；无引用时仍是 `已删除 X`。被引用时撤销窗口从 8s 放宽到 12s。
+  3. 保留「软删除 + 提示条撤销」：文件进 `targets/uploads/.trash/`，点「撤销」走 `POST /api/target/restore` 回原位；下拉删完不收起，便于连续清理。
+  4. ✕ 的 `title` 由「删除这个文件（移入回收区，可撤销）」改为「点击即删除（移入回收区，提示条上可撤销）」，让"不弹框"这件事在 hover 时就说清。
+  5. 测试新增三条：必须存在 `deleteTarget(del.dataset.del)`、不得再出现 `askDeleteTarget`、不得再出现待审文件删除的 `openConfirm`。
+- **为什么**：用户截图指出「这里不需要二次确认，点击即可删除」。原实现的确认框是为了"被历史报告引用过的文件要说清后果"，但它拦的是**高频清理动作**——一次清 10 个测试上传物要弹 10 次确认，点击从 10 次变 20 次。而真正兜住误删的两条（后端软删除、前端 8 秒撤销）本来就在，确认框叠在上面没有增加安全性，只增加阻力。所以把"后果"从"停下问你"改成"删了告诉你 + 给更长的撤销窗口"。
+- **验证**：全量 **649 项 OK**（`discover -s tests`，510s，skipped=1；含 `test_api_contract` 165 项）。CDP 无头 Edge 实测（`/tmp/cdp_target_del.py`）：下拉 18 行 → 点第一行 ✕ → **`#confirmModal` 全程未出现**、行数 18→17、下拉保持打开、提示条 `已删除 简历-20261026-203826.docx.txt · 2 份报告引用它，原文定位将失效` 且带「撤销」；点撤销 → 行数回到 18、提示 `已恢复 简历-20261026-203826.docx.txt`。截图核对提示条三行内完整显示、撤销按钮不换行（1680×1050）。
+
+### 2026-11-03 · 修改 · 历史报告改成独立页：左列列表 + 右栏记录，点开才进控制台
+
+- **文件**：`web/index.html`（新增 `#page-history`、导航加「历史报告」页签、侧栏换成 `#quickHistoryBtn` 入口卡）、`web/app.js`（新增 `previewHistory()` / `renderHistoryDetail()` / `openReportInConsole()` / `enterHistoryPage()` / `updateSidebarQuick()`）、`web/workspace.css`（`.history-page` / `.hd-*` / `.quick-card` 一套，导航图标改按 `data-tab` 绑定）、`tests/test_api_contract.py`、`README.md` §17.7 + 新增 §42
+- **改了什么**：
+  1. 历史报告从侧栏迁到独立页：左侧是原列表（勾选、全选当前、批量收藏/取消/删除、搜索、结果筛选、收藏筛选、回收站、刷新、审计状态全保留），右侧新增 `#historyDetail` 记录摘要。
+  2. **单击 = 只看记录，双击 / 点「在审查控制台打开」= 换正文**。两套状态分开存：`state.historyPreviewId` / `historyPreview` 对右栏，`state.currentReport` 对控制台；`previewHistory()` 只写前者，`openReportInConsole()` 才走 `selectReport()`。
+  3. 右栏内容：裁定依据 + 需要人工复核标记、待审对象/类型/字数/审查方式/Agent/生成时间、规则·知识·Agent 版本与运行编号、法条库与覆盖范围、四项严重度统计 + 前 4 条问题、完整性三档（自洽 / 旧版规则 / 校验失败）+ 报告哈希/链上 seq/前序哈希/原文哈希、审查目的、边界（折叠）。
+  4. 列表或预览份被删（单删/批删/别处刷新）后，右栏立即清成空态，不让「打开」点出 404；人就在历史页且没有预览时自动补最新一份。
+  5. 侧栏只留 `Archive` 入口卡（总数 / 未通过 / 收藏），`#historyToggle` 折叠逻辑整套删除。
+- **为什么**：用户原话「把历史报告放在左侧，点击后在右侧大栏中显示历史记录，然后可以批量操作，点击任意历史报告跳转到审查控制台」，并选定「先看摘要，再一键跳控制台」。原实现把列表压在 286px 窄栏里：批量按钮被 `flex: 0 1 32px` 挤成三个 9px 字号的方块，更要紧的是**「看记录」和「打开正文」被合成一个动作**——只想确认"这份按哪版规则判的"，却把控制台正在读的那篇换走了。
+- **验证**：全量 **649 项 OK**（含新增/改写的 `test_history_page_has_left_list_and_right_record`）；`node --check web/app.js` 通过。CDP（无头 Edge 1680×1050）实测：初始 60 行、右栏 `R-20261103-002`；点第三行 → 右栏变 `R-20261030-032`、`#resultView` 仍 hidden、tab 仍 `history`；勾两行 → 「已选 2」且三个批量按钮解锁；点「在审查控制台打开」→ tab 变 `review`、结论区渲染 `R-20261030-032`；返回历史页预览保留；搜 `contract` → 24 行、标题「历史报告（216）· 筛选 24」。1680 / 1100 / 1000 三档截图核对：无横向溢出，状态条完整（此前被 `max-height:35px` 切半行）。
+
+### 2026-11-03 · 修复 · 三条对着旧样式表/旧文案的前端契约断言
+
+- **文件**：`tests/test_api_contract.py`、`web/index.html`（`#uploadToggle` 补回 `upload-toggle` 类）
+- **改了什么**：
+  1. `test_old_log_without_detail_is_explained` 改为读 `web/workspace.css`（页面真正加载的那张），并先断言 `index.html` 引的是它；文案断言从字面量「未记录步骤明细」放宽为「未记录」+「旧版本日志」。
+  2. `test_delete_flow_uses_confirm_dialog_and_server_guard` 的 `need_confirm` 断言从 `web/app.js` 移到 `server.py`。
+  3. `#uploadToggle` 补回 `class="entry-toggle upload-toggle"`（上一轮改写成 `class="entry-toggle"` 时漏了）。
+- **为什么**：这三条长期是红项，读的是已经不生效的 `style.css` 或已被改写的文案，**红在测试而不是功能**；留着红项会让"全量 OK"失去意义（真出问题时混在已知红里看不见）。
+- **验证**：`StepDetailTests` + `FrontendHistoryContractTests` **10 项 OK**；全量 649 项 OK。
+
+### 2026-11-03 · 修复 · 点历史一律切回工作台并把报告滚到视野顶部
+
+- **文件**：`web/app.js`（`selectReport()` + 新增 `revealReportTop()` / `revealActiveHistoryRow()`）、`web/index.html`（`.result-card` 补 `id="resultCard"`）、`web/workspace.css`（`.result-card` 加 `overflow-anchor: none`）、`tests/test_api_contract.py`（`FrontendHistoryContractTests` 新增 1 项）、`README.md` §17.7
+- **改了什么**：
+  1. `selectReport()` 收尾从「只渲染」改成三件事：`state.tab !== "review"` 时 `switchTab("review")`；`revealReportTop()` 把 `#resultCard` 摆到视口顶部（避让 56px 导航）；`revealActiveHistoryRow()` 让左栏当前项露出来。
+  2. `revealReportTop()` 走 `scrollHost()` 找真正的滚动容器（宽屏是卡片内部滚动框，`window` 滚不动），默认瞬间到位——平滑动画会被紧随的重排打断，停在半路。
+  3. `.result-card` 加 `overflow-anchor: none`：报告整块高度差异极大（2462px ↔ 6096px），浏览器 scroll anchoring 会在同帧把"刚滚到顶"抵消掉。
+- **为什么**：用户反馈「点历史没有显示在右侧」。实测根因不是没渲染，而是 **只渲染不切页**——停在「规则与学习」页点历史时 `activePage=page-rules`、`resultViewHidden=false`，报告被写进隐藏的 `page-review`，屏幕毫无反应；停在工作台但深滚过时也只换内容不回头。另有 scroll anchoring 把滚动位置从 600 拉回 562（只挪 38px），使"滚到顶部"失效。
+- **验证**：`FrontendHistoryContractTests` 跑 **8 项**，新增的 `test_history_click_shows_report_in_workspace` OK（唯一失败项是旧断言 `need_confirm`，属 11-03 回收站重构遗留，与本次无关）；`node --check web/app.js` 通过。无头 Edge 1600×1000 实测：停在规则页点首条历史 → `page=page-review`、`hash=#review`、`cardTop=64`、`activeRow=0`、结论区可见；深滚到 800 后点第三条 → `y` 回到 146、`cardTop=64`、`activeRow=2`；再点回第一条 → 同上，`activeRow=0`。滚动中断前后的对比数值来自同一页面的探针（关闭锚定前 600→562 不动，关闭后 600→141）。
+
+### 2026-11-03 · 修改 · 历史报告迁入左侧栏并支持批量收藏/删除
+
+- **文件**：`web/index.html`、`web/app.js`、`web/workspace.css`、`server.py`、`tests/test_api_contract.py`、`docs/API接口对照表.md`、`README.md`
+- **改了什么**：
+  1. 历史报告从右侧设置栏移到全局左侧栏，保留搜索、结果筛选、收藏筛选、刷新、回收站和审计状态；窄屏下折叠成「历史报告」入口，不占满首屏。
+  2. 每行增加勾选框，历史栏增加「全选当前」、已选数量以及批量收藏、取消收藏、删除按钮；部分勾选时全选框显示 indeterminate 状态。
+  3. 新增 `POST /api/reports/favorites`：批量收藏先完整校验再一次性写盘，避免半批成功；新增 `DELETE /api/reports/batch`：确认后逐份移入回收站并返回成功/失败明细。
+  4. 批量删除复用现有回收站、审计墓碑和恢复链路；删除当前正在查看的报告时同步清空结果区。删除后可在回收站逐份恢复。
+- **为什么**：历史报告原先夹在右侧审查设置下方，列表窄且只能逐条操作；用户需要把历史作为左侧主导航的一部分，并一次处理多份报告。
+- **验证**：新增批量收藏、批量删除、左侧栏 DOM 契约测试；定向 **4 项 OK**，`node --check web/app.js` 与 `compileall` 通过。无头 Edge 实测 1440px：历史列表独立滚动、60 行均有勾选框，全选后显示「已选 60」且三个批量按钮解锁，取消一项后全选框进入半选态；页面横向溢出 0。390px 实测历史栏默认折叠，页面横向溢出 0。
+
+### 2026-11-03 · 修复 · 删除待审文件返回 `not found`（启动器复用旧后台）
+
+- **文件**：`start-console.bat`、`server.py`、`tests/test_api_contract.py`
+- **改了什么**：
+  1. 新增 `GET /api/health`，返回当前控制台进程的 PID、工作目录和**进程启动时锁定的 `server.py` 源码指纹**。
+  2. 启动脚本不再仅凭 `/api/targets` 可访问就复用端口；指纹不一致或健康接口不存在时，自动尝试下一个空闲端口并启动当前代码。
+  3. 启动脚本继续复用运行同一份源码的实例，避免双击启动时无谓地堆积进程。
+- **为什么**：旧后台仍在 8000 端口运行时，静态 `app.js` 每次都从磁盘读取，已经显示新删除按钮；Python 路由却还是旧进程内存里的版本，`DELETE /api/target` 因而落到 `{"error":"not found"}`。根因不是删除按钮，而是启动器把“端口能响应”误当成“代码是当前版本”。
+- **验证**：修复前 8000 端口删除探针返回 HTTP 404；修复后同一探针返回 HTTP 200 `{"ok":false,"error":"文件不存在（可能已被删除）"}`，证明请求已进入删除路由；启动器实测输出「Port 8000 is running an older console」并正确切到当前实例；`TargetsTests`+`FrontendParityTests`+`RecycleBinTests` **19 项 OK**。
+
+### 2026-11-03 · 新增 · 待审对象下拉改成自定义列表，所有文件可就地删除（软删除 + 撤销）
+
+- **文件**：`web/app.js`、`web/index.html`、`web/workspace.css`、`server.py`、`tests/test_api_contract.py`、`docs/API接口对照表.md`（新增 2.4 / 2.45 两行）
+- **改了什么**：
+  1. 原生 `<select id="targetSelect">` 换成自定义下拉：`#targetSelect`（按钮）+ `#targetMenu`（列表）+ `#targetTriggerText`（当前值）。每行 = 文件名 + `上传`/`标注·不可审` 标签 + 大小 + 右侧 ✕。所有待审文件都可删除，内置语料不再显示 🔒。整块委托绑定，删完不收起列表，可以连着清。
+  2. 新增 `DELETE /api/target?rel=`：**软删除**，`targets/` 顶层文件和上传文件都搬进 `targets/uploads/.trash/<时间戳>__<原名>`，`items` 返回删除后的完整列表；`rel` 做 `..`／绝对路径／盘符／越界校验。
+  3. 新增 `POST /api/target/restore {trashed}`：撤销删除，按回收区清单搬回原目录，只认 `.trash` 下归档，同名已存在时拒绝覆盖。
+  4. 删除前走 `openConfirm`：若文件被历史报告引用（`reportMatchesTarget`），警告里写明「这些报告仍可查看，但原文标注与定位会指着不存在的文件」。删除成功后 toast 带 8 秒「撤销」。
+  5. `resetWorkspaceView()` 改为走 `selectTarget(null)`，让按钮文案与列表高亮一起复位。
+- **为什么**：用户反馈待审列表里堆了一次性文件和内置样本，想清理时部分选项只显示锁。原生 `option` 里放不下按钮，所以换自定义列表；现在所有待审文件都可软删除，评测标注仍保留「不可审」提示，但不能再用锁阻止用户清理。
+- **验证**：
+  - 后端：`tests.test_api_contract.TargetsTests` 新增 2 例（上传件软删除→列表消失→回收区有件→撤销回来→二次撤销明确失败；内置语料同样软删除→原位恢复 + `../server.py`／`/etc/passwd`／`C:/Windows/win.ini`／不存在路径全部拒绝且 `server.py` 未被删）。`TargetsTests`+`FrontendParityTests`+`RecycleBinTests` **18 项 OK**（`test_target_select_change_is_wired` 同时锁定「每行有 ✕、无 🔒」）。
+  - 静态契约：`node --check web/app.js` 通过；删除控件不再按 `uploaded` 分支，所有待审行都渲染 `/api/target?rel=` 删除按钮。
+  - 冒烟用的临时上传件与临时页面已全部清理（`web/` 下只剩 index/app/config/style/workspace 五个文件）。
+  - 另：11-03 之前的 3 项旧断言失败仍未处理（`need_confirm`、`upload-toggle`、`未记录步骤明细`，属回收站重构遗留），与本次无关。
+
+### 2026-11-03 · 修改 · 控制台进入即为初始化界面（不再自动带出上一次的报告与输入）
+
+- **文件**：`web/app.js`、`web/index.html`、`README.md` §审查目的、`docs/审查目的.md` §5
+- **改了什么**：
+  1. `loadReports()` 删掉「`!currentReport && reports.length` → `selectReport(reports[0])`」的自动打开逻辑。进入系统结果区停在 `#resultEmpty` 空状态，历史报告仍在右栏列表里点开。
+  2. `loadTargets()` 增加占位项「请选择待审对象（N 个可审）」，去掉了「默认取第一个可审文件」；只有上传后明确传入 `preferRel`、或当前选择仍可审时才自动选中。
+  3. `selectTarget(null)` 同步把下拉拉回占位项（原来只改 `state`，控件还停在旧文件上）。
+  4. 新增 `resetWorkspaceView()`：清 `currentReport/selected/job`，隐藏 `#resultView`、显示 `#resultEmpty`、收起进度卡、重渲染文件卡与上下文徽标；`init()` 在全部 `load*` 之后调用。
+  5. 新增 `resetPurposeOnEnter()`：审查目的输入框置空、`localStorage.removeItem("ra_purpose")`、并逐个 `DELETE /api/purpose/files?id=` 清掉暂存的目的文件。`initPurpose()` 不再从 localStorage 读回目的（写入也一并去掉）。
+  6. 删除当前正在看的报告时，结果区同步回到空状态（原来只清 `state`，正文还留在屏上）。
+  7. `#resultEmpty` 文案改为「在右侧选择待审对象后点「开始审查」；历史报告在右栏列表里，点开即可查看。」
+- **为什么**：用户反馈每次进控制台都顶着上一份审查结论（截图：`R-20261030-032` 自动展开、待审对象自动停在 `contract_001.md`、审查目的自动回填「这是给客户的合同…」+「已填写 + 1 个目的文件」）。上一份结论留在屏上会被误读成"这次的结论"；上一次的目的还会派生目标、并入下一次审查，属于界面上看不见的输入污染。
+- **验证**：无头 Edge（`--headless=new --virtual-time-budget=8000`）实测 1440×900：`#resultEmpty` 可见 / `#resultView.hidden` 成立 / 占位项「请选择待审对象（18 个可审）」为选中项 / 上下文徽标「尚未选择待审文件」/ `#fileChip`、`#progressCard` 均 hidden / `purposeToggleSub` =「点击填写：这份文本想干什么」（不再是「已填写 + 1 个目的文件」）/ `#purposeFileList` 为空 / `GET /api/purpose/files` 返回 `{"ok":true,"items":[]}`（原 1 个暂存文件已按约定清除，备份在 `/tmp/purpose_uploads_backup`）/ 右栏历史列表 64 条照常渲染。`node --check web/app.js` 通过。`tests.test_api_contract` 158 项：155 通过，3 项失败均为本轮之前就存在的旧断言（`need_confirm` 随 11-03 回收站重构被删、`upload-toggle` 类名已重构、`未记录步骤明细` 文案已改），与本次改动无关。
+
+### 2026-11-03 · 修改 · 历史报告改为回收站与一键撤销
+
+- **文件**：`server.py`、`review_agent/infrastructure/ledger.py`、`web/index.html`、`web/app.js`、`web/workspace.css`、`checks/test_server_recycle_bin.py`（新增）、`checks/test_ledger_concurrency.py`、`docs/API接口对照表.md`、`README.md`
+- **改了什么**：
+  1. 历史列表垃圾桶由“弹窗二次确认”改为一步移入回收站；右下角提示保留 8 秒「撤销」。
+  2. 新增「回收站（N）」入口：支持单份恢复、单份彻底删除、清空回收站；不可恢复动作仍保留强确认。
+  3. 新删除写入 `.trash/.manifests/<id>.json`，记录报告、日志、V1 副本、状态文件、快照与独占缓存的原始路径；恢复前预检冲突并拒绝覆盖，搬移失败时回滚。
+  4. 旧版 `.trash/` 没有 manifest 的数据继续按历史命名规则识别和恢复。
+  5. 审计链新增追加式 `op=restore` 事件；删除、恢复、再次删除都不改写历史行，`/api/integrity` 同时返回当前 `deleted` 与 `restored` 状态。
+- **为什么**：用户反馈现有删除流程过重。文件本来已进入可恢复回收区，却仍要求“悬停 → 点击 → 弹窗 → 确认”，把可恢复操作当成了不可恢复操作；同时旧界面没有恢复入口，误删后只能手工搬文件。
+- **验证**：新增回收站后端 **5 项**、前端契约 **4 项**、台账恢复 **2 项**；定向回归和公开全量 `python -m unittest discover -s checks` 共 **808 项**，其中 **807 项通过**，唯一失败仍是本机已忽略文件 `config/llm.local.json` 中的真实 API Key 被 SecretScan 检出，与本次功能无关；`tests.test_api_contract.ReportManagementTests` **8 项 OK**；`node --check web/app.js` 通过；Playwright/Edge 实测 1440px 与 390px，回收站 64 条真实历史数据可见，桌面/移动端横向溢出均为 **0px**，一键删除未弹旧确认框、toast「撤销」可恢复，浏览器控制台 **0 错误**。
+
 # 2026-11-02
+
+### 2026-11-02 · 修改 · 控制台升级为审查工作台界面
+
+- **文件**：`web/index.html`、`web/workspace.css`（新增）、`web/app.js`
+- **改了什么**：
+  1. 将原三栏控制台重构为深色主导航 + 审查报告主画布 + 设置/历史侧栏的工作台布局。
+  2. 保留上传、目的文件、Agent、情境、格式规格、进度、完整报告、历史收藏/删除、规则候选、四类日志、Ledger、LLM 配置及删除确认等全部既有功能。
+  3. 增加历史报告搜索、结果筛选和分批加载；补齐逻辑/格式规则筛选；支持未配置 LLM 时直接运行纯规则审查，并提供任务取消入口。
+  4. 兼容 V1 报告的 `target.path` 与 `generated_at` 字段，选中历史报告时同步待审文件，并用上下文提示区分“历史报告”和“新审查草稿”。
+  5. 修复审计日志对新旧任务字段的兼容，显示阶段、节点、状态、异常与告警；规则开关补充键盘操作。
+  6. 统一提高可读字号：正文 13–14px、表单 13px、辅助信息不低于 10.5px；移动端主导航改为两列，避免大字号导致入口被截断。
+- **为什么**：验收发现原界面存在待审文件与当前报告串台、桌面控件被底部操作栏覆盖、390px 页面横向溢出、历史记录无检索、审计步骤名称缺失等问题，需要在不改变后端能力的条件下重新组织信息层级和操作流程。
+- **验证**：`node --check web/app.js` 通过；Playwright 实测 1440/1024/390px，页面横向溢出均为 0，字号分别为正文 15px、报告正文 13px、表单 13px、辅助信息 12px；格式选择器无遮挡，历史搜索与结果筛选生效，上传区/审查目的/LLM 弹窗可正常展开；定向回归 **45 项 OK**；公开全量回归 **797 项中 796 项通过**，唯一失败为本机已被忽略文件 `config/llm.local.json` 中的 API Key 被 SecretScan 检出，与本次前端改动无关。
 
 ### 2026-11-02 · 修改 · 默认引擎切到 V1，正式报告/控制台/进度收口
 

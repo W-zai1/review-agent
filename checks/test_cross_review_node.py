@@ -15,7 +15,7 @@
     2. 运行时：revisions 按 id 生效、顺序不变、悬空/重复修订被拒
     3. 历史差分：207 份报告，节点结果与旧实现逐字段一致
 
-历史语料只在本地有（outputs/ 被 .gitignore 排除）；CI 跑前两层。
+历史差分已迁到 `test_historical_corpus.py`，这里只保留规则与运行时测试。
 """
 import asyncio
 import json
@@ -203,56 +203,6 @@ class AdvanceRevisionTests(unittest.TestCase):
         with self.assertRaises(InvariantViolation):
             self._advance(state, NodeResult.ok(findings=(fresh,),
                                                revisions=(fresh,)))
-
-
-def historical_reports():
-    outputs = ROOT / "outputs"
-    if not outputs.is_dir():
-        return []
-    out = []
-    for path in sorted(outputs.rglob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and "review_id" in data and isinstance(
-                data.get("verdict"), str):
-            out.append(data)
-    return out
-
-
-@unittest.skipUnless(historical_reports(), "outputs/ 不存在（CI 无历史语料）")
-class HistoricalDifferentialTests(unittest.TestCase):
-    """差分：同一批 issue，节点与旧实现必须给出同样的争议与同样的置信度。"""
-
-    def test_node_matches_legacy_cross_review(self):
-        import review as legacy_review
-        from review_agent.adapters.issue_codec import encode_issues
-
-        checked = 0
-        for report in historical_reports():
-            issues = report.get("issues") or []
-            if not issues:
-                continue
-            session = legacy_review.Session(report["review_id"], "t", "text")
-            session.issues = [dict(i) for i in issues]
-            legacy_review.cross_review(session)
-
-            findings = [e.finding for e in encode_issues(issues, run_id=RUN_ID)]
-            result = review_findings(findings, run_id=RUN_ID)
-            # 节点不就地改发现（不可变）：最终置信度 = 修订后的值
-            revised = {f.id: f.confidence for f in result.revisions}
-
-            self.assertEqual(
-                [dispute_to_report_dict(d) for d in result.disputes],
-                session.disputes,
-                f"{report['review_id']}：争议回写形状不一致")
-            self.assertEqual(
-                [revised.get(f.id, f.confidence) for f in findings],
-                [i["confidence"] for i in session.issues],
-                f"{report['review_id']}：降权后的置信度不一致")
-            checked += 1
-        self.assertGreater(checked, 0, "历史语料里没有带 issue 的报告")
 
 
 if __name__ == "__main__":

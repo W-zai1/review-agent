@@ -9,8 +9,8 @@
        不是「策略错了」，而是「旧实现没按自己声明的规则裁定」——这类差异必须
        被登记，不能靠人肉记忆。
 
-历史全量用例只在本地跑（outputs/ 被 .gitignore 排除，CI 里没有）；
-CI 里跑的是 checks/fixtures/legacy_report_min.json 这份最小样本。
+这里跑 `checks/fixtures/legacy_report_min.json` 最小样本；历史全量回放
+由 `test_historical_corpus.py` 通过显式 `REVIEW_AGENT_HISTORY_DIR` 运行。
 
 运行：
     python -m unittest discover -s checks -v
@@ -33,15 +33,6 @@ from review_agent.domain import (                      # noqa: E402
 from review_agent.adapters import CONSUMED_KEYS, adapt_report  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "legacy_report_min.json"
-OUTPUTS = ROOT / "outputs"
-
-# 已核对的历史偏差：这 5 份报告在「库外事实未核完」时仍给了 pass。
-# 旧版本的 verdict 计算发生在这段兜底逻辑上线之前；新策略会判 warn。
-# 留成显式清单而不是 skip：一旦历史报告被重生成，这里会失败并提醒复核。
-KNOWN_VERDICT_DEVIATIONS = {
-    "R-20261028-045", "R-20261028-046", "R-20261028-047",
-    "R-20261028-055", "R-20261028-071",
-}
 
 
 def load_fixture() -> dict:
@@ -118,64 +109,6 @@ class FixtureAdaptationTests(unittest.TestCase):
         kinds = [e.kind.value for e in adapted.audit]
         self.assertEqual(kinds.count("step"), 1)
         self.assertEqual(kinds.count("decision"), 1)
-
-
-@unittest.skipUnless(OUTPUTS.is_dir() and list(OUTPUTS.glob("R-*.json")),
-                     "outputs/ 不在当前 checkout（CI 只跑最小样本）")
-class HistoricalCorpusTests(unittest.TestCase):
-    """全量历史报告回归：202 份报告必须都能被领域模型表达。"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.reports = []
-        for path in sorted(OUTPUTS.glob("R-*.json")):
-            cls.reports.append((path.stem, json.loads(path.read_text(encoding="utf-8"))))
-
-    def test_corpus_is_present(self):
-        self.assertGreaterEqual(len(self.reports), 100)
-
-    def test_all_reports_adapt_without_error(self):
-        for name, raw in self.reports:
-            with self.subTest(report=name):
-                adapt_report(raw)
-
-    def test_verdict_deviations_are_exactly_the_known_ones(self):
-        deviations = set()
-        for name, raw in self.reports:
-            adapted = adapt_report(raw)
-            if any("策略复算" in w for w in adapted.warnings):
-                deviations.add(name)
-        self.assertEqual(deviations, KNOWN_VERDICT_DEVIATIONS,
-                         "历史报告的裁定偏差集合变了：要么新增了不符合策略的报告，"
-                         "要么已知问题被修复（两种情况都要更新清单）")
-
-    def test_finding_counts_and_stats_match_every_report(self):
-        for name, raw in self.reports:
-            with self.subTest(report=name):
-                adapted = adapt_report(raw)
-                expected = len(raw.get("issues") or []) + len(raw.get("suppressed") or [])
-                self.assertEqual(len(adapted.findings), expected)
-                stats = raw.get("stats") or {}
-                self.assertEqual(adapted.stats.total,
-                                 sum(int(stats.get(k) or 0) for k in
-                                     ("blocker", "major", "minor", "nit")))
-                ids = [f.id for f in adapted.findings]
-                self.assertEqual(len(ids), len(set(ids)), "finding id 重复")
-
-    def test_high_severity_low_confidence_findings_are_documented(self):
-        for name, raw in self.reports:
-            adapted = adapt_report(raw)
-            for f in adapted.findings:
-                if (f.severity in (Severity.BLOCKER, Severity.MAJOR)
-                        and f.confidence < 0.7):
-                    self.assertIsNotNone(
-                        f.severity_note, f"{name}/{f.id} 低置信高严重度但没有说明")
-
-    def test_no_report_data_is_dropped(self):
-        for name, raw in self.reports:
-            adapted = adapt_report(raw)
-            with self.subTest(report=name):
-                self.assertEqual(set(adapted.extra), set(raw) - CONSUMED_KEYS)
 
 
 if __name__ == "__main__":

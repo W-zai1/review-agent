@@ -63,6 +63,7 @@ _BUILTIN = {
     "FORMAT-004": "docx_format·版式检查（行距）",
     "FORMAT-005": "docx_format·版式检查（标题层级）",
     "FORMAT-006": "docx_format·版式检查（图表编号一致性）",
+    "FORMAT-007": "docx_format·版式检查（段前/段后间距）",
 }
 
 _LABEL = {"deterministic": "确定性", "declarative": "声明式", "prompt_only": "仅提示"}

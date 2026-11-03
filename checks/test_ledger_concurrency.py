@@ -147,6 +147,38 @@ class TombstoneIsAppendOnlyTests(unittest.TestCase):
             ledger.tombstone(self.path, 2)
         self.assertIn("已有墓碑", str(ctx.exception))
 
+    def test_restore_is_an_append_event(self):
+        before = self.raw_lines()
+        ledger.tombstone(self.path, 2)
+        ledger.restore(self.path, 2, actor="web", reason="撤销删除")
+        after = self.raw_lines()
+        self.assertEqual(after[:len(before)], before,
+                         "恢复不能改写报告或删除事件")
+        self.assertEqual(len(after), len(before) + 2)
+        ok, message, stats = ledger.verify(self.path)
+        self.assertTrue(ok, message)
+        self.assertEqual(stats["records"], 5)
+        self.assertEqual(stats["restored"], [2])
+        self.assertEqual(stats["deleted"], [])
+        view = ledger.entries_for_api(self.path)
+        by_seq = {e["seq"]: e for e in view["entries"]}
+        self.assertFalse(by_seq[2]["deleted"])
+        self.assertTrue(by_seq[2]["restored"])
+        self.assertEqual(by_seq[2]["op"], "restore")
+
+    def test_restore_requires_current_delete_and_allows_delete_again(self):
+        with self.assertRaises(ledger.LedgerError):
+            ledger.restore(self.path, 2)
+        ledger.tombstone(self.path, 2)
+        ledger.restore(self.path, 2)
+        with self.assertRaises(ledger.LedgerError):
+            ledger.restore(self.path, 2)
+        ledger.tombstone(self.path, 2)
+        _ok, _message, stats = ledger.verify(self.path)
+        self.assertEqual(stats["deleted"], [2])
+        self.assertEqual(stats["restored"], [])
+        self.assertEqual(stats["restores"], 1)
+
     def test_legacy_in_place_tombstone_still_verifies(self):
         """历史那批是「原位改一行」（行内 op=delete，带 report_hash）。不能被判成坏链。"""
         legacy = self.dir / "legacy-chain.log"

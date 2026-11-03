@@ -34,10 +34,20 @@ SPECS_PATH = ROOT / "config" / "format_specs.yaml"
 _KNOWN_KEYS = {
     "body_font_east", "body_size_halfpt",
     "first_line_chars", "first_line_twips_min", "first_line_twips_max",
-    "line_twips", "line_rule",
+    "line_twips", "line_rule", "line_multiple",
+    "space_before_pt", "space_after_pt", "space_scope",
     "heading_font", "heading_min_size_halfpt", "heading_max_level",
+    "heading_levels",
     "figref",
 }
+
+# 自定义规格（前端分项表单）用的固定 id。它**不进** config/format_specs.yaml：
+# 那套是"可复用的委托方标准"，而自定义是"这一次这么判"，写进配置会让
+# 配置文件变成一次性输入的垃圾桶。
+CUSTOM_ID = "custom"
+# 不带"本次"两个字：报告是半年后还要读的档案，标题里写"本次"会让人
+# 分不清是哪一次。来源由 source 字段说明（"本次审查手动填写"）。
+CUSTOM_NAME = "自定义格式要求"
 
 
 class FormatSpecError(Exception):
@@ -50,6 +60,47 @@ def _clean_list(raw, field, sid):
     if not isinstance(raw, list):
         raise FormatSpecError(f"规格 {sid} 的 {field} 必须是列表")
     return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _check_heading_levels(raw, sid):
+    """逐级标题格式：[{level: 1, font_east: [..], size_halfpt: 32}, ...]
+
+    为什么需要它：`heading_max_level` 只能回答"最多几级"，
+    回答不了「一级标题黑体三号、二级标题黑体四号」这种最常被规定的要求。
+    每一项至少要写字体或字号之一——只写 level 的项没有任何判定内容，
+    留着会让前端以为"这一级已经配好了"。
+    """
+    if not isinstance(raw, list) or not raw:
+        raise FormatSpecError(f"规格 {sid} 的 heading_levels 必须是非空列表")
+    out, seen = [], set()
+    for it in raw:
+        if not isinstance(it, dict):
+            raise FormatSpecError(f"规格 {sid} 的 heading_levels 每一项都必须是对象")
+        lv = it.get("level")
+        if isinstance(lv, bool) or not isinstance(lv, int) or not (1 <= lv <= 9):
+            raise FormatSpecError(
+                f"规格 {sid} 的 heading_levels.level 必须是 1~9 的整数，收到 {lv!r}")
+        if lv in seen:
+            raise FormatSpecError(f"规格 {sid} 的 heading_levels 里 {lv} 级重复")
+        seen.add(lv)
+        item = {"level": lv}
+        if it.get("font_east") is not None:
+            fonts = _clean_list(it.get("font_east"), "font_east", sid)
+            if not fonts:
+                raise FormatSpecError(
+                    f"规格 {sid} 的 heading_levels[{lv}].font_east 不能为空列表")
+            item["font_east"] = fonts
+        if it.get("size_halfpt") is not None:
+            sz = it.get("size_halfpt")
+            if isinstance(sz, bool) or not isinstance(sz, int) or sz <= 0:
+                raise FormatSpecError(
+                    f"规格 {sid} 的 heading_levels[{lv}].size_halfpt 必须是正整数")
+            item["size_halfpt"] = sz
+        if "font_east" not in item and "size_halfpt" not in item:
+            raise FormatSpecError(
+                f"规格 {sid} 的 heading_levels[{lv}] 至少要写字体或字号")
+        out.append(item)
+    return sorted(out, key=lambda x: x["level"])
 
 
 def _check_dict(raw, sid):
@@ -82,6 +133,25 @@ def _check_dict(raw, sid):
             out[k] = str(v).strip()
             if not out[k]:
                 raise FormatSpecError(f"规格 {sid} 的 heading_font 不能为空")
+        elif k == "line_multiple":
+            # 倍数行距：Word 里 lineRule=auto 且 line = 倍数 × 240。
+            # 允许 1.5 这种小数，但不允许 0/负数（0 倍行距不是"没有要求"，是错误输入）。
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                raise FormatSpecError(f"规格 {sid} 的 line_multiple 必须是正数，收到 {v!r}")
+            out[k] = float(v)
+        elif k in ("space_before_pt", "space_after_pt"):
+            # 段前/段后间距，单位磅。**允许 0**：'段前 0 磅' 是一条真实要求
+            # （要求标题不要额外段前距），和'没填'不是一回事。
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise FormatSpecError(f"规格 {sid} 的 {k} 必须是非负整数（磅），收到 {v!r}")
+            out[k] = v
+        elif k == "space_scope":
+            v = str(v).strip()
+            if v not in ("body", "heading"):
+                raise FormatSpecError(f"规格 {sid} 的 space_scope 只能是 body / heading")
+            out[k] = v
+        elif k == "heading_levels":
+            out[k] = _check_heading_levels(v, sid)
         else:
             # 数值项：必须是正整数（半磅/缇/字符×100 都不可能是 0 或小数）
             if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
@@ -139,6 +209,92 @@ def load():
             "default": default, "specs": out}
 
 
+def build_custom(check, name=None):
+    """把前端填的分项表单变成一条**只对本次生效**的规格。
+
+    为什么不写进 `config/format_specs.yaml`：那里放的是"可复用的委托方标准"。
+    把每次手填的东西写进去，配置文件会变成一次性输入的垃圾桶，而且
+    改这个文件要升 version（历史报告会因此显示"规格版本已变"）——
+    一次临时审查不该留下这种痕迹。
+
+    校验直接复用 `_check_dict`：前端能填什么、后端认什么，必须是**同一份白名单**，
+    否则前端多写一个键就变成"配了不生效"，而人完全看不出来。
+    """
+    if not isinstance(check, dict) or not check:
+        raise FormatSpecError("自定义格式要求为空：至少填写一项再发起审查")
+    c = _check_dict(check, CUSTOM_ID)
+    if not c:
+        raise FormatSpecError("自定义格式要求没有任何可判定项")
+    return {
+        "id": CUSTOM_ID,
+        "name": (str(name or "").strip() or CUSTOM_NAME),
+        "source": "本次审查手动填写（不入配置库）",
+        "desc": describe_check(c),
+        "check": c,
+        "disable_rules": [],
+    }
+
+
+_SIZE_NAMES = {
+    84: "初号", 72: "小初", 52: "一号", 48: "小一", 44: "二号", 36: "小二",
+    32: "三号", 30: "小三", 28: "四号", 24: "小四", 21: "五号", 18: "小五",
+}
+
+
+def _pt(halfpt):
+    return f"{halfpt / 2:g}pt" + (f"（{_SIZE_NAMES[halfpt]}）" if halfpt in _SIZE_NAMES else "")
+
+
+def describe_check(c):
+    """把 check 块写成人话，用于前端提示、报告和 limitations。"""
+    parts = []
+    if c.get("body_font_east"):
+        parts.append(f"正文字体 {'/'.join(c['body_font_east'])}")
+    if c.get("body_size_halfpt"):
+        parts.append(f"字号 {_pt(c['body_size_halfpt'])}")
+    if c.get("first_line_chars"):
+        parts.append(f"首行缩进 {c['first_line_chars'] / 100:g} 字符")
+    if c.get("line_multiple"):
+        parts.append(f"行距 {c['line_multiple']:g} 倍")
+    elif c.get("line_rule") == "exact" and c.get("line_twips"):
+        parts.append(f"固定行距 {c['line_twips'] / 20:g} 磅")
+    elif c.get("line_rule") == "auto":
+        parts.append("行距非固定值")
+    elif c.get("line_twips"):
+        parts.append(f"行距 {c['line_twips'] / 20:g} 磅")
+    if "space_before_pt" in c or "space_after_pt" in c:
+        scope = "标题段" if c.get("space_scope") == "heading" else "正文段"
+        bits = []
+        if "space_before_pt" in c:
+            bits.append(f"段前 {c['space_before_pt']} 磅")
+        if "space_after_pt" in c:
+            bits.append(f"段后 {c['space_after_pt']} 磅")
+        parts.append(f"{scope}{'、'.join(bits)}")
+    levels = c.get("heading_levels") or []
+    if levels:
+        seg = []
+        for it in levels:
+            one = []
+            if it.get("font_east"):
+                one.append("/".join(it["font_east"]))
+            if it.get("size_halfpt"):
+                one.append(_pt(it["size_halfpt"]))
+            seg.append(f"标题{it['level']}={' '.join(one)}")
+        parts.append("；".join(seg))
+    elif c.get("heading_font") or c.get("heading_min_size_halfpt"):
+        h = []
+        if c.get("heading_font"):
+            h.append(c["heading_font"])
+        if c.get("heading_min_size_halfpt"):
+            h.append(f"不小于 {_pt(c['heading_min_size_halfpt'])}")
+        parts.append(f"标题 {' '.join(h)}")
+    if c.get("heading_max_level"):
+        parts.append(f"最多 {c['heading_max_level']} 级标题")
+    if c.get("figref"):
+        parts.append("图表编号与正文引用一致")
+    return "、".join(parts) if parts else "（未填写任何判定项）"
+
+
 def get(sid):
     """按 id 取规格；不存在返回 None（调用方决定报错还是用默认值）。"""
     if not sid:
@@ -159,9 +315,14 @@ def public_list():
         "first_line_twips_min": "首行缩进",
         "line_twips": "行距",
         "line_rule": "行距",
+        "line_multiple": "行距",
+        "space_before_pt": "段落间距",
+        "space_after_pt": "段落间距",
+        "space_scope": "段落间距",
         "heading_font": "标题字体",
         "heading_min_size_halfpt": "标题字号",
         "heading_max_level": "标题层级",
+        "heading_levels": "逐级标题",
         "figref": "图表编号",
     }
     items = []
@@ -184,17 +345,35 @@ def public_list():
             "default": data["default"], "items": items}
 
 
-def apply(sid, rules):
+def resolve(spec):
+    """把 apply 的入参归一成「规格 dict + 配置版本」。
+
+    三种入参都要认，因为同一个函数被 CLI（传 id）、服务端（传前端填的 check）、
+    测试（传完整规格）三处调用：
+      - str  → 从 config/format_specs.yaml 取
+      - dict 且带 check → 已经是规格（build_custom 的产物）
+      - dict 不带 check → 前端的分项表单原文，先过 build_custom 校验
+    未知 id / 空表单都抛错，**不静默回退**：回退的后果是"以为按 A 判的，实际按 B 判的"。
+    """
+    if isinstance(spec, dict):
+        sp = spec if "check" in spec else build_custom(spec)
+        return sp, CUSTOM_ID
+    data = load()
+    sp = next((s for s in data["specs"] if s["id"] == spec), None)
+    if sp is None:
+        opts = "、".join(s["id"] for s in data["specs"])
+        raise FormatSpecError(f"未知格式规格：{spec}；可选：{opts}")
+    return sp, data["version"]
+
+
+def apply(spec, rules):
     """按格式规格过滤规则，返回规格内容 + 过滤结果 + 记账。
 
     返回：{id,name,source,desc,version,check,rules[],skipped[],limitations[]}
     未知规格 → 抛 FormatSpecError（不静默降级）。
+    `spec` 可以是配置里的 id，也可以是本次手填的自定义规格（见 resolve）。
     """
-    data = load()
-    sp = next((s for s in data["specs"] if s["id"] == sid), None)
-    if sp is None:
-        opts = "、".join(s["id"] for s in data["specs"])
-        raise FormatSpecError(f"未知格式规格：{sid}；可选：{opts}")
+    sp, version = resolve(spec)
 
     disable = set(sp["disable_rules"])
     kept, skipped, hit = [], [], set()
@@ -216,7 +395,8 @@ def apply(sid, rules):
             "（这些没有通用的正确答案，必须由委托方的格式要求决定）。"
             "「未报出版式问题」不等于版式合规。")
     else:
-        unchecked = [x for x in ("字体", "字号", "首行缩进", "行距", "标题层级", "图表编号")]
+        unchecked = [x for x in ("字体", "字号", "首行缩进", "行距",
+                                 "段落间距", "标题层级", "图表编号")]
         got = set()
         c = sp["check"]
         if "body_font_east" in c:
@@ -225,22 +405,26 @@ def apply(sid, rules):
             got.add("字号")
         if "first_line_chars" in c or "first_line_twips_min" in c:
             got.add("首行缩进")
-        if "line_twips" in c or "line_rule" in c:
+        if "line_twips" in c or "line_rule" in c or "line_multiple" in c:
             got.add("行距")
-        if "heading_max_level" in c:
+        if "space_before_pt" in c or "space_after_pt" in c:
+            got.add("段落间距")
+        if "heading_max_level" in c or "heading_levels" in c:
             got.add("标题层级")
         if c.get("figref"):
             got.add("图表编号")
         miss = [x for x in unchecked if x not in got]
         if miss:
+            who = ("本次填写的格式要求" if sp["id"] == CUSTOM_ID
+                   else f"所选格式规格「{sp['name']}」")
             limitations.append(
-                f"所选格式规格「{sp['name']}」未包含 {'、'.join(miss)} 的判定，"
+                f"{who}未包含 {'、'.join(miss)} 的判定，"
                 f"这些项本次未检查（不是「已合规」）。")
 
     # 配置里写了、但当前规则库中不存在的 ID：可能规则被改名/删除。
     # 不报错（不影响本次审查），但必须让人看见。
     unmatched = sorted(disable - hit)
-    if unmatched:
+    if unmatched and sp["id"] != CUSTOM_ID:
         limitations.append(
             f"格式规格「{sp['name']}」配置了 {len(unmatched)} 条当前规则库中不存在的规则："
             f"{'、'.join(unmatched)}——请核对 config/format_specs.yaml。")
@@ -250,7 +434,9 @@ def apply(sid, rules):
         "name": sp["name"],
         "source": sp["source"],
         "desc": sp["desc"],
-        "version": data["version"],
+        # 自定义规格没有配置版本：写 "custom" 而不是空串，
+        # 半年后能一眼区分"按某版配置判的"和"按那天手填的要求判的"。
+        "version": version,
         "check": sp["check"],
         "rules": kept,
         "skipped": skipped,
