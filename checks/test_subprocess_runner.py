@@ -180,6 +180,7 @@ class RunnerTests(unittest.TestCase):
                    purpose="查合规", engine="v1", use_llm=False)
         self.assertIn("--review-id", proc.cmd)
         for flag, value in (("--no-llm", None), ("--research", None),
+                            ("--engine", "v1"),
                             ("--type", "code"), ("--agent", "doc-review"),
                             ("--scenario", "s1"), ("--format-spec", "course"),
                             ("--purpose", "查合规"), ("--purpose-max", "10")):

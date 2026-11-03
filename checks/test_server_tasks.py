@@ -288,5 +288,40 @@ class CancelTests(unittest.TestCase):
         self.assertIn("找不到", result["error"])
 
 
+class StatusSourceTests(unittest.TestCase):
+    """重启后 JOBS 可能来自 .jobs/*.jsonl；状态必须回到 task 记录。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self._saved = {name: getattr(server, name)
+                       for name in ("TASKS", "JOBS", "JOBS_DIR")}
+        self.addCleanup(self._restore)
+        server.TASKS = FileTaskStore(self.base / "state" / "tasks")
+        server.JOBS = {"job1": {"id": "job1", "review_id": RID,
+                                "status": "done", "report_id": RID}}
+        server.JOBS_DIR = self.base / "logs" / ".jobs"
+        server.JOBS_DIR.mkdir(parents=True)
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        server.TASKS.save(TaskRecord(
+            review_id=RID, run_id=f"{RID}-RUN01",
+            status=RunStatus.FAILED.value, stage=Stage.ANALYSIS.value,
+            target="targets/a.md", error="检查点缺失，无法从断点继续",
+            created_at=stamp, updated_at=stamp))
+
+    def _restore(self):
+        for name, value in self._saved.items():
+            setattr(server, name, value)
+
+    def test_task_record_wins_over_recovered_job_view(self):
+        result = server.Handler._review_status(mock.MagicMock(), "job1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["job"]["status"], "error")
+        self.assertEqual(result["job"]["task_status"], "failed")
+        self.assertEqual(result["job"]["error"], "检查点缺失，无法从断点继续")
+        self.assertIsNone(result["report"])
+
+
 if __name__ == "__main__":
     unittest.main()

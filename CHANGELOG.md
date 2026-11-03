@@ -44,6 +44,40 @@
 
 # 2026-11-03
 
+### 2026-11-03 · 修改 · 第二阶段 2.1b：CLI 参数解析拆到 parser.py
+
+- **文件**：新增 `interfaces/cli/parser.py`（289 行：`CliOptions` + `parse_args`）、`interfaces/cli/commands.py`（361 → 124 行，只留 `main` + `_run_review`）；`tests/test_purpose.py`（源码定位断言补读 `parser.py`）
+- **改了什么**：参数解析、校验、`--list*`、`--print-review-id` 原样迁到 `interfaces/cli/parser.py`；解析顺序、错误文案、退出码、`GAP_LOG` 副作用保持不变；`review.py::main` 仍是 4 行薄壳。
+- **为什么**：第二阶段 2.1 的第二刀——把「解析」与「执行」分开，`commands.py` 只负责审查执行与错误映射。
+- **验证**：CLI 冒烟（正常审查并写任务记录、`shadow --llm` 退 2、缺失目标退 1、五个 `--list*`/`--print-review-id` 退 0）；`checks` 全量 **830 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1）**。
+
+### 2026-11-03 · 修改 · 第二阶段 2.1a：CLI 入口迁出 review.py
+
+- **文件**：新增 `interfaces/__init__.py`、`interfaces/cli/__init__.py`、`interfaces/cli/commands.py`（361 行，从 `review.py::main()` 原样迁出）；`review.py` 的 `main()` 收敛为 4 行薄壳；`tests/test_purpose.py`（源码定位断言改为同时读取 `review.py` 与 `interfaces/cli/commands.py`，断言意图不变）
+- **改了什么**：参数解析、`--list*`、`--print-review-id`、v1/legacy/shadow 分发全部迁到 `interfaces/cli/commands.py`；通过 `runtime` 注入**正在运行的模块对象**（`__main__` 或 `review`），避免 `python review.py` 时 `import review` 产生第二份模块、两套 `OUTPUTS/STATE/GAP_LOG`。行为、输出、退出码保持不变。
+- **为什么**：第二阶段 2.1「拆分 review.py 的入口层」。`review.py` 5,565 → **5,226** 行；`main()` 345 → **4** 行；入口逻辑归到 `interfaces/cli/`。
+- **验证**：CLI 冒烟（正常审查并写任务记录、`shadow --llm` 退 2、缺失目标退 1、四个 `--list*` 退 0、`--print-review-id` 正常）；`checks` 全量 **830 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1）**。
+
+### 2026-11-03 · 修复 · P0 复审：子进程钉死引擎 + 状态以任务记录为准
+
+- **文件**：`server.py`（`_run_review_job` 显式 `--engine`；`_review_status` 用任务记录覆盖 JOBS 视图）、`checks/test_subprocess_runner.py`（断言 `--engine`）、`checks/test_server_tasks.py`（新增 `StatusSourceTests`）
+- **改了什么**：
+  1. 子进程命令行显式传任务记录的 engine（server 恒 v1）：宿主机设了 `REVIEW_ENGINE=legacy` 也不会再出现「任务记录写 v1、实际跑 legacy」。
+  2. `/api/review/status` 返回前用 `state/tasks/<rid>.json` 覆盖 JOBS：重启后 JOBS 可能来自 `.jobs/*.jsonl`，状态/错误/报告一律以任务记录为准。
+- **为什么**：P0 复审发现两处仍可能产生「两条执行链 / 两套状态」——环境变量能让执行偏离记录；重启后的视图能与记录不一致。
+- **验证**：临时副本设 `REVIEW_ENGINE=legacy` 起 server → 任务记录 `engine=v1`、报告 `engine=architecture-v1`；CLI 与 server 的 v1 报告顶层键集合一致（35 键，无差异）；`checks` 全量 **830 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1）**。
+
+### 2026-11-03 · 修改 · CLI 接入 TaskService，审查入口收口（第一阶段第 5 条）
+
+- **文件**：`review.py`（`_run_v1` 拆为 `_run_v1_core` + `_print_v1_result` + `_run_v1`；`make_task_runner` / `make_task_service` 扩展；新增 `_run_v1_via_task`；`main()` 的 v1 分支按 `--review-id` 分流）、`checks/test_error_taxonomy.py`（CLI 用例带 `--review-id`，避免公开检查写真实 `state/tasks`）、`docs/ARCHITECTURE.md`、`docs/整改报告-第一阶段.md`
+- **改了什么**：
+  1. 手工 CLI 默认 v1 改为 `TaskService.start_review`：任务记录落 `state/tasks/`，创建/完成/失败语义与 Web 同一套。
+  2. server 子进程（`--review-id`）仍走 `_run_v1` 直跑：父进程已持有任务记录，子进程不再建第二条（否则会覆盖幂等键/创建时间）。
+  3. `_run_v1` 拆成 `_run_v1_core`（不打印、不退出）+ `_print_v1_result` + `_run_v1`；报告、进度文件、`REVIEW_RESULT` 契约不变。
+  4. `make_task_service` 透传 scenario / format_spec / research / purpose / progress / diag；`make_task_runner` 复用同一 core，不再复制一段 v1 执行。
+- **为什么**：甲方第一阶段第 5 条「统一 CLI、Web 的审查入口」。此前 CLI 不建任务，任务层只覆盖 Web，等于入口各有一套生命周期。
+- **验证**：临时副本手工 CLI 3 次——两次正常运行各新增 1 条 `completed/finalize` 任务记录；`--review-id R-20261103-999` 直跑不新增（仍 2 条）且报告 ID 一致；`checks` 全量 **829 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1）**。首次跑公开检查时，`test_error_taxonomy` 的坏 docx 用例在真实 `state/tasks` 留下 3 条失败记录（已移出到临时目录，并给该用例加 `--review-id`）；复核后 `state` 无新增文件。
+
 ### 2026-11-03 · 修改 · 任务生命周期收口到 TaskService（server 保留子进程隔离）
 
 - **文件**：`review_agent/application/tasks.py`（新增 `start_review_with` / `start_async_with`，`_execute` 接受 per-call runner；原 `start_review` / `start_async` 委托，签名不变）、`server.py`（新增 `_task_service` / `_SubprocessRunner` / `_watch_cancel`；`_start_review` 与同步 `/api/review` 改走 TaskService；`_cancel_review` 改 `service.cancel`；`_recover_jobs` 改 `service.recover`；删除 `_finish_sync_task` 与 server 侧任务状态写入）、`checks/test_server_tasks.py`（替身接缝从 `_run_review_job` 移到 Runner 注入，断言意图不变）、`checks/test_subprocess_runner.py`（新增 5 项）、`docs/整改报告-第一阶段.md`（新增）

@@ -1887,6 +1887,16 @@ class Handler(BaseHTTPRequestHandler):
             job = dict(JOBS.get(job_id) or {})
         if not job:
             return {"ok": False, "error": "任务不存在或已过期"}
+        # 任务记录是唯一事实来源：JOBS 可能来自 .jobs/*.jsonl（重启恢复），
+        # 与 state/tasks 可能不一致；状态/错误/报告一律以记录为准。
+        review_id = str(job.get("review_id") or "")
+        if review_id:
+            try:
+                record = TASKS.get(review_id)
+            except (OSError, ValueError, KeyError, TypeError):
+                record = None
+            if record is not None:
+                job = _job_view(record, job)
         steps = []
         progress = JOBS_DIR / f"{job_id}.jsonl"
         if progress.exists():
@@ -3342,7 +3352,7 @@ class _SubprocessRunner:
             s["job_id"], review_id, s["file"], s["llm_opt"], s["progress"],
             s["type_opt"], s["agent_opt"], s["purpose"], s["purpose_max"],
             s["purpose_quality"], s["scenario_opt"], s["spec_opt"],
-            s["research_opt"], s["custom_opt"], token=token)
+            s["research_opt"], s["custom_opt"], token=token, engine=engine)
 
 
 def _watch_cancel(proc, token, *, poll=0.1, grace=10.0):
@@ -3427,7 +3437,8 @@ def _recover_jobs(now=None):
 def _run_review_job(job_id, review_id, file, llm_opt, progress_path, type_opt=None,
                     agent_opt=None, purpose=None, purpose_max=None,
                     purpose_quality=None, scenario_opt=None, format_spec_opt=None,
-                    research_opt=None, format_custom=None, token=None):
+                    research_opt=None, format_custom=None, engine="v1",
+                    token=None):
     """Runner 的执行体：跑 review.py，进度事件写入 progress_path。
 
     与改造前的差别（问题 2 / 第二阶段）：这里**不再写任务状态**。
@@ -3439,6 +3450,9 @@ def _run_review_job(job_id, review_id, file, llm_opt, progress_path, type_opt=No
     """
     cmd = [str(PY), str(ROOT / "review.py"), file,
            "--progress", str(progress_path), "--review-id", str(review_id)]
+    # 引擎必须显式钉死：子进程会继承 server 的环境变量，若宿主机设了
+    # REVIEW_ENGINE=legacy，不传 --engine 就会「任务记录写 v1、实际跑 legacy」。
+    cmd.extend(["--engine", str(engine or "v1")])
     # 显式开关：不传就等于"按配置文件决定"，而配置里 enabled 通常是 true
     cmd.append(_llm_flag(llm_opt))
     if llm_opt is True:

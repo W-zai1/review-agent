@@ -4525,40 +4525,88 @@ def _record_research_egress(review_id, claim):
         print(f"[egress] 外发记录写入失败：{exc}", flush=True)
 
 
-def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
-            use_llm=False, purpose=None, purpose_max=None, review_id=None,
-            research_enabled=False, purpose_notes=None, scenario=None,
-            format_spec=None, progress_path=None):
-    """运行 V1 八阶段流水线，写正式 `outputs/` 报告、状态和审计链。"""
+def _run_v1_core(target_path, rules, *, type_override=None, agent_id=None,
+                 use_llm=False, purpose=None, purpose_max=None, review_id=None,
+                 research_enabled=False, purpose_notes=None, scenario=None,
+                 format_spec=None, progress_path=None, token=None):
+    """执行 V1 并写正式报告；**不打印、不退出**。
+
+    返回 info（state / outcome / report_path / llm_meta / context）。
+    可恢复错误以异常抛出（UnreadableTargetError / ConfigError），由入口决定退出码。
+
+    为什么拆出这一层：CLI 的两条 v1 入口（服务端子进程 `--review-id` 直跑、
+    手工运行的 TaskService 路径）必须共用同一段执行与落盘逻辑；否则又是
+    「同一件事两套实现」。
+    """
     purpose_info = None
     if purpose and str(purpose).strip():
         purpose_info = purpose_mod.parse(str(purpose), max_chars=purpose_max)
     llm_meta: dict = {}
     integrity_inputs: dict = {}
     context_out: dict = {}
-    try:
-        state, outcome, session = run_typed_pipeline(
-            target_path, rules, review_id=review_id,
-            agent_id=agent_id, type_override=type_override,
-            store=STATE / "runs", use_llm=use_llm, llm_meta_out=llm_meta,
-            purpose_info=purpose_info, integrity_out=integrity_inputs,
-            research_enabled=research_enabled,
-            scenario_id=scenario, format_spec=format_spec,
-            context_out=context_out, progress_path=progress_path)
-    except UnreadableTargetError as e:
-        print(f"目标不可读：{e}")
-        _emit_domain_error(e)
-        sys.exit(1)
-    except ConfigError as e:
-        print(f"[v1] {e}")
-        _emit_domain_error(e)
-        sys.exit(2)
+    state, outcome, session = run_typed_pipeline(
+        target_path, rules, review_id=review_id,
+        agent_id=agent_id, type_override=type_override,
+        store=STATE / "runs", use_llm=use_llm, llm_meta_out=llm_meta,
+        purpose_info=purpose_info, integrity_out=integrity_inputs,
+        research_enabled=research_enabled,
+        scenario_id=scenario, format_spec=format_spec,
+        context_out=context_out, progress_path=progress_path, token=token)
+    info = {
+        "state": state,
+        "outcome": outcome,
+        "session": session,
+        "llm_meta": llm_meta,
+        "context": context_out,
+        "purpose_info": purpose_info,
+        "use_llm": use_llm,
+        "research_enabled": research_enabled,
+        "purpose_notes": purpose_notes,
+        "report_path": None,
+    }
     if not outcome.ok:
-        print(f"[v1] 流水线未完成：{outcome.status}；{'；'.join(outcome.errors)[:300]}")
-        _emit_error("；".join(outcome.errors) or "流水线未完成", kind="system",
-                    http_status=500)
-        sys.exit(1)
-    if use_llm is False:
+        return info
+    if token is not None and token.cancelled:
+        # 结论算完了但已请求取消：不写报告（写一份用户不想要的东西更糟）
+        info["cancelled"] = True
+        return info
+    if progress_path:
+        research = state.artifacts.get("research") or {}
+        steps = _v1_progress_steps(
+            outcome, purpose_info=purpose_info,
+            research_enabled=bool(research.get("enabled")),
+            active_rules=context_out.get("active_rules") or (),
+            coverage_meta=context_out.get("coverage_meta"),
+        )
+        with open(progress_path, "a", encoding="utf-8") as handle:
+            for step in steps:
+                handle.write(json.dumps(step, ensure_ascii=False) + "\n")
+    info["report_path"] = _write_shadow_report(
+        state, outcome,
+        integrity_inputs=integrity_inputs,
+        session=session,
+        purpose_info=purpose_info,
+        purpose_notes=purpose_notes,
+        scenario=context_out.get("scenario"),
+        format_spec=context_out.get("format_spec"),
+        agent=context_out.get("agent"),
+        active_rules=context_out.get("active_rules") or (),
+        coverage_meta=context_out.get("coverage_meta"),
+        official=True,
+        target_type=context_out.get("target_type"),
+        target_type_source=context_out.get("target_type_source"),
+        rule_execution=context_out.get("rule_execution"),
+    )
+    return info
+
+
+def _print_v1_result(info):
+    """CLI 成功收尾：摘要 + 机器可读结果行（两条 v1 入口共用）。"""
+    state = info["state"]
+    llm_meta = info["llm_meta"]
+    research_enabled = info["research_enabled"]
+    report_path = info["report_path"]
+    if info["use_llm"] is False:
         print("[v1] 语义审：已通过 --no-llm 关闭（本次为纯规则审）")
     elif llm_meta.get("available"):
         print(f"[v1] 语义审：model={llm_meta.get('model')}"
@@ -4575,30 +4623,6 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
     elif research_enabled:
         print("[v1] 库外核验：本次维度不含事实审，未执行")
     verdict = state.decision.verdict.value if state.decision else "-"
-    if progress_path:
-        steps = _v1_progress_steps(
-            outcome, purpose_info=purpose_info,
-            research_enabled=bool((state.artifacts.get("research") or {}).get("enabled")),
-            active_rules=context_out.get("active_rules") or (),
-            coverage_meta=context_out.get("coverage_meta"),
-        )
-        with open(progress_path, "a", encoding="utf-8") as handle:
-            for step in steps:
-                handle.write(json.dumps(step, ensure_ascii=False) + "\n")
-    report_path = _write_shadow_report(state, outcome,
-                                       integrity_inputs=integrity_inputs,
-                                       session=session,
-                                       purpose_info=purpose_info,
-                                       purpose_notes=purpose_notes,
-                                       scenario=context_out.get("scenario"),
-                                       format_spec=context_out.get("format_spec"),
-                                       agent=context_out.get("agent"),
-                                       active_rules=context_out.get("active_rules") or (),
-                                       coverage_meta=context_out.get("coverage_meta"),
-                                       official=True,
-                                       target_type=context_out.get("target_type"),
-                                       target_type_source=context_out.get("target_type_source"),
-                                       rule_execution=context_out.get("rule_execution"))
     try:
         shown = report_path.relative_to(ROOT).as_posix()
     except ValueError:
@@ -4610,7 +4634,40 @@ def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
           f"状态：state/runs/{state.run_id}.state.json")
     _emit_result(state.review_id, report_path, verdict=verdict,
                  report_id=state.review_id)
-    return state
+
+
+def _run_v1(target_path, rules, *, type_override=None, agent_id=None,
+            use_llm=False, purpose=None, purpose_max=None, review_id=None,
+            research_enabled=False, purpose_notes=None, scenario=None,
+            format_spec=None, progress_path=None):
+    """运行 V1 并写正式报告（`--review-id` 直跑路径：任务由调用方持有）。
+
+    server 起子进程时传 `--review-id`，说明父进程已经建好任务记录；
+    这里只执行、不重复建任务。手工 CLI 运行走 `_run_v1_via_task`。
+    """
+    try:
+        info = _run_v1_core(
+            target_path, rules, type_override=type_override, agent_id=agent_id,
+            use_llm=use_llm, purpose=purpose, purpose_max=purpose_max,
+            review_id=review_id, research_enabled=research_enabled,
+            purpose_notes=purpose_notes, scenario=scenario,
+            format_spec=format_spec, progress_path=progress_path)
+    except UnreadableTargetError as e:
+        print(f"目标不可读：{e}")
+        _emit_domain_error(e)
+        sys.exit(1)
+    except ConfigError as e:
+        print(f"[v1] {e}")
+        _emit_domain_error(e)
+        sys.exit(2)
+    if not info["outcome"].ok:
+        print(f"[v1] 流水线未完成：{info['outcome'].status}；"
+              f"{'；'.join(info['outcome'].errors)[:300]}")
+        _emit_error("；".join(info["outcome"].errors) or "流水线未完成",
+                    kind="system", http_status=500)
+        sys.exit(1)
+    _print_v1_result(info)
+    return info["state"]
 
 
 def law_library_block(session):
@@ -5043,15 +5100,18 @@ def _path_for_record(path: Path) -> str:
         return path.resolve().as_posix()
 
 
-def make_task_runner(*, rules=None, type_override=None, agent_id=None):
-    """把六节点流水线包成 TaskService 的 runner（不打印、不 sys.exit）。
+def make_task_runner(*, rules=None, type_override=None, agent_id=None,
+                     scenario=None, format_spec=None, research_enabled=False,
+                     purpose_max=None, purpose_notes=None, progress_path=None,
+                     diag=None):
+    """把 V1 执行包成 TaskService 的 runner（不打印、不 sys.exit）。
 
-    与 `_run_v1` 的分工：`_run_v1` 是「人跑一次」的入口（打印摘要、错误码），
-    这里只返回结果。失败以 `TaskOutcome(status=FAILED)` 返回，由任务层记账。
+    与 `_run_v1` 的分工：`_run_v1` 是「服务端子进程 / 直跑」入口（打印摘要、错误码），
+    这里只返回 TaskOutcome，由任务层记账。执行与落盘共用 `_run_v1_core`，
+    所以 CLI 两条入口不会出现「两套 v1」。
 
-    接了 `token`：取消在阶段/节点边界生效，被取消时 `outcome.ok` 为 False，
-    于是**不会写报告**（报告只在流水线跑完之后写）——这正是"取消不留半成品"的
-    实现方式，而不是靠事后删文件。
+    `diag`：CLI 传一个 dict 进来，回填 state/outcome/report_path，供收尾打印；
+    任务层拿不到这些（它只认 TaskOutcome），但 CLI 需要原有摘要。
     """
 
     def runner(target, *, review_id, profile_id=None, purpose=None,
@@ -5059,28 +5119,26 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None):
         # profile 目前就是「用哪个 Agent / 规则包」：v1 的 ReviewProfile 由 agent 派生，
         # 所以 profile_id 直接当 agent 选择器用；传空则走既有的扩展名自动路由。
         std_rules = rules if rules is not None else load_rules()
-        purpose_info = (purpose_mod.parse(str(purpose))
-                        if purpose and str(purpose).strip() else None)
-        integrity_inputs: dict = {}
-        state, outcome, session = run_typed_pipeline(
-            target, std_rules, review_id=review_id,
-            agent_id=profile_id or agent_id, type_override=type_override,
-            store=STATE / "runs", use_llm=use_llm,
-            purpose_info=purpose_info, integrity_out=integrity_inputs,
-            token=token)
+        info = _run_v1_core(
+            target, std_rules, type_override=type_override,
+            agent_id=profile_id or agent_id, use_llm=use_llm,
+            purpose=purpose, purpose_max=purpose_max, review_id=review_id,
+            research_enabled=research_enabled, purpose_notes=purpose_notes,
+            scenario=scenario, format_spec=format_spec,
+            progress_path=progress_path, token=token)
+        if diag is not None:
+            diag.update(info)
+        state, outcome = info["state"], info["outcome"]
         if not outcome.ok:
             return TaskOutcome(
                 status=RunStatus.FAILED, stage=state.stage,
                 error="；".join(outcome.errors) or f"流水线未完成：{outcome.status}")
-        if token is not None and token.cancelled:
+        if info.get("cancelled"):
             # 结论算完了但已请求取消：不写报告，交给任务层落 CANCELLED。
-            # （写一份"用户已经不想要"的报告，比不写更糟——它会进台账。）
             return TaskOutcome(
                 status=RunStatus.FAILED, stage=state.stage,
-                error=f"已取消：{token.reason}")
-        report_path = _write_shadow_report(
-            state, outcome, integrity_inputs=integrity_inputs,
-            session=session, purpose_info=purpose_info, official=True)
+                error=f"已取消：{token.reason if token else '用户取消'}")
+        report_path = info["report_path"]
         return TaskOutcome(
             status=RunStatus.COMPLETED, stage=state.stage,
             verdict=state.decision.verdict.value if state.decision else None,
@@ -5089,7 +5147,6 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None):
         )
 
     return runner
-
 
 def has_run_state(run_id) -> bool:
     """这次运行有没有落盘的检查点（`TaskService.recover` 要用）。
@@ -5101,19 +5158,56 @@ def has_run_state(run_id) -> bool:
     return bool(run_id) and (STATE / "runs" / f"{run_id}.state.json").exists()
 
 
-def make_task_service(*, rules=None, type_override=None, agent_id=None) -> TaskService:
-    """装配任务服务：执行走六节点流水线，记录落 `state/tasks/`。
+def make_task_service(*, rules=None, type_override=None, agent_id=None,
+                      scenario=None, format_spec=None, research_enabled=False,
+                      purpose_max=None, purpose_notes=None, progress_path=None,
+                      diag=None) -> TaskService:
+    """装配任务服务：执行走 V1 核心，记录落 `state/tasks/`。
 
     `STATE` 在调用时才读：测试会把模块级目录重定向到临时目录，
     如果在导入时算好路径，重定向就失效（`test_engine_switch` 用的是同一套做法）。
     """
     return TaskService(
-        runner=make_task_runner(rules=rules, type_override=type_override,
-                                agent_id=agent_id),
+        runner=make_task_runner(
+            rules=rules, type_override=type_override, agent_id=agent_id,
+            scenario=scenario, format_spec=format_spec,
+            research_enabled=research_enabled, purpose_max=purpose_max,
+            purpose_notes=purpose_notes, progress_path=progress_path,
+            diag=diag),
         store=FileTaskStore(STATE / "tasks"),
         allocate=_allocate_task_review_id,
         root=ROOT,
     )
+
+
+def _run_v1_via_task(target_path, rules, *, type_override=None, agent_id=None,
+                     use_llm=False, purpose=None, purpose_max=None,
+                     purpose_notes=None, scenario=None, format_spec=None,
+                     research_enabled=False, progress_path=None):
+    """CLI 默认入口：任务由 TaskService 建，执行走同一个 `_run_v1_core`。
+
+    `--review-id` 不在这里：那是 server 的子进程，任务记录已由父进程持有；
+    子进程再建一条会把幂等键/创建时间覆盖掉（见 `main` 的分支）。
+    """
+    diag: dict = {}
+    service = make_task_service(
+        rules=rules, type_override=type_override, agent_id=agent_id,
+        scenario=scenario, format_spec=format_spec,
+        research_enabled=research_enabled, purpose_max=purpose_max,
+        purpose_notes=purpose_notes, progress_path=progress_path, diag=diag)
+    record = service.start_review(
+        target_path, profile_id=agent_id, purpose=purpose,
+        engine="v1", use_llm=use_llm)
+    if record.status == RunStatus.COMPLETED.value and diag.get("report_path"):
+        _print_v1_result(diag)
+        return record
+    outcome = diag.get("outcome")
+    errors = ("；".join(getattr(outcome, "errors", []) or [])
+              or record.error or "流水线未完成")
+    print(f"[v1] 流水线未完成：{getattr(outcome, 'status', record.status)}；"
+          f"{errors[:300]}")
+    _emit_error(errors, kind="system", http_status=500)
+    sys.exit(1)
 
 
 def make_report_service() -> ReportService:
@@ -5125,319 +5219,8 @@ def make_report_service() -> ReportService:
 
 
 def main():
-    args = sys.argv[1:]
-    use_llm = None
-    progress_path = None
-    type_override = None
-    agent_id = None
-    purpose = None
-    purpose_max = None
-    purpose_notes = None
-    scenario = None
-    research_enabled = False
-    review_id_opt = None          # `--review-id`：服务端预先发的号（见 _emit_result）
-    # 引擎选择：默认 v1 八阶段流水线；legacy = 旧链路回滚；shadow = 两条都跑并比对。
-    engine, args = _take_engine(args)
-    if engine == "off":
-        return
-    if "--scenario" in args:
-        i = args.index("--scenario")
-        if i + 1 < len(args):
-            scenario = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-            try:
-                opts = "、".join(s["id"] for s in scenario_mod.load()["scenarios"])
-            except scenario_mod.ScenarioError as e:
-                opts = f"（情境配置读取失败：{e}）"
-            print(f"--scenario 缺少取值。可用：{opts}")
-            sys.exit(2)
-    if "--list-scenarios" in args:
-        data = scenario_mod.load()
-        print(f"可用审查情境（默认 {data['default']}，配置版本 {data['version']}）：")
-        for s in data["scenarios"]:
-            print(f"  {s['id']:<20}{s['name']}")
-            print(f"      关闭规则：{'、'.join(s['disable_rules']) or '无'}"
-                  + (f"｜关闭维度：{'、'.join(s['disable_dimensions'])}"
-                     if s["disable_dimensions"] else ""))
-            if s["keep_note"]:
-                print(f"      仍然检查：{s['keep_note']}")
-        return
-    if scenario and scenario_mod.get(scenario) is None:
-        try:
-            opts = "、".join(s["id"] for s in scenario_mod.load()["scenarios"])
-        except scenario_mod.ScenarioError as e:
-            print(f"审查情境错误：{e}")
-            sys.exit(2)
-        print(f"未知审查情境：{scenario}；可选：{opts}")
-        sys.exit(2)
-    format_spec = None
-    if "--format-spec-json" in args:
-        i = args.index("--format-spec-json")
-        if i + 1 < len(args):
-            raw_json = args[i + 1]
-            del args[i:i + 2]
-            try:
-                format_spec = json.loads(raw_json)
-            except json.JSONDecodeError as e:
-                print(f"--format-spec-json 不是合法 JSON：{e}")
-                sys.exit(2)
-            if not isinstance(format_spec, dict):
-                print("--format-spec-json 必须是对象（check 块）")
-                sys.exit(2)
-        else:
-            del args[i]
-            print("--format-spec-json 缺少取值")
-            sys.exit(2)
-    if "--format-spec" in args:
-        i = args.index("--format-spec")
-        if i + 1 < len(args):
-            # 同时给了 --format-spec-json 时以 json 为准：它是更精确的那一个
-            # （前端已经按分项表单算好了数值），id 只是它的来源说明。
-            if not isinstance(format_spec, dict):
-                format_spec = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-            try:
-                opts = "、".join(s["id"] for s in format_spec_mod.load()["specs"])
-            except format_spec_mod.FormatSpecError as e:
-                opts = f"（格式规格配置读取失败：{e}）"
-            print(f"--format-spec 缺少取值。可用：{opts}")
-            sys.exit(2)
-    if "--list-format-specs" in args:
-        data = format_spec_mod.load()
-        print(f"可用格式规格（默认 {data['default']}，配置版本 {data['version']}）：")
-        for s in data["specs"]:
-            print(f"  {s['id']:<24}{s['name']}")
-            print(f"      判定项：{'、'.join(sorted(s['check'])) or '无'}")
-            if s["source"]:
-                print(f"      来源：{s['source']}")
-            if s["disable_rules"]:
-                print(f"      不参与：{'、'.join(s['disable_rules'])}")
-        return
-    if format_spec and format_spec_mod.get(format_spec) is None:
-        try:
-            opts = "、".join(s["id"] for s in format_spec_mod.load()["specs"])
-        except format_spec_mod.FormatSpecError as e:
-            print(f"格式规格错误：{e}")
-            sys.exit(2)
-        print(f"未知格式规格：{format_spec}；可选：{opts}")
-        sys.exit(2)
-    if "--agent" in args:
-        i = args.index("--agent")
-        if i + 1 < len(args):
-            agent_id = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-            print("--agent 缺少取值。可用："
-                  + "、".join(a["id"] for a in agent_spec.list_agents()))
-            sys.exit(2)
-    if "--list-agents" in args:
-        print("可用审查 Agent（每个 Agent = 一套判定标准）：")
-        for a in agent_spec.list_agents():
-            if a.get("error"):
-                print(f"  {a['id']:<16} [无效] {a['error'][:100]}")
-                continue
-            print(f"  {a['id']:<16}{a['version']:<8}{a['name']}")
-            print(f"      维度：{'、'.join(d['label'] for d in a['dimensions'])}")
-            print(f"      规则：{a['rules']} 条｜检查器：{len(a['checks'])} 项｜"
-                  f"自动路由：{'是' if a['auto'] else '否（需 --agent 显式指定）'}")
-        return
-    if "--type" in args:
-        i = args.index("--type")
-        if i + 1 < len(args):
-            type_override = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-    valid_types = agent_spec.all_target_types() or list(DIM_FOR_TYPE)
-    if type_override and type_override not in valid_types:
-        print(f"未知类型：{type_override}，可选：{', '.join(valid_types)}")
-        sys.exit(2)
-    if "--purpose" in args:
-        i = args.index("--purpose")
-        if i + 1 < len(args):
-            purpose = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-            print("--purpose 缺少取值（例：--purpose \"这是给客户的报价邮件，找承诺过头的地方\"）")
-            sys.exit(2)
-    if "--purpose-max" in args:
-        i = args.index("--purpose-max")
-        if i + 1 < len(args):
-            try:
-                purpose_max = int(args[i + 1])
-            except ValueError:
-                print("--purpose-max 必须是整数（目的文本参与解析的字数上限）")
-                sys.exit(2)
-            if not 1 <= purpose_max <= 20000:
-                print("--purpose-max 需在 1-20000 之间")
-                sys.exit(2)
-            del args[i:i + 2]
-        else:
-            del args[i]
-            print("--purpose-max 缺少取值（例：--purpose-max 2000，配合上传的目的文件使用）")
-            sys.exit(2)
-    if "--purpose-notes" in args:
-        i = args.index("--purpose-notes")
-        if i + 1 < len(args):
-            raw = args[i + 1]
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                print("--purpose-notes 必须是 JSON 数组（目的来源的质量提示）")
-                sys.exit(2)
-            if not isinstance(parsed, list):
-                print("--purpose-notes 必须是 JSON 数组（目的来源的质量提示）")
-                sys.exit(2)
-            purpose_notes = [str(x) for x in parsed]
-            del args[i:i + 2]
-        else:
-            del args[i]
-            print("--purpose-notes 缺少取值（JSON 数组）")
-            sys.exit(2)
-    if "--progress" in args:
-        i = args.index("--progress")
-        if i + 1 < len(args):
-            progress_path = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-    if "--no-llm" in args:
-        use_llm = False
-        args = [a for a in args if a != "--no-llm"]
-    if "--no-research" in args:
-        # 离线/涉密场景：不联网核验，报告会写明「未做外部事实核验」
-        research_enabled = False
-        args = [a for a in args if a != "--no-research"]
-    if "--research" in args:
-        research_enabled = True
-        args = [a for a in args if a != "--research"]
-    if "--no-gap-log" in args:
-        # 缺口清单里会存被审文本的片段。涉密/涉个人信息的材料可以不落这份工单
-        # （代价：下次仍然不知道该补什么，报告里 fact_gaps.disabled=True 会写明）。
-        globals()["GAP_LOG"] = False
-        args = [a for a in args if a != "--no-gap-log"]
-    if "--llm" in args:
-        use_llm = True
-        args = [a for a in args if a != "--llm"]
-    # `--review-id <R-...>`：由服务端预先发号（它要先建任务记录，记录里的
-    # review_id 必须与报告一致）。号仍然由本模块统一发，见 `--print-review-id`。
-    if "--review-id" in args:
-        i = args.index("--review-id")
-        if i + 1 < len(args):
-            review_id_opt = args[i + 1]
-            del args[i:i + 2]
-        else:
-            del args[i]
-            print("--review-id 缺少取值（形如 R-20261101-001）")
-            sys.exit(2)
-    if "--print-review-id" in args:
-        # 服务端在起任务前调用它拿号：只发号、不做任何审查、不写任何报告。
-        # 为什么用子进程而不是把发号逻辑复制到服务端：两份发号逻辑迟早会发出同一个号。
-        date = datetime.date.today().strftime("%Y%m%d")
-        new_id, lock = allocate_review_id(date)
-        try:
-            lock.unlink()
-        except OSError:
-            pass
-        _ID_LOCKS.discard(lock)
-        print(json.dumps({"review_id": new_id}, ensure_ascii=False))
-        return
-    if not args or args[0] == "--list":
-        print("可用待审对象：")
-        paths = sorted(glob.glob(str(TARGETS / "*")))
-        paths += sorted(glob.glob(str(TARGETS / "uploads" / "*")))
-        for p in paths:
-            if os.path.isfile(p):
-                print("  ", str(Path(p).relative_to(ROOT)).replace("\\", "/"))
-        print("\n可选参数：--llm 强制调用大模型；--no-llm 强制纯规则审；"
-              "--type 显式指定对象类型；--agent 指定审查 Agent（--list-agents 查看）；"
-              "--scenario 指定审查情境（--list-scenarios 查看：不同用途关掉不同规则）；"
-              "--format-spec 指定格式规格（--list-format-specs 查看：docx 版式按哪套标准判，"
-              "默认 none 即不判字体字号行距）；"
-              "--purpose \"这份文本想干什么\"（按目的派生目标并定位证据，默认解析前 300 字）；"
-              "--purpose-max N 目的文本参与解析的字数上限（1-20000，上传目的文件时用）；"
-              "--research 对事实库外的数字/日期主张联网检索来源并核验（默认关闭）；"
-              "--no-research 强制关闭联网核验；"
-              "--engine legacy|v1|shadow 选择执行引擎（v1 默认；v1 跑八阶段流水线、"
-              "写报告 outputs/v1/ 并落状态；legacy 为旧链路回滚；shadow 出旧报告并双跑比对，"
-              "差异写 state/double_run/；shadow 需配合 --no-llm，v1 可带 --llm）；"
-              "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
-        return
-    target_arg = args[0]
-    target_path = (ROOT / target_arg) if not os.path.isabs(target_arg) else Path(target_arg)
-    if not target_path.exists():
-        print(f"找不到待审文件：{target_path}")
-        _emit_domain_error(NotFoundError(f"找不到待审文件：{target_path}"))
-        sys.exit(1)
-    rules = load_rules()
-    if engine == "shadow" and use_llm is not False:
-        # 双跑比对不能拿模型输出比：语义审本身有波动，差异无从判定是 bug 还是随机。
-        # 显式拒绝，比产出一堆「未解释差异」强。
-        print("--engine shadow 目前只支持纯规则模式：请加 --no-llm")
-        _emit_error("--engine shadow 需要 --no-llm", kind="input", http_status=400)
-        sys.exit(2)
-    if engine == "v1":
-        try:
-            _run_v1(target_path, rules, type_override=type_override,
-                    agent_id=agent_id, use_llm=use_llm,
-                    purpose=purpose, purpose_max=purpose_max,
-                    review_id=review_id_opt, research_enabled=research_enabled,
-                    purpose_notes=purpose_notes,
-                    scenario=scenario, format_spec=format_spec,
-                    progress_path=progress_path)
-        except scenario_mod.ScenarioError as e:
-            print(f"审查情境错误：{e}")
-            _emit_domain_error(ConfigError(f"审查情境错误：{e}"))
-            sys.exit(2)
-        except format_spec_mod.FormatSpecError as e:
-            print(f"格式规格错误：{e}")
-            _emit_domain_error(ConfigError(f"格式规格错误：{e}"))
-            sys.exit(2)
-        return
-    try:
-        report = run_one(target_path, rules, use_llm=use_llm,
-                         progress_path=progress_path, type_override=type_override,
-                         agent_id=agent_id, purpose=purpose, purpose_max=purpose_max,
-                         purpose_notes=purpose_notes, scenario=scenario,
-                         format_spec=format_spec,
-                         research_enabled=research_enabled,
-                         review_id=review_id_opt)
-    except agent_spec.AgentError as e:
-        print(f"Agent 配置错误：{e}")
-        _emit_domain_error(ConfigError(f"Agent 配置错误：{e}"))
-        sys.exit(2)
-    except scenario_mod.ScenarioError as e:
-        print(f"审查情境错误：{e}")
-        _emit_domain_error(ConfigError(f"审查情境错误：{e}"))
-        sys.exit(2)
-    except format_spec_mod.FormatSpecError as e:
-        print(f"格式规格错误：{e}")
-        _emit_domain_error(ConfigError(f"格式规格错误：{e}"))
-        sys.exit(2)
-    except UnreadableTargetError as e:
-        print(f"目标不可读：{e}")
-        _emit_domain_error(e)
-        sys.exit(1)
-    if engine == "shadow":
-        _run_shadow(report, target_path, rules,
-                    type_override=type_override, agent_id=agent_id,
-                    purpose=purpose, purpose_max=purpose_max,
-                    research_enabled=research_enabled)
-    print(f"[{report['review_id']}] 裁定={report['verdict']} | "
-          f"Agent={(report.get('agent') or {}).get('id')} | "
-          f"情境={(report.get('scenario') or {}).get('id') or '-'} | "
-          f"规格={(report.get('format_spec') or {}).get('id') or '-'} | "
-          f"模式={report['review_mode']} | 异议 {len(report['issues'])} 条 | "
-          f"输出：outputs/{report['review_id']}.json/.md")
-    _emit_result(report["review_id"], OUTPUTS / f"{report['review_id']}.json",
-                 verdict=report.get("verdict"))
-
-
+    """CLI 薄入口：解析/分发在 interfaces/cli/commands.py（第二阶段 2.1）。"""
+    from interfaces.cli import commands
+    return commands.main(sys.argv[1:], runtime=sys.modules[__name__])
 if __name__ == "__main__":
     main()

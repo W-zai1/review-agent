@@ -4,6 +4,7 @@
 > `review_agent/` 已提供领域模型、运行时（六节点 + 编排器 + 检查点）、Application Service
 > （含 Task / Report / Audit）、工具注册表与适配器；`--engine` 缺省为 `v1`，
 > `legacy` 仅用于回滚与差异验证（不再增加功能）。
+> CLI 手工运行与 Web 共用 `TaskService`；server 的 `--review-id` 子进程只执行、不重复建任务。
 > `tools/` 的 46 个模块尚未逐个迁移。
 > 逐段迁移的顺序与验收标准见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)；
 > 切流（V1 接管）+ 证据可信度 + 工程闭环的排期见

@@ -89,7 +89,11 @@ class ReviewErrorLineTests(unittest.TestCase):
             bad = Path(tmp) / "broken.docx"
             bad.write_bytes(b"not a zip at all")
             proc = subprocess.run(
-                [sys.executable, "review.py", str(bad)],
+                # 带 --review-id：这是「服务端子进程」路径，不建任务记录。
+                # 不带的话 CLI 会按手工运行在真实 state/tasks 留一条失败记录，
+                # 公开检查不该写仓库运行数据。
+                [sys.executable, "review.py", str(bad),
+                 "--review-id", "R-20261103-999"],
                 cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=120,
             )
