@@ -62,6 +62,7 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 # server 与 review.py 共用它：两边各写一份的下场是「一个按行数推号、一个按记录数推号」，
 # 删过报告之后新记录的 seq 就会撞号。
 from review_agent.infrastructure import ledger as ledger_store
+from interfaces.web.reports import ReportService
 # 任务记录是「这条审查到底跑完没有」的唯一真相：JOBS 只是给前端看的内存视图。
 from review_agent.application import (
     FileTaskStore,
@@ -257,6 +258,27 @@ def _ctype(path: Path) -> str:
 
 def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _report_service(favorites_getter=None, favorites_setter=None):
+    """按当前模块全局构造报告服务。
+
+    测试会 monkeypatch `server.OUTPUTS/TRASH/...`，所以这里必须每次读全局，
+    不能在 import 时固化一份实例。
+    """
+    return ReportService(
+        root=ROOT,
+        outputs=OUTPUTS,
+        log_dir=LOG_DIR,
+        state_dir=STATE_DIR,
+        trash=TRASH,
+        ledger_dir=LEDGER,
+        favorites_path=FAVORITES,
+        llm_cache_dir=LLM_CACHE_DIR,
+        favorites_getter=favorites_getter,
+        favorites_setter=favorites_setter,
+        purge_gap=fact_gap.purge_review,
+    )
 
 
 def _legacy_task_view(task):
@@ -1327,434 +1349,58 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _favorites(self):
-        """读取被收藏的报告 ID。
-
-        文件不存在 / 损坏 / 内容不合规，一律当"没有收藏"处理——
-        一个坏掉的收藏文件不能把整个历史列表拖垮（列表是主路径，收藏是附加）。
-        """
-        try:
-            data = json.loads(FAVORITES.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        ids = data.get("favorites") if isinstance(data, dict) else data
-        if not isinstance(ids, list):
-            return []
-        out = []
-        for x in ids:
-            rid = str(x or "")
-            if re.fullmatch(r"R-\d{8}-\d{3}", rid) and rid not in out:
-                out.append(rid)
-        return out
+        return _report_service().favorites()
 
     def _save_favorites(self, ids):
-        FAVORITES.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "favorites": ids,
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        tmp = FAVORITES.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(str(tmp), str(FAVORITES))
+        return _report_service().save_favorites(ids)
 
     def _set_favorite(self, data):
-        """收藏 / 取消收藏一份报告。body: {"id": "R-xxx", "favorite": true|false}
-
-        `favorite` 必须是布尔值：不接受 "1" / "toggle" 之类的模糊写法，
-        免得前端状态与服务端不一致时静默写反。
-        """
-        rid = str((data or {}).get("id") or "")
-        if not re.fullmatch(r"R-\d{8}-\d{3}", rid):
-            return {"ok": False, "error": "报告 ID 格式不合法"}
-        if not ((OUTPUTS / f"{rid}.json").exists()
-                or (OUTPUTS / "v1" / f"{rid}.json").exists()):
-            return {"ok": False, "error": f"未找到报告 {rid}"}
-        want = (data or {}).get("favorite")
-        if not isinstance(want, bool):
-            return {"ok": False, "error": "favorite 必须是 true / false"}
-
-        ids = self._favorites()
-        if want and rid not in ids:
-            ids.insert(0, rid)          # 最近收藏的排前面
-        elif not want and rid in ids:
-            ids.remove(rid)
-        self._save_favorites(ids)
-        return {"ok": True, "id": rid, "favorite": want, "favorites": ids}
+        return _report_service(
+            self._favorites, self._save_favorites).set_favorite(data)
 
     def _set_favorites(self, data):
-        """批量收藏/取消收藏。先完整校验，再一次性写盘，避免半批成功。"""
-        raw_ids = (data or {}).get("ids")
-        if not isinstance(raw_ids, list) or not raw_ids:
-            return {"ok": False, "error": "ids 必须是非空数组"}
-        if len(raw_ids) > 200:
-            return {"ok": False, "error": "一次最多收藏 200 份报告"}
-        ids = list(dict.fromkeys(str(item or "") for item in raw_ids))
-        bad = [rid for rid in ids
-               if not re.fullmatch(r"R-\d{8}-\d{3}", rid)]
-        if bad:
-            return {"ok": False, "error": f"报告 ID 格式不合法：{bad[0]}"}
-        missing = [rid for rid in ids
-                   if not ((OUTPUTS / f"{rid}.json").exists()
-                           or (OUTPUTS / "v1" / f"{rid}.json").exists())]
-        if missing:
-            return {"ok": False, "error": f"未找到报告 {missing[0]}"}
-        want = (data or {}).get("favorite")
-        if not isinstance(want, bool):
-            return {"ok": False, "error": "favorite 必须是 true / false"}
-
-        current = self._favorites()
-        chosen = set(ids)
-        current = [rid for rid in current if rid not in chosen]
-        if want:
-            current = ids + current       # 最近操作的这一批排最前面
-        self._save_favorites(current)
-        return {
-            "ok": True,
-            "ids": ids,
-            "favorite": want,
-            "updated": len(ids),
-            "favorites": current,
-        }
+        return _report_service(
+            self._favorites, self._save_favorites).set_favorites(data)
 
     def _reports(self):
-        """历史报告列表：**只按时间倒序**，最新的排最上面。
-
-        排序键用报告内的 `timestamp`（生成时刻），不用文件 mtime：
-        拷贝 / 解压 / 批量重写都会改 mtime，会让顺序莫名漂移；而 timestamp
-        是报告自己写死的，永远等于"这份报告是什么时候跑出来的"。
-        同秒连跑两份时 timestamp 相同，用 review_id 兜底（编号更大的在后生成的），
-        保证顺序稳定、不随文件系统返回顺序抖动。
-        """
-        fav = set(self._favorites())
-        items = []
-        paths = [*OUTPUTS.glob("R-*.json"), *(OUTPUTS / "v1").glob("R-*.json")]
-        by_id = {}
-        for p in paths:
-            try:
-                r = _read_json(p)
-            except Exception:
-                continue          # 坏掉的报告不该让整个列表 500
-            rid = str(r.get("review_id") or p.stem)
-            by_id[rid] = (p, r)
-
-        for rid, (p, r) in by_id.items():
-            inc = r.get("integrity", {})
-            mtime = p.stat().st_mtime
-            target = r.get("target") if isinstance(r.get("target"), dict) else {}
-            ts = str(r.get("timestamp") or r.get("generated_at") or "")
-            if not ts:
-                # 老报告可能没写 timestamp：退回 mtime，但格式化成同一个口径再排
-                ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mtime))
-            target_path = r.get("target_path") or target.get("path")
-            items.append({
-                "id": rid,
-                "verdict": r.get("verdict"),
-                "target_type": r.get("target_type") or target.get("type"),
-                "target_path": target_path,
-                "target_name": Path(target_path or "").name,
-                "review_mode": r.get("review_mode"),
-                "timestamp": ts,
-                "issues": len(r.get("issues", [])),
-                "stats": r.get("stats", {}),
-                "engine": r.get("engine") or (
-                    "architecture-v1" if p.parent.name == "v1" else "legacy"),
-                "report_hash": (inc.get("report_hash") or "")[:16],
-                "favorite": rid in fav,
-                "mtime": mtime,
-            })
-        items.sort(key=lambda x: (x["timestamp"], x["id"]), reverse=True)
-        return {"items": items, "favorites": sorted(fav)}
+        return _report_service(
+            self._favorites, self._save_favorites).reports()
 
     def _delete_report(self, rid, data):
-        """删除单份历史报告。
-
-        二次确认：body 必须带 confirm=<报告ID>，与服务端要求完全一致才执行。
-        审计链：ledger 对应行原位打上 op=delete 墓碑，seq / report_hash / prev_hash
-                全部保持不变——链的衔接分毫不动，删除痕迹留在链上可审计。
-        文件不硬删：移入 outputs/.trash/，误删可自行恢复。
-        """
-        if not rid:
-            return {"ok": False, "error": "缺少 id"}
-        if not re.fullmatch(r"R-\d{8}-\d{3}", str(rid)):
-            return {"ok": False, "error": "报告 ID 格式不合法"}
-        hit = OUTPUTS / f"{rid}.json"
-        sidecar = OUTPUTS / f"{rid}.md"
-        v1_hit = OUTPUTS / "v1" / f"{rid}.json"
-        v1_sidecar = OUTPUTS / "v1" / f"{rid}.md"
-        # 只认 .json 会留下"清不掉的孤儿"：删除是「先移 json 再移 md」两次文件操作，
-        # 中途被打断（进程被杀 / 磁盘满）就只剩一个 .md，而 .json 已进回收站。
-        # 此时再删会报"未找到报告"，那个 .md 就永远躺在 outputs/ 里没人能处理。
-        # 所以判"找不到"要看两个文件都不在。
-        if not any(p.exists() for p in (hit, sidecar, v1_hit, v1_sidecar)):
-            return {"ok": False, "error": f"未找到报告 {rid}"}
-
-        confirm = str((data or {}).get("confirm") or "")
-        if confirm != rid:
-            return {"ok": False, "need_confirm": True,
-                    "error": "删除需要二次确认：请提交 confirm=<报告ID>"}
-
-        report = None
-        for candidate in (v1_hit, hit):
-            if candidate.is_file():
-                try:
-                    report = _read_json(candidate)
-                    break
-                except Exception:
-                    continue
-
-        TRASH.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "schema": 1,
-            "review_id": rid,
-            "deleted_at": ledger_store.now_iso(),
-            "files": [],
-        }
-        moved = []
-        for src in (OUTPUTS / f"{rid}.json", OUTPUTS / f"{rid}.md"):
-            if src.exists():
-                dst = _trash_destination(src.name)
-                shutil.move(str(src), str(dst))
-                _record_trash_move(manifest, src, dst)
-                moved.append(src.name)
-        log_src = LOG_DIR / rid
-        if log_src.is_dir():
-            dst = _trash_destination(f"{rid}_logs")
-            shutil.move(str(log_src), str(dst))
-            _record_trash_move(manifest, log_src, dst)
-            moved.append(f"logs/{rid}/")
-        # 连带清理：报告不是唯一一份原文副本
-        moved.extend(_purge_derived(rid, report=report, manifest=manifest))
-        # 先记映射再追加墓碑：即使台账写入失败，界面也能把报告恢复回来。
-        _save_trash_manifest(manifest)
-
-        tombstoned = _mark_ledger_deleted(rid)
-        # 收藏表里摘掉这个 id：报告都进回收站了，收藏里留着会变成永远点不开的幽灵项
-        favs = self._favorites()
-        if rid in favs:
-            favs.remove(rid)
-            self._save_favorites(favs)
-        return {
-            "ok": True,
-            "id": rid,
-            "moved": moved,
-            "trash": "outputs/.trash/",
-            "ledger_tombstone": tombstoned,
-        }
+        """删除报告；未带 confirm=<报告ID> 时由服务层返回 need_confirm。"""
+        return _report_service(
+            self._favorites, self._save_favorites).delete_report(rid, data)
 
     def _delete_reports(self, data):
-        """批量移入回收站。每份报告独立执行，返回完整成功数与失败明细。"""
-        if str((data or {}).get("confirm") or "") != "DELETE_SELECTED":
-            return {"ok": False, "need_confirm": True,
-                    "error": "批量删除需要确认：confirm=DELETE_SELECTED"}
-        raw_ids = (data or {}).get("ids")
-        if not isinstance(raw_ids, list) or not raw_ids:
-            return {"ok": False, "error": "ids 必须是非空数组"}
-        if len(raw_ids) > 200:
-            return {"ok": False, "error": "一次最多删除 200 份报告"}
-        ids = list(dict.fromkeys(str(item or "") for item in raw_ids))
-        deleted = []
-        errors = []
-        for rid in ids:
-            try:
-                result = self._delete_report(rid, {"confirm": rid})
-            except Exception as exc:                    # noqa: BLE001 - 单份失败不拖垮批次
-                result = {"ok": False,
-                          "error": f"{type(exc).__name__}: {exc}"}
-            if result.get("ok"):
-                deleted.append(rid)
-            else:
-                errors.append({"id": rid,
-                               "error": result.get("error") or "删除失败"})
-        return {
-            "ok": not errors,
-            "deleted": deleted,
-            "failed": errors,
-            "total": len(ids),
-        }
+        return _report_service(
+            self._favorites, self._save_favorites).delete_reports(data)
 
     def _trash_reports(self):
-        """回收站列表。新数据读 manifest，旧回收数据按命名规则兼容。"""
-        ids = set()
-        manifest_dir = TRASH / ".manifests"
-        if manifest_dir.is_dir():
-            for path in manifest_dir.glob("R-*.json"):
-                rid = path.stem
-                if re.fullmatch(r"R-\d{8}-\d{3}", rid):
-                    ids.add(rid)
-        if TRASH.is_dir():
-            for path in TRASH.iterdir():
-                match = re.match(
-                    r"(?:v1_)?(R-\d{8}-\d{3})(?:-\d+)?\.json$", path.name)
-                if path.is_file() and match:
-                    ids.add(match.group(1))
-
-        items = []
-        for rid in ids:
-            # 同名报告已恢复时，残留 manifest 不应再让它出现在回收站。
-            if ((OUTPUTS / f"{rid}.json").exists()
-                    or (OUTPUTS / "v1" / f"{rid}.json").exists()):
-                continue
-            manifest = _load_trash_manifest(rid)
-            report = _find_report(rid)
-            paths = _trash_items(rid, report=report)
-            if not paths:
-                continue
-            mtimes = []
-            size = 0
-            for src, _original in paths:
-                try:
-                    if src.is_dir():
-                        files = [p for p in src.rglob("*") if p.is_file()]
-                        size += sum(p.stat().st_size for p in files)
-                        mtimes.extend(p.stat().st_mtime for p in files)
-                    else:
-                        st = src.stat()
-                        size += st.st_size
-                        mtimes.append(st.st_mtime)
-                except OSError:
-                    continue
-            deleted_at = (manifest or {}).get("deleted_at")
-            if not deleted_at and mtimes:
-                deleted_at = datetime.fromtimestamp(
-                    max(mtimes)).astimezone().isoformat(timespec="seconds")
-            target = report.get("target") if isinstance(report, dict) else {}
-            target_path = (
-                (report or {}).get("target_path")
-                or (target or {}).get("path")
-                or ""
-            )
-            items.append({
-                "id": rid,
-                "target_name": (
-                    (report or {}).get("target_name")
-                    or Path(str(target_path)).name
-                ),
-                "target_path": str(target_path),
-                "verdict": (report or {}).get("verdict", ""),
-                "review_mode": (report or {}).get("review_mode", ""),
-                "issues": len((report or {}).get("issues") or []),
-                "deleted_at": deleted_at or "",
-                "files": len(paths),
-                "size": size,
-                "restorable": True,
-            })
-        items.sort(key=lambda x: (x["deleted_at"], x["id"]), reverse=True)
-        return {"ok": True, "items": items, "total": len(items)}
+        return _report_service().trash_reports()
 
     def _restore_report(self, data):
-        """把回收站报告及登记过的伴生文件原路移回；不覆盖现有文件。"""
-        rid = str((data or {}).get("id") or "")
-        if not re.fullmatch(r"R-\d{8}-\d{3}", rid):
-            return {"ok": False, "error": "报告 ID 格式不合法"}
-        if ((OUTPUTS / f"{rid}.json").exists()
-                or (OUTPUTS / "v1" / f"{rid}.json").exists()):
-            return {"ok": False, "error": f"报告 {rid} 已存在，拒绝覆盖"}
-        report = _find_report(rid)
-        items = _trash_items(rid, report=report)
-        if not items:
-            return {"ok": False, "error": f"回收站中未找到报告 {rid}"}
-        conflicts = [str(original) for _src, original in items
-                     if original.exists()]
-        if conflicts:
-            return {"ok": False,
-                    "error": f"恢复目标已存在，拒绝覆盖：{conflicts[0]}"}
-
-        moved = []
-        try:
-            for src, original in items:
-                original.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(original))
-                moved.append((original, src))
-        except Exception as exc:
-            for original, src in reversed(moved):
-                try:
-                    src.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(original), str(src))
-                except OSError:
-                    pass
-            return {"ok": False,
-                    "error": f"恢复中断，已回滚：{type(exc).__name__}: {exc}"}
-
-        manifest = _trash_manifest_path(rid)
-        try:
-            manifest.unlink()
-        except OSError:
-            pass
-        ledger_restored = _mark_ledger_restored(rid)
-        return {
-            "ok": True,
-            "id": rid,
-            "restored": [str(original) for original, _src in moved],
-            "ledger_restore": ledger_restored,
-        }
+        return _report_service().restore_report(data)
 
     def _purge_trash_report(self, rid, data):
-        """彻底删除回收站中的一份报告；必须再次提交完整报告 ID。"""
-        if not re.fullmatch(r"R-\d{8}-\d{3}", str(rid or "")):
-            return {"ok": False, "error": "报告 ID 格式不合法"}
-        if str((data or {}).get("confirm") or "") != rid:
-            return {"ok": False, "need_confirm": True,
-                    "error": "彻底删除需要二次确认：请提交 confirm=<报告ID>"}
-        report = _find_report(rid)
-        items = _trash_items(rid, report=report, dedupe=False)
-        if not items:
-            return {"ok": False, "error": f"回收站中未找到报告 {rid}"}
-        removed = []
-        for src, _original in items:
-            try:
-                if src.is_dir():
-                    shutil.rmtree(str(src))
-                elif src.exists():
-                    src.unlink()
-                removed.append(str(src))
-            except OSError as exc:
-                return {"ok": False,
-                        "error": f"彻底删除失败：{type(exc).__name__}: {exc}",
-                        "removed": removed}
-        try:
-            _trash_manifest_path(rid).unlink()
-        except OSError:
-            pass
-        return {"ok": True, "id": rid, "removed": removed}
+        return _report_service().purge_trash_report(rid, data)
 
     def _empty_trash(self, data):
-        """清空整个回收区。此动作不可恢复，必须提交 confirm=EMPTY。"""
-        if str((data or {}).get("confirm") or "") != "EMPTY":
-            return {"ok": False, "need_confirm": True,
-                    "error": '清空回收站需要二次确认：请提交 confirm="EMPTY"'}
-        if not TRASH.is_dir():
-            return {"ok": True, "removed": 0}
-        removed = 0
-        for path in list(TRASH.iterdir()):
-            if path.is_dir():
-                shutil.rmtree(str(path))
-            else:
-                path.unlink()
-            removed += 1
-        return {"ok": True, "removed": removed}
-
-    def _purge_derived(self, rid):
-        """删报告时，把它在别处的**原文副本**一起处理掉（实现见模块级 `_purge_derived`）。"""
-        return _purge_derived(rid)
-
-    def _mark_ledger_deleted(self, rid):
-        """给这份报告追加墓碑（实现见模块级 `_mark_ledger_deleted`）。"""
-        return _mark_ledger_deleted(rid)
-
-    def _mark_ledger_restored(self, rid):
-        """给这份报告追加恢复事件（实现见模块级 `_mark_ledger_restored`）。"""
-        return _mark_ledger_restored(rid)
+        return _report_service().empty_trash(data)
 
     def _report(self, rid):
-        if not rid:
-            return {"ok": False, "error": "缺少 id"}
-        if not re.fullmatch(r"R-\d{8}-\d{3}", str(rid)):
-            return {"ok": False, "error": "报告 ID 格式不合法"}
-        hit = next(OUTPUTS.glob(f"{rid}.json"), None)
-        if hit is None:
-            hit = next((OUTPUTS / "v1").glob(f"{rid}.json"), None)
-        if not hit:
-            return {"ok": False, "error": f"未找到报告 {rid}"}
-        return {"ok": True, "report": _read_json(hit)}
+        return _report_service().report(rid)
+
+    def _purge_derived(self, rid):
+        """兼容入口：实际实现见 interfaces/web/reports.py。"""
+        return _report_service()._purge_derived(rid)
+
+    def _mark_ledger_deleted(self, rid):
+        """兼容入口：实际实现见 interfaces/web/reports.py。"""
+        return _report_service()._mark_ledger_deleted(rid)
+
+    def _mark_ledger_restored(self, rid):
+        """兼容入口：实际实现见 interfaces/web/reports.py。"""
+        return _report_service()._mark_ledger_restored(rid)
 
     def _rules(self):
         state = rules_store.load_state()
@@ -2631,364 +2277,79 @@ def _record_egress(kind, *, target=None, job_id=None, detail="", enabled=True):
 
 
 def _trash_destination(name):
-    TRASH.mkdir(parents=True, exist_ok=True)
-    dst = TRASH / name
-    if dst.exists():
-        stem, ext = os.path.splitext(name)
-        dst = TRASH / f"{stem}-{int(time.time() * 1000)}{ext}"
-    return dst
+    return _report_service()._trash_destination(name)
 
 
 def _root_relative(path):
-    """把仓库内路径转成可写入 manifest 的 POSIX 相对路径；仓库外返回空。"""
-    try:
-        return Path(path).resolve().relative_to(ROOT.resolve()).as_posix()
-    except (OSError, ValueError):
-        return ""
+    return _report_service()._root_relative(path)
 
 
 def _trash_manifest_path(rid):
-    return TRASH / ".manifests" / f"{rid}.json"
+    return _report_service()._trash_manifest_path(rid)
 
 
 def _record_trash_move(manifest, src, dst):
-    """记录一次可逆搬移。只登记仓库内源路径，避免恢复接口成为任意落盘入口。"""
-    if manifest is None:
-        return
-    rel = _root_relative(src)
-    if rel:
-        manifest.setdefault("files", []).append({
-            "from": rel,
-            "to": Path(dst).name,
-        })
+    return _report_service()._record_trash_move(manifest, src, dst)
 
 
 def _save_trash_manifest(manifest):
-    if not manifest or not manifest.get("review_id"):
-        return
-    path = _trash_manifest_path(manifest["review_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    return _report_service()._save_trash_manifest(manifest)
 
 
 def _load_trash_manifest(rid):
-    path = _trash_manifest_path(rid)
-    if not path.is_file():
-        return None
-    try:
-        data = _read_json(path)
-    except Exception:
-        return None
-    if not isinstance(data, dict) or data.get("review_id") != rid:
-        return None
-    files = data.get("files")
-    if not isinstance(files, list):
-        return None
-    return data
+    return _report_service()._load_trash_manifest(rid)
 
 
 def _trash_suffix_match(name, prefix, suffix):
-    """匹配 `prefix + 可选 .NNN` + suffix，兼容并发回收时的撞名后缀。"""
-    if not name.startswith(prefix) or not name.endswith(suffix):
-        return False
-    middle = name[len(prefix):len(name) - len(suffix)]
-    return not middle or (middle.startswith("-") and middle[1:].isdigit())
+    return _report_service()._trash_suffix_match(name, prefix, suffix)
 
 
 def _legacy_trash_items(rid, report=None, dedupe=True):
-    """旧版回收区没有 manifest：按既有命名规则反推原始位置。"""
-    if not TRASH.is_dir():
-        return []
-    snapshot_name = Path(_snapshot_ref(report)).name if _snapshot_ref(report) else ""
-    items = []
-    for src in sorted(TRASH.iterdir(), key=lambda p: p.name):
-        if not (src.is_file() or src.is_dir()):
-            continue
-        name = src.name
-        original = None
-        if _trash_suffix_match(name, rid, ".json"):
-            original = OUTPUTS / f"{rid}.json"
-        elif _trash_suffix_match(name, rid, ".md"):
-            original = OUTPUTS / f"{rid}.md"
-        elif _trash_suffix_match(name, f"v1_{rid}", ".json"):
-            original = OUTPUTS / "v1" / f"{rid}.json"
-        elif _trash_suffix_match(name, f"v1_{rid}", ".md"):
-            original = OUTPUTS / "v1" / f"{rid}.md"
-        elif src.is_dir() and _trash_suffix_match(name, f"{rid}_logs", ""):
-            original = LOG_DIR / rid
-        elif src.is_dir() and _trash_suffix_match(name, f"{rid}_v1logs", ""):
-            original = LOG_DIR / "v1" / rid
-        elif src.is_file() and name.startswith(f"state_{rid}") and name.endswith(".state.json"):
-            original = STATE_DIR / "runs" / name[len("state_"):]
-        elif src.is_file() and name.startswith("cache_llm_"):
-            original = LLM_CACHE_DIR / name[len("cache_llm_"):]
-        elif src.is_file() and name.startswith("cache_research_"):
-            original = STATE_DIR / "research_cache" / name[len("cache_research_"):]
-        elif snapshot_name and src.is_file() and _trash_suffix_match(
-                name, f"text_{snapshot_name}", ""):
-            original = STATE_DIR / "text" / snapshot_name
-        if original is not None:
-            items.append((src, original))
-    if not dedupe:
-        return items
-    # 旧回收区可能因重复删除留下带时间后缀的副本。恢复时每个原位置只能选
-    # 最新的一份，否则预检虽通过，搬移第二份时仍会撞上第一份。
-    newest = {}
-    for src, original in items:
-        try:
-            stamp = src.stat().st_mtime
-        except OSError:
-            stamp = 0
-        previous = newest.get(original)
-        if previous is None or stamp > previous[0]:
-            newest[original] = (stamp, src)
-    return [(src, original) for original, (_stamp, src) in sorted(
-        newest.items(), key=lambda item: str(item[0]))]
+    return _report_service()._legacy_trash_items(
+        rid, report=report, dedupe=dedupe)
 
 
 def _trash_items(rid, report=None, dedupe=True):
-    """返回 [(回收区路径, 原始路径)]；优先用 manifest，旧数据按命名规则回落。"""
-    manifest = _load_trash_manifest(rid)
-    if manifest:
-        items = []
-        for row in manifest.get("files", []):
-            if not isinstance(row, dict):
-                continue
-            rel = str(row.get("from") or "")
-            name = str(row.get("to") or "")
-            if not rel or not name or Path(name).name != name:
-                continue
-            original = ROOT / rel
-            # manifest 是本地文件，仍需防手工篡改后借恢复接口越界写盘。
-            if not _root_relative(original):
-                continue
-            src = TRASH / name
-            if src.exists():
-                items.append((src, original))
-        if items:
-            return items
-    return _legacy_trash_items(rid, report=report, dedupe=dedupe)
+    return _report_service()._trash_items(rid, report=report, dedupe=dedupe)
 
 
 def _move_derived(src, prefix, moved, label, manifest=None):
-    try:
-        dst = _trash_destination(f"{prefix}_{src.name}")
-        shutil.move(str(src), str(dst))
-        _record_trash_move(manifest, src, dst)
-        moved.append(f"{label}/{src.name}")
-    except OSError:
-        pass
+    return _report_service()._move_derived(
+        src, prefix, moved, label, manifest=manifest)
 
 
 def _purge_owned_cache(directory, owner, prefix, label, moved, manifest=None):
-    """移除缓存里的 owner；若还有别的 owner 就保留文件。"""
-    if not owner or not directory.is_dir():
-        return
-    for src in sorted(directory.glob("*.json")):
-        try:
-            data = json.loads(src.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        raw = data.get("_owners")
-        owners = [str(x) for x in raw] if isinstance(raw, list) else []
-        if owner not in owners:
-            continue
-        remaining = [x for x in owners if x != owner]
-        if remaining:
-            data["_owners"] = remaining
-            try:
-                tmp = src.with_name(f"{src.name}.{os.getpid()}.tmp")
-                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                               encoding="utf-8")
-                os.replace(tmp, src)
-            except OSError:
-                pass
-        else:
-            _move_derived(src, prefix, moved, label, manifest=manifest)
+    return _report_service()._purge_owned_cache(
+        directory, owner, prefix, label, moved, manifest=manifest)
 
 
 def _snapshot_ref(report):
-    if not isinstance(report, dict):
-        return ""
-    target = report.get("target")
-    if isinstance(target, dict) and target.get("snapshot_ref"):
-        return str(target["snapshot_ref"])
-    snap = report.get("target_snapshot")
-    if isinstance(snap, dict) and snap.get("ref"):
-        return str(snap["ref"])
-    return ""
+    return _report_service()._snapshot_ref(report)
 
 
 def _snapshot_file(ref):
-    if not ref:
-        return None
-    path = Path(ref)
-    if path.is_absolute():
-        return path if path.is_file() else None
-    candidate = ROOT / path
-    if candidate.is_file():
-        return candidate
-    candidate = STATE_DIR / "text" / path.name
-    return candidate if candidate.is_file() else None
+    return _report_service()._snapshot_file(ref)
 
 
 def _snapshot_referenced(ref, exclude_rid):
-    for base in (OUTPUTS, OUTPUTS / "v1"):
-        for path in base.glob("R-*.json"):
-            if path.stem == exclude_rid:
-                continue
-            try:
-                report = _read_json(path)
-            except Exception:
-                continue
-            if _snapshot_ref(report) == ref:
-                return True
-    return False
+    return _report_service()._snapshot_referenced(ref, exclude_rid)
 
 
 def _find_report(rid):
-    for path in (OUTPUTS / f"{rid}.json",
-                 OUTPUTS / "v1" / f"{rid}.json",
-                 TRASH / f"{rid}.json",
-                 TRASH / f"v1_{rid}.json"):
-        if path.is_file():
-            try:
-                return _read_json(path)
-            except Exception:
-                continue
-    return None
+    return _report_service()._find_report(rid)
 
 
 def _purge_derived(rid, report=None, manifest=None):
-    """删报告时，把它在别处的**原文副本/派生缓存**一起处理掉。
-
-    新报告会带两类归属信息：
-      * LLM/检索缓存的 `_owners` 里有 review_id；
-      * v1 报告的 `target.snapshot_ref` 指向 `state/text/<sha256>.txt`。
-
-    因此删除时可以做到：
-      * 独占缓存 → 移到回收站；
-      * 共享缓存 → 只摘掉当前 review_id，文件保留；
-      * 共享原文快照 → 其他报告仍引用就保留；
-      * `state/gap_log.jsonl` → 只移除该 review_id 的行。
-
-    旧报告没有归属键时，无法可靠反查的缓存不会被误删，继续由 retention
-    按年龄清理；返回的 `moved` 如实列出实际处理过的条目。
-    """
-    moved = []
-    for suffix in (".json", ".md"):
-        src = OUTPUTS / "v1" / f"{rid}{suffix}"
-        if src.exists():
-            dst = _trash_destination(f"v1_{src.name}")
-            shutil.move(str(src), str(dst))
-            _record_trash_move(manifest, src, dst)
-            moved.append(f"outputs/v1/{src.name}")
-    for src in sorted((STATE_DIR / "runs").glob(f"{rid}*.state.json")):
-        dst = _trash_destination(f"state_{src.name}")
-        shutil.move(str(src), str(dst))
-        _record_trash_move(manifest, src, dst)
-        moved.append(f"state/runs/{src.name}")
-    v1_logs = LOG_DIR / "v1" / rid
-    if v1_logs.is_dir():
-        dst = _trash_destination(f"{rid}_v1logs")
-        shutil.move(str(v1_logs), str(dst))
-        _record_trash_move(manifest, v1_logs, dst)
-        moved.append(f"logs/v1/{rid}/")
-
-    report = report if isinstance(report, dict) else _find_report(rid)
-    ref = _snapshot_ref(report)
-    if ref and not _snapshot_referenced(ref, rid):
-        snapshot = _snapshot_file(ref)
-        if snapshot:
-            _move_derived(snapshot, "text", moved, "state/text",
-                          manifest=manifest)
-
-    _purge_owned_cache(LLM_CACHE_DIR, rid, "cache_llm", "cache/llm", moved,
-                       manifest=manifest)
-    _purge_owned_cache(STATE_DIR / "research_cache", rid,
-                       "cache_research", "state/research_cache", moved,
-                       manifest=manifest)
-    try:
-        removed = fact_gap.purge_review(
-            rid, path=STATE_DIR / "gap_log.jsonl")
-    except OSError:
-        removed = 0
-    if removed:
-        moved.append(f"state/gap_log.jsonl（移除 {removed} 行）")
-    return moved
+    return _report_service()._purge_derived(
+        rid, report=report, manifest=manifest)
 
 
 def _mark_ledger_deleted(rid):
-    """给这份报告**追加**一条墓碑；链上原有行一个字节都不动。
-
-    旧实现是在台账里原位改一行（`op=delete`）再整文件 `os.replace` 写回：
-    语义对，机制有三个洞——不持写锁（撞上正在 append 的审查会静默吞掉新行，
-    而 `seq` 按行数推，吞一行就撞号）、临时名固定（并发删除互相覆盖）、
-    Windows 上 `os.replace` 还可能 PermissionError。现在改为追加独立墓碑行，
-    锁与 `review.py` 共用同一把（`review_agent.infrastructure.ledger`）。
-
-    两种形态都能被 `verify` 读：历史那批原位墓碑继续有效（`legacy_tombstone`）。
-    """
-    wrote = False
-    for chain in (LEDGER / "v1-chain.log", LEDGER / "chain.log"):
-        if not chain.exists():
-            continue
-        try:
-            records = ledger_store.read_records(chain)
-        except ledger_store.LedgerError as exc:
-            print(f"[ledger] 删除墓碑跳过：{exc}", flush=True)
-            continue
-        target = next(
-            (r.get("seq") for r in ledger_store.report_records(records)
-             if r.get("review_id") == rid and r.get("op") != "delete"),
-            None,
-        )
-        if target is None:
-            continue
-        try:
-            ledger_store.tombstone(chain, int(target), actor="web",
-                                   reason=f"删除报告 {rid}")
-            wrote = True
-        except ledger_store.LedgerError as exc:
-            # 重复删除、链异常都不该把 DELETE 变成 500：文件已经移进回收站了，
-            # 这里如实记一行日志并向调用方返回 False（前端会显示"墓碑未写入"）。
-            print(f"[ledger] 删除墓碑失败：{exc}", flush=True)
-    return wrote
+    return _report_service()._mark_ledger_deleted(rid)
 
 
 def _mark_ledger_restored(rid):
-    """给恢复的报告追加一条 restore 事件，不改已有删除墓碑与哈希链。"""
-    wrote = False
-    for chain in (LEDGER / "v1-chain.log", LEDGER / "chain.log"):
-        if not chain.exists():
-            continue
-        try:
-            records = ledger_store.read_records(chain)
-        except ledger_store.LedgerError as exc:
-            print(f"[ledger] 恢复事件跳过：{exc}", flush=True)
-            continue
-        target = next(
-            (r.get("seq") for r in ledger_store.report_records(records)
-             if r.get("review_id") == rid),
-            None,
-        )
-        if target is None:
-            continue
-        try:
-            ledger_store.restore(chain, int(target), actor="web",
-                                 reason=f"从回收站恢复 {rid}")
-            wrote = True
-        except ledger_store.LedgerError as exc:
-            # 旧报告可能只有原位墓碑；若它已被后续事件恢复，这里重复恢复只会
-            # 返回“当前不在删除状态”。文件恢复仍应成功，事件结果如实返回 False。
-            print(f"[ledger] 恢复事件失败：{exc}", flush=True)
-    return wrote
-
+    return _report_service()._mark_ledger_restored(rid)
 
 RESULT_MARKER = "REVIEW_RESULT "
 

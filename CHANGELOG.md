@@ -42,6 +42,22 @@
 
 ---
 
+# 2026-11-04
+
+### 2026-11-04 · 修改 · 第二阶段 2.3：报告管理抽到 ReportService
+
+- **文件**：新增 `interfaces/web/reports.py`（754 行，`ReportService`）；`server.py`（Handler 报告方法与会模块级 helpers 改为薄委托/兼容包装，3,615 → 2,975 行）；`docs/第二阶段整改任务单.md`（2.3 状态与验收）
+- **改了什么**：收藏、列表/详情、删除、批量删除、回收站、恢复、彻底删除、清空回收站，以及回收站清单、快照引用、派生文件清理，全部收进 `ReportService`；路径、收藏读写、`purge_gap` 注入，service 不 import server。`server.Handler` 的 `_favorites/_reports/_delete_report/_delete_reports/_trash_reports/_restore_report/_purge_trash_report/_empty_trash/_report` 只做委托，模块级 `_trash_destination/_trash_items/_snapshot_ref/_find_report/...` 保留兼容包装；HTTP 路径与请求/响应字段未变。
+- **为什么**：第二阶段 2.3「server 报告管理拆分」——回收站/删除/恢复是 `server.py` 中最长的一段业务逻辑，且与任务执行无关；先抽这一刀，让路由层只处理参数与响应，同时保留删除链路的高风险回滚入口。
+- **验证**：`checks/test_server_recycle_bin` 9 项 OK；`tests/test_api_contract.ReportsLogsIntegrityTests` + `ReportManagementTests` 16 项 OK（54.971s，覆盖列表/详情/删除/批量/收藏/恢复/彻底删除/清空/链完整）；`checks` 全量 **833 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1，335.529s）**；`py_compile server.py interfaces/web/reports.py` 与 `import server` 均通过。`Handler._delete_report` 的 docstring 保留 `need_confirm` 契约说明：静态契约测试读 `server.py`，实际拦截在 `ReportService`。
+
+### 2026-11-04 · 修改 · 第二阶段 2.2：报告落盘抽到 ReportStore
+
+- **文件**：新增 `review_agent/infrastructure/report_store.py`（`ReportStore`）、`checks/test_report_store.py`（3 项契约用例）；`review.py`（`_report_store` + 兼容包装，`_write_shadow_report` 落盘段委托，+23/−78 行）；`docs/第二阶段整改任务单.md`（2.2 状态与验收口径）
+- **改了什么**：原文快照、`(run_id)` 幂等判断、台账锁内取 `prev_hash`/算 `report_hash`/追加、JSON/Markdown 写入收进 `ReportStore`；路径与 `compute_hash`/锁/时钟注入，避免落盘层反向依赖 `review` 全局。报告组装（`build_shadow_report`/`_attach_action_plan`/法条/限制）仍在 `review.py`，`_write_shadow_report` 签名与返回路径不变。
+- **为什么**：第二阶段 2.2「报告持久化抽离」——交付核心的落盘/台账逻辑此前与 5,000 行入口混在一起，改一处要读整段主流程；抽成单实现后，报告 schema 仍只有一处来源。
+- **验证**：`checks/test_report_store` 3 项 OK；`checks` 全量 **833 项 OK（skipped=11）**；`tests` 全量 **686 项 OK（skipped=1）**；`checks/test_idempotency` 同 run 不重写、不同 run 链追加且 `integrity.verify_ledger` 通过；`tools/integrity.py verify ledger/v1-chain.log` → `OK（290 条记录，链完整）`。
+
 # 2026-11-03
 
 ### 2026-11-03 · 修改 · 第二阶段 2.1b：CLI 参数解析拆到 parser.py

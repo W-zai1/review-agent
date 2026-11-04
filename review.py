@@ -120,6 +120,7 @@ from review_agent.runtime import (
 # 旧实现把「读末行 → 算 hash → 追加」散在 review.py 与 server.py 各写一遍，
 # 结果两边的 seq 口径不同（一个按行数、一个按记录数），删过报告之后必然对不上。
 from review_agent.infrastructure import ledger as ledger_store
+from review_agent.infrastructure.report_store import ReportStore
 from review_agent.runtime.nodes import (
     ClaimVerdict,
     CrossReviewerNode,
@@ -4880,63 +4881,29 @@ def _attach_action_plan(report):
     return report
 
 
-def _report_already_written(json_path, run_id):
-    """幂等键 `(run_id, stage=finalize)`：同一次运行只写一份报告、只进一次链。
+def _report_store():
+    """按当前模块级路径构造落盘器。
 
-    为什么按 `run_id` 而不是按内容：同一次执行的结论是确定的（节点必须确定性），
-    所以「这个 run_id 已经写过报告」就足以判定重复。按内容比对反而危险——
-    内容里含 audit / logs_hash 这类每次都会变的东西，永远比不相等。
-
-    读不出来的坏文件不算「已经写过」：宁可重写一份，也不拿坏文件当既成事实。
+    测试会把 `OUTPUTS/STATE/LEDGER/ROOT` 重定向到临时目录，所以每次都按
+    当前值构造，不做模块级缓存——缓存会把测试写进真实交付目录。
     """
-    if not run_id or not json_path.exists():
-        return False
-    try:
-        existing = json.loads(json_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return existing.get("run_id") == run_id
+    return ReportStore(
+        outputs=OUTPUTS, ledger=LEDGER, state=STATE, root=ROOT,
+        compute_hash=integrity.compute_report_hash,
+        acquire_lock=_acquire_ledger_lock,
+        release_lock=_release_ledger_lock,
+        now_iso=now_iso,
+    )
+
+
+def _report_already_written(json_path, run_id):
+    """兼容包装：幂等判断已收进 `ReportStore.already_written`。"""
+    return _report_store().already_written(json_path, run_id)
 
 
 def _write_target_snapshot(state):
-    """把被审原文按内容哈希存成快照：`state/text/<sha256>.txt`。
-
-    为什么报告里要指一个文件而不是只嵌原文：报告嵌的是**解码后的文本**，
-    读者能读到它，但没法证明「这段字就是当初那份文件里的」；快照文件名就是
-    文本的 sha256，改一个字文件名就对不上。
-
-    为什么按内容寻址（文件名 = 哈希）而不是按 review_id：
-        同一份材料常被审很多次（生产台账里单个目标最多审过 15 次），
-        按运行存会把同一段原文复制十几份。
-
-    幂等：文件已存在就不重写（内容相同，重写只会刷 mtime，
-    让 retention 的「目录年龄取内部最新文件」永远判它不过期）。
-
-    返回 `{"ref": 相对仓库根的路径, "hash": sha256}`；没有原文时返回 None。
-    """
-    text = state.artifacts.get("target_text")
-    if not isinstance(text, str) or not text:
-        return None
-    payload = text.encode("utf-8")
-    digest = hashlib.sha256(payload).hexdigest()
-    path = STATE / "text" / f"{digest}.txt"
-    try:
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # 先写唯一临时名再原子替换：并发两个进程写同一份快照时，
-            # 固定临时名会互相覆盖（批次 1 的 FileTaskStore 踩过同一个坑）。
-            tmp = path.with_name(f"{digest}.{os.getpid()}.tmp")
-            tmp.write_bytes(payload)
-            os.replace(tmp, path)
-    except OSError as exc:                              # pragma: no cover - 落盘失败不阻断
-        print(f"[v1] 原文快照写入失败：{exc}", flush=True)
-        return None
-    try:
-        ref = path.resolve().relative_to(ROOT).as_posix()
-    except ValueError:
-        # 测试把 STATE 重定向到临时目录：照实给绝对路径，不假装它在仓库里
-        ref = path.resolve().as_posix()
-    return {"ref": ref, "hash": digest}
+    """兼容包装：快照落盘已收进 `ReportStore.write_target_snapshot`。"""
+    return _report_store().write_target_snapshot(state.artifacts.get("target_text"))
 
 
 def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
@@ -4955,10 +4922,11 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
     不重写报告、不重写日志、不往链上追加第二条记录。否则「恢复后重跑一次」
     会在审计链里留下两条同一份结论的记录，链就没法用来证明「跑了几次」。
     """
+    store = _report_store()
     out_dir = OUTPUTS if official else OUTPUTS / "v1"
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{state.review_id}.json"
-    if _report_already_written(json_path, state.run_id):
+    if store.already_written(json_path, state.run_id):
         return json_path
 
     logs_hash = (_write_v1_logs(session, outcome, state.review_id,
@@ -4970,7 +4938,7 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
     # session 为 None（测试里直接造 state）时给 None，报告里照实自报"未接入"。
     law_lib = law_library_block(session)[0] if session is not None else None
     # 原文快照必须先写：报告里的 snapshot_ref 指向它，写不进去就照实给 None
-    snapshot = _write_target_snapshot(state)
+    snapshot = store.write_target_snapshot(state.artifacts.get("target_text"))
     report = build_shadow_report(
         state,
         target_meta=state.artifacts.get("target_meta"),
@@ -5041,31 +5009,8 @@ def _write_shadow_report(state, outcome, *, integrity_inputs=None, session=None,
         except (ValueError, OSError):
             pass
     _attach_action_plan(report)      # 必须早于 report_hash：哈希要覆盖整改建议
-    ledger_path = LEDGER / ("chain.log" if official else "v1-chain.log")
-    lock = _acquire_ledger_lock()
-    try:
-        prev, seq_no = ledger_store.chain_state(ledger_path)
-        report["integrity"]["prev_report_hash"] = prev
-        report["integrity"]["report_hash"] = integrity.compute_report_hash(report)
-        ledger_store.append(ledger_path, {
-            "seq": seq_no,
-            "review_id": report["review_id"],
-            "engine": report["engine"],
-            "target_hash": report["integrity"]["target_hash"],
-            "report_hash": report["integrity"]["report_hash"],
-            "prev_hash": prev,
-            "rules_dir_hash": report["integrity"]["rules_dir_hash"],
-            "rules_version": report["integrity"]["rules_version"],
-            "ts": now_iso(),
-        }, locked=True, expect_prev=prev)
-    finally:
-        _release_ledger_lock(lock)
-
-    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
-                         encoding="utf-8")
-    (out_dir / f"{report['review_id']}.md").write_text(
-        render_shadow_md(report), encoding="utf-8")
-    return json_path
+    return store.write_report(
+        report, official=official, render_markdown=render_shadow_md)
 
 
 # ---------------------------------------------------------------------------
