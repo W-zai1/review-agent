@@ -44,6 +44,27 @@
 
 # 2026-11-05
 
+### 2026-11-05 · 修改 · 第二阶段 2.9：server 异步启动适配层
+
+- **文件**：新增 `interfaces/web/review_start.py`（146 行）；修改 `server.py`（2,798 → 2,713 行）、`docs/第二阶段整改任务单.md`（2.9）
+- **改了什么**：把 `Handler._start_review` 的“请求归一后的幂等命中、并发闸门、清理旧 JOBS、生成 job_id/进度文件、调用 `TaskService.start_async_with`、补 JOBS 视图”抽到 `ReviewStarter.start()`；`server.py` 只保留薄包装与 `_review_starter()` 工厂。`ReviewStarter` 的 TASKS/JOBS/锁/路径/TaskService/解析器/Runner 工厂/job 视图全部注入，不 import server；执行仍走 `_SubprocessRunner` 子进程。
+- **为什么**：2.7 已统一同步/异步的参数归一，但异步启动仍在 Handler 里做幂等与并发闸门，`server.py` 继续承担领域判断。抽出后启动判定有单一实现，且测试可直接覆盖；没有动任务记录格式、TaskService、`_run_review_job` 或子进程隔离。
+- **验证**：`checks.test_server_tasks + checks.test_subprocess_runner` **22 项 OK**；全量 `checks` **854 项 OK（skipped=11，25.692s）**；全量 `tests` **686 项 OK（skipped=1，501.766s）**；`py_compile`、`git diff --check` 通过。
+
+### 2026-11-05 · 修改 · 第二阶段 2.8：server 任务状态/取消抽离
+
+- **文件**：新增 `interfaces/web/task_lifecycle.py`（150 行）、`checks/test_web_task_lifecycle.py`（84 行，3 项）；修改 `server.py`（2,902 → 2,798 行）、`docs/第二阶段整改任务单.md`（2.8）
+- **改了什么**：把 `_job_view` 的记录→前端映射、`TaskLifecycle.status()`（读 task 记录/`.jobs` 进度/`outputs` 或 `outputs/v1` 报告）与 `TaskLifecycle.cancel()`（PROCS terminate + `TaskService.cancel` + JOBS 视图刷新）抽到 `interfaces/web/task_lifecycle.py`；`server.py` 的 `_review_status` / `_cancel_review` / `_job_view` 改成薄包装，并新增 `_task_lifecycle()` 按当前 `JOBS/TASKS/PROCS/OUTPUTS/...` 注入构造。任务记录仍是唯一事实源，`JOBS` 仍只是视图；取消仍是「先停进程、再走 TaskService」，没有砍掉子进程隔离。端点、响应字段、`_SubprocessRunner`、`_run_review_job` 未改。
+- **为什么**：Handler 同时承担路由和状态/取消语义，状态查询/取消各写一遍；把 HTTP 适配层收口后，`server.py` 更薄，且状态/取消的“记录优先”“v1 报告回退”“幂等取消”有独立契约测试。没有动任务记录格式、TaskService 状态机或审查执行链。
+- **验证**：`checks.test_web_task_lifecycle + test_server_tasks + test_subprocess_runner` **25 项 OK**；全量 `checks` **854 项 OK（skipped=11，27.691s）**、`tests` **686 项 OK（skipped=1，471.425s）**；`py_compile`、`git diff --check` 通过。
+
+### 2026-11-05 · 修改 · 第二阶段 2.7：server 审查请求组装收敛
+
+- **文件**：新增 `interfaces/web/review_requests.py`（133 行）、`checks/test_review_requests.py`（101 行，6 项）；修改 `server.py`（2,958 → 2,902 行）、`docs/第二阶段整改任务单.md`（2.7）
+- **改了什么**：新增 `ReviewRequest` 数据类与 `resolve_target()` / `assemble_request()` / `build_runner_spec()`，把同步 `/api/review` 与异步 `/api/review/start` 重复的目标解析、llm/research/type 归一、agent/scenario/format 校验、目的组装、幂等键计算收成一份。`assemble_request(normalize_flags=False)` 只用于同步接口，保留其历史上不把非布尔 llm/research 改成 None 的行为；异步仍按原逻辑归一。`server.py` 的 `_start_review` / `_run_review` 改为调用共享模块，`_SubprocessRunner` 的 spec 由 `build_runner_spec()` 生成；端点、响应字段、校验顺序与错误文案未改。
+- **为什么**：两套入口各写一遍参数归一，任何一处漂移都会让同一个请求走同步/异步得到不同任务身份；`TaskService` 已统一任务生命周期，剩下最值得收口的是这组纯请求组装逻辑。没有动 `TaskService`、`JOBS`、子进程隔离与 `_run_review_job`。
+- **验证**：新增 `checks/test_review_requests.py` 6 项；定向 `test_review_requests + test_server_tasks + test_subprocess_runner` **28 项 OK**；全量 `checks` **851 项 OK（skipped=11，22.934s）**、`tests` **686 项 OK（skipped=1，431.748s）**；`py_compile`、`git diff --check` 通过；`secret_scan` 240 文件/0 命中。
+
 ### 2026-11-05 · 修改 · 第二阶段 2.6：V1 报告层抽到 V1Reporter
 
 - **文件**：新增 `review_agent/application/v1_reporting.py`（271 行，`V1Reporter`）；修改 `review.py`（5,171 → 4,992 行，非空 4,726 → 4,553）、`review_agent/application/__init__.py`（导出 `V1Reporter`）、`docs/第二阶段整改任务单.md`（2.6 状态与验收）

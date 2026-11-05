@@ -62,6 +62,7 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 # server 与 review.py 共用它：两边各写一份的下场是「一个按行数推号、一个按记录数推号」，
 # 删过报告之后新记录的 seq 就会撞号。
 from review_agent.infrastructure import ledger as ledger_store
+from interfaces.web import review_requests, review_start, task_lifecycle
 from interfaces.web.reports import ReportService
 # 任务记录是「这条审查到底跑完没有」的唯一真相：JOBS 只是给前端看的内存视图。
 from review_agent.application import (
@@ -1528,48 +1529,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _review_status(self, job_id):
-        if not job_id:
-            return {"ok": False, "error": "缺少 job 参数"}
-        with JOBS_LOCK:
-            job = dict(JOBS.get(job_id) or {})
-        if not job:
-            return {"ok": False, "error": "任务不存在或已过期"}
-        # 任务记录是唯一事实来源：JOBS 可能来自 .jobs/*.jsonl（重启恢复），
-        # 与 state/tasks 可能不一致；状态/错误/报告一律以记录为准。
-        review_id = str(job.get("review_id") or "")
-        if review_id:
-            try:
-                record = TASKS.get(review_id)
-            except (OSError, ValueError, KeyError, TypeError):
-                record = None
-            if record is not None:
-                job = _job_view(record, job)
-        steps = []
-        progress = JOBS_DIR / f"{job_id}.jsonl"
-        if progress.exists():
-            try:
-                for line in progress.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        steps.append(json.loads(line))
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        report = None
-        if job.get("status") == "done" and job.get("report_id"):
-            rid = job["report_id"]
-            path = OUTPUTS / f"{rid}.json"
-            if not path.exists():
-                path = OUTPUTS / "v1" / f"{rid}.json"
-            if path.exists():
-                try:
-                    report = _read_json(path)
-                except Exception:
-                    report = None
-        return {"ok": True, "job": job, "steps": steps, "report": report}
+        return _task_lifecycle().status(job_id)
 
     ANNOTATION_TOKEN_ENV = "REVIEW_AGENT_ANNOTATION_TOKEN"
 
@@ -1629,198 +1589,10 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, **r}
 
     def _start_review(self, data):
-        file = str((data or {}).get("file") or "").strip()
-        target, error = _resolve_target(file)
-        if error:
-            return {"ok": False, "error": error}
-        llm_opt = (data or {}).get("llm")
-        if llm_opt not in (True, False, None):
-            llm_opt = None
-        research_opt = (data or {}).get("research")
-        if research_opt not in (True, False, None):
-            research_opt = None
-        type_opt = (data or {}).get("type")
-        if type_opt not in TARGET_TYPES:
-            type_opt = None
-        agent_opt, agent_err = _resolve_agent((data or {}).get("agent"))
-        if agent_err:
-            return {"ok": False, "error": agent_err}
-        scenario_opt, scenario_err = _resolve_scenario((data or {}).get("scenario"))
-        if scenario_err:
-            return {"ok": False, "error": scenario_err}
-        spec_opt, spec_err = _resolve_format_spec((data or {}).get("format_spec"))
-        if spec_err:
-            return {"ok": False, "error": spec_err}
-        # 本次手填的格式要求（分项表单）。给了它就以它为准，spec_opt 只当来源记录。
-        custom_opt, custom_err = _resolve_format_custom((data or {}).get("format_custom"))
-        if custom_err:
-            return {"ok": False, "error": custom_err}
-        # 目的组装（手写 + 上传的目的文件）在启动前完成：id 非法/超量要直接报错，
-        # 不能等任务跑起来才失败。组装后的文本经 --purpose 传给子进程，
-        # --purpose-max 告知解析上限（文件类目的可超过 300 字）。
-        typed_purpose = _clean_purpose((data or {}).get("purpose"))
-        purpose_text, purpose_err, purpose_quality = _assemble_purpose(
-            typed_purpose, (data or {}).get("purpose_files"))
-        if purpose_err:
-            return {"ok": False, "error": purpose_err}
-        purpose_max = len(purpose_text) if purpose_text else None
-        # 「同一份材料 + 同一套参数」的指纹：重复提交不该建出第二个任务，
-        # 也不该在台账里多一条同结论记录（实测生产台账里 286 条只对应 77 个目标）。
-        # 自定义格式要求必须进指纹：同一份文件、同样的其他选项，
-        # 只改了「行距 2 倍 → 固定 22 磅」也是一次新的审查。
-        # 不进指纹的后果是幂等命中旧任务，用户以为按新要求判的，其实拿到的是旧结论。
-        spec_key = (spec_opt if not custom_opt
-                    else "custom:" + json.dumps(custom_opt.get("check") or {},
-                                                ensure_ascii=False, sort_keys=True))
-        key = _idempotency_key(file=file, llm=llm_opt, research=research_opt,
-                               type_=type_opt, agent=agent_opt,
-                               scenario=scenario_opt, spec=spec_key,
-                               purpose_text=purpose_text)
-        with JOBS_LOCK:
-            now = time.time()
-            # 1) 幂等命中：同一个键的未结束任务直接复用（返回同一个 job_id）
-            existing = find_active(TASKS, key)
-            if existing is not None:
-                for old_id, old in list(JOBS.items()):
-                    if old.get("review_id") == existing.review_id:
-                        JOBS[old_id] = _job_view(existing, old)
-                        print(f"[review] 幂等命中：沿用任务 {existing.review_id}"
-                              f"（job {old_id}）", flush=True)
-                        return {"ok": True, "job_id": old_id, "deduped": True,
-                                "review_id": existing.review_id,
-                                "status": JOBS[old_id]["status"]}
-            # 2) 并发闸门：看**任务记录**，不看内存里的 running。后者在重启后是空的，
-            #    而且同步接口根本不占位（等于没闸门）。
-            busy = active_tasks(TASKS, stale_after=TASK_STALE_AFTER)
-            if busy:
-                return {"ok": False, "error": "已有审查任务进行中，请稍候",
-                        "review_id": busy[0].review_id}
-            # 3) 清掉一小时前结束的内存任务（只清视图与进度文件，不动任务记录）
-            for old_id, old in list(JOBS.items()):
-                if old.get("finished") and now - old["finished"] > 3600:
-                    JOBS.pop(old_id, None)
-                    try:
-                        (JOBS_DIR / f"{old_id}.jsonl").unlink()
-                    except OSError:
-                        pass
-            job_id = uuid.uuid4().hex[:12]
-            progress = JOBS_DIR / f"{job_id}.jsonl"
-            try:
-                progress.unlink()
-            except OSError:
-                pass
-            # 任务身份 / 状态 / 幂等 / 超时全部交给 TaskService；
-            # server 只把「这一次怎么跑」封成 Runner（内部仍是 review.py 子进程）。
-            runner = _SubprocessRunner({
-                "job_id": job_id,
-                "file": file,
-                "progress": progress,
-                "llm_opt": llm_opt,
-                "research_opt": research_opt,
-                "type_opt": type_opt,
-                "agent_opt": agent_opt,
-                "purpose": purpose_text or None,
-                "purpose_max": purpose_max,
-                "purpose_quality": purpose_quality,
-                "scenario_opt": scenario_opt,
-                "spec_opt": spec_opt,
-                "custom_opt": custom_opt,
-            })
-            try:
-                record = _task_service().start_async_with(
-                    runner, target, profile_id=agent_opt,
-                    purpose=(purpose_text or None), engine="v1",
-                    use_llm=llm_opt is True, timeout=REVIEW_TIMEOUT,
-                    idempotency_key=key)
-            except NotFoundError as exc:
-                return {"ok": False, "error": str(exc)}
-            except OSError as exc:
-                return {"ok": False, "error": f"无法写入任务记录：{exc}"}
-            review_id = record.review_id
-            if record.status != RunStatus.QUEUED.value:
-                # 幂等竞态：前置 find_active 之后、_open 之前，另一个请求先建了同一任务。
-                existing = next((jid for jid, job in JOBS.items()
-                                 if job.get("review_id") == review_id), None)
-                return {"ok": True, "job_id": existing or job_id, "deduped": True,
-                        "review_id": review_id, "status": record.status}
-            # 只补视图；runner 可能已经先写过（setdefault 不覆盖它的进度）。
-            JOBS.setdefault(job_id, {
-                "id": job_id,
-                "review_id": review_id,
-                "file": file,
-                "status": "running",
-                "task_status": RunStatus.QUEUED.value,
-                "created": now,
-                "finished": None,
-                "report_id": None,
-                "error": None,
-                "llm": llm_opt,
-                "research": research_opt,
-                "type": type_opt,
-                "agent": agent_opt,
-                "scenario": scenario_opt,
-                "format_spec": spec_opt,
-                # 本次任务实际使用的超时：/api/review/status 可见，排查
-                # 「为什么跑了很久才失败 / 为什么 300s 就断了」时有据可查。
-                "timeout": REVIEW_TIMEOUT,
-            })
-        print(f"[review] 任务 {job_id}（{review_id}）已创建：{file}"
-              f"（超时 {REVIEW_TIMEOUT}s）", flush=True)
-        return {"ok": True, "job_id": job_id, "review_id": review_id}
+        return _review_starter().start(data)
 
     def _cancel_review(self, data):
-        """取消正在跑（或排队）的审查。
-
-        为什么现在能做到：执行进程登记在 `PROCS` 里，取消就是 `terminate` 它——
-        旧实现只在内存里把状态改成 error，进程还在后台写完报告，用户看到
-        「已取消」却在 `outputs/` 里多出一份报告。
-
-        状态以任务记录为准：`terms` 之后子进程退出码非零，但 `TaskService`
-        先落 CANCELLED、执行器回来时不会覆盖成 error。
-        """
-        d = data or {}
-        job_id = str(d.get("job") or "").strip()
-        review_id = str(d.get("review_id") or "").strip()
-        if not review_id and job_id:
-            with JOBS_LOCK:
-                review_id = str((JOBS.get(job_id) or {}).get("review_id") or "")
-        if not review_id:
-            return {"ok": False, "error": "找不到任务：请给 job 或 review_id"}
-        record = TASKS.get(review_id)
-        if record is None:
-            return {"ok": False, "error": f"找不到任务：{review_id}"}
-        status = RunStatus(record.status)
-        if status is RunStatus.CANCELLED:
-            cancelled = record                      # 幂等：连点两下不该报错
-        elif status.is_terminal:
-            return {"ok": False,
-                    "error": f"任务已是终态（{status.value}），不能取消"}
-        else:
-            # 先真的停进程：恢复出来的旧任务没有本进程令牌，只能靠 PROCS 兜底；
-            # 本进程发起的任务还会被 runner 的令牌监视器再确认一次。
-            with PROCS_LOCK:
-                proc = PROCS.get(review_id)
-            if proc is not None:
-                try:
-                    proc.terminate()
-                except OSError as exc:
-                    print(f"[review] 取消时终止子进程失败：{exc}", flush=True)
-            try:
-                cancelled = _task_service().cancel(review_id, reason="用户取消")
-            except InvalidTransition as exc:
-                return {"ok": False, "error": str(exc)}
-            except NotFoundError as exc:
-                return {"ok": False, "error": str(exc)}
-        with JOBS_LOCK:
-            for jid, job in JOBS.items():
-                if job.get("review_id") != review_id:
-                    continue
-                job.update(_job_view(cancelled, job))
-                job.update({"status": "cancelled",
-                            "finished": job.get("finished") or time.time()})
-        print(f"[review] 任务 {review_id} 已取消（{cancelled.status}）", flush=True)
-        return {"ok": True, "review_id": review_id,
-                "status": cancelled.status, "job": job_id or None}
+        return _task_lifecycle().cancel(data)
 
     def _integrity(self):
         chains = [p for p in (LEDGER / "chain.log", LEDGER / "v1-chain.log")
@@ -2139,8 +1911,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": str(e)}
 
     def _run_review(self, data):
-        file = str((data or {}).get("file") or "").strip()
-        target, error = _resolve_target(file)
+        file, target, error = review_requests.resolve_target(data, _resolve_target)
         if error:
             return {"ok": False, "error": error}
         # 同步接口也要占并发闸门：旧实现只查内存 JOBS 里的 running，而同步调用根本不写 JOBS，
@@ -2149,29 +1920,21 @@ class Handler(BaseHTTPRequestHandler):
         if busy:
             return {"ok": False, "error": "已有审查任务进行中，请稍候",
                     "review_id": busy[0].review_id}
-        llm_opt = (data or {}).get("llm")
-        research_opt = (data or {}).get("research")
-        type_opt = (data or {}).get("type")
-        if type_opt not in TARGET_TYPES:
-            type_opt = None
-        agent_opt, agent_err = _resolve_agent((data or {}).get("agent"))
-        if agent_err:
-            return {"ok": False, "error": agent_err}
-        scenario_opt, scenario_err = _resolve_scenario((data or {}).get("scenario"))
-        if scenario_err:
-            return {"ok": False, "error": scenario_err}
-        spec_opt, spec_err = _resolve_format_spec((data or {}).get("format_spec"))
-        if spec_err:
-            return {"ok": False, "error": spec_err}
-        # 本次手填的格式要求（分项表单）。给了它就以它为准，spec_opt 只当来源记录。
-        custom_opt, custom_err = _resolve_format_custom((data or {}).get("format_custom"))
-        if custom_err:
-            return {"ok": False, "error": custom_err}
-        typed_purpose = _clean_purpose((data or {}).get("purpose"))
-        purpose_text, purpose_err, purpose_quality = _assemble_purpose(
-            typed_purpose, (data or {}).get("purpose_files"))
-        if purpose_err:
-            return {"ok": False, "error": purpose_err}
+        request, error = review_requests.assemble_request(
+            data, file=file, target=target, target_types=TARGET_TYPES,
+            resolve_agent=_resolve_agent,
+            resolve_scenario=_resolve_scenario,
+            resolve_format_spec=_resolve_format_spec,
+            resolve_format_custom=_resolve_format_custom,
+            clean_purpose=_clean_purpose,
+            assemble_purpose=_assemble_purpose,
+            idempotency_key=_idempotency_key,
+            normalize_flags=False)
+        if error:
+            return {"ok": False, "error": error}
+        llm_opt = request.llm
+        agent_opt = request.agent
+        purpose_text = request.purpose_text
         # 与异步接口同一条链：TaskService 建任务 / 落状态 / 超时；
         # server 只把「这一次怎么跑」封成 Runner（内部仍是 review.py 子进程）。
         job_id = "sync-" + uuid.uuid4().hex[:8]
@@ -2180,21 +1943,8 @@ class Handler(BaseHTTPRequestHandler):
             progress.unlink()
         except OSError:
             pass
-        runner = _SubprocessRunner({
-            "job_id": job_id,
-            "file": file,
-            "progress": progress,
-            "llm_opt": llm_opt,
-            "research_opt": research_opt,
-            "type_opt": type_opt,
-            "agent_opt": agent_opt,
-            "purpose": purpose_text or None,
-            "purpose_max": len(purpose_text) if purpose_text else None,
-            "purpose_quality": purpose_quality,
-            "scenario_opt": scenario_opt,
-            "spec_opt": spec_opt,
-            "custom_opt": custom_opt,
-        })
+        runner = _SubprocessRunner(review_requests.build_runner_spec(
+            request, job_id=job_id, progress=progress))
         t0 = time.time()
         try:
             record = _task_service().start_review_with(
@@ -2420,33 +2170,8 @@ def _idempotency_key(*, file, llm, research, type_, agent, scenario, spec,
 
 
 def _job_view(record: TaskRecord, job: dict | None = None) -> dict:
-    """把任务记录折成前端认识的 job 形状（`running/done/error` 三态之外加 `cancelled`）。
-
-    前端只读 `status` 的三态；这里多做一步映射而不是改前端：`queued` 视为 running，
-    `cancelled/aborted` 视为 error 但带 `cancelled=True`——老前端不会因此白屏。
-    """
-    status = RunStatus(record.status)
-    if status in (RunStatus.COMPLETED,):
-        shown = "done"
-    elif status in (RunStatus.CANCELLED, RunStatus.ABORTED):
-        shown = "cancelled"
-    elif status in (RunStatus.FAILED,):
-        shown = "error"
-    else:
-        shown = "running"
-    view = dict(job or {})
-    view.update({
-        "id": view.get("id"),
-        "review_id": record.review_id,
-        "status": shown,
-        "task_status": status.value,
-        "error": record.error,
-        "report_id": record.report_path and Path(record.report_path).stem
-                     or view.get("report_id"),
-        "finished": view.get("finished") or (
-            time.time() if status.is_terminal else None),
-    })
-    return view
+    """把任务记录折成前端认识的 job 形状（兼容入口）。"""
+    return task_lifecycle.job_view(record, job)
 
 
 def _resolve_agent(raw):
@@ -2675,6 +2400,36 @@ def _task_service() -> TaskService:
             )
             _TASK_SERVICE_KEY = key
         return _TASK_SERVICE
+
+
+def _task_lifecycle() -> task_lifecycle.TaskLifecycle:
+    """按当前全局构造任务状态/取消适配层。
+
+    每次调用重新取 `JOBS/TASKS/PROCS`，测试替换这些全局后仍生效；
+    构造本身无副作用，真正的状态仍在 task 记录里。
+    """
+    return task_lifecycle.TaskLifecycle(
+        jobs=JOBS, jobs_lock=JOBS_LOCK, tasks=TASKS, jobs_dir=JOBS_DIR,
+        outputs=OUTPUTS, procs=PROCS, procs_lock=PROCS_LOCK,
+        task_service=_task_service(), read_json=_read_json,
+    )
+
+
+def _review_starter() -> review_start.ReviewStarter:
+    """按当前全局构造异步启动适配层，测试替换 JOBS/TASKS 后仍生效。"""
+    return review_start.ReviewStarter(
+        jobs=JOBS, jobs_lock=JOBS_LOCK, tasks=TASKS, jobs_dir=JOBS_DIR,
+        task_service=_task_service(), task_stale_after=TASK_STALE_AFTER,
+        review_timeout=REVIEW_TIMEOUT, target_types=TARGET_TYPES,
+        resolve_target=_resolve_target, resolve_agent=_resolve_agent,
+        resolve_scenario=_resolve_scenario,
+        resolve_format_spec=_resolve_format_spec,
+        resolve_format_custom=_resolve_format_custom,
+        clean_purpose=_clean_purpose, assemble_purpose=_assemble_purpose,
+        idempotency_key=_idempotency_key,
+        build_runner=lambda spec: _SubprocessRunner(spec),
+        job_view=_job_view,
+    )
 
 
 class _SubprocessRunner:
