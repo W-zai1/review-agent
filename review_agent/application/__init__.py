@@ -25,6 +25,7 @@ from .shadow_report import (
     build_shadow_report,
     render_shadow_md,
 )
+from .v1_reporting import V1Reporter
 from .tasks import (
     TASK_SCHEMA,
     FileTaskStore,
@@ -47,6 +48,7 @@ __all__ = [
     # 影子报告
     "ENGINE", "LOGS_HASH_LIMITATION", "SCHEMA_VERSION", "UNSUPPORTED_BLOCKS",
     "build_shadow_report", "render_shadow_md",
+    "V1Reporter",
     "build_graph",
     # 任务
     "TASK_SCHEMA", "FileTaskStore", "RecoveryReport", "Runner", "TaskOutcome",

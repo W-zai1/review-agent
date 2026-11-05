@@ -73,6 +73,7 @@ from review_agent.application import (
     find_active,
 )
 from review_agent.domain import InvalidTransition, NotFoundError, RunStatus, Stage
+from review_agent.profiles import selection as profile_selection
 
 # 强制 UTF-8 输出：Windows / GitHub Actions runner 的控制台可能用 cp1252 等
 # 非 UTF-8 编码，打印中文（任务恢复日志等）会抛 UnicodeEncodeError。
@@ -2450,25 +2451,13 @@ def _job_view(record: TaskRecord, job: dict | None = None) -> dict:
 
 def _resolve_agent(raw):
     """校验前端传来的 agent id；空值表示走自动路由。"""
-    if raw in (None, "", "auto"):
-        return None, None
-    known = {a["id"] for a in agent_spec.list_agents()}
-    if raw not in known:
-        return None, f"未知 Agent：{raw}；可选：{'、'.join(sorted(known))}"
-    return str(raw), None
+    return profile_selection.resolve_agent(raw, agent_spec.list_agents)
 
 
 def _resolve_scenario(raw):
     """校验前端传来的情境 id；空值表示不指定（= 全规则，等价于旧行为）。"""
-    if raw in (None, "", "default"):
-        return None, None
-    try:
-        known = [s["id"] for s in scenario.load()["scenarios"]]
-        if str(raw) not in known:
-            return None, f"未知审查情境：{raw}；可选：{'、'.join(known)}"
-    except scenario.ScenarioError as e:
-        return None, f"情境配置错误：{e}"
-    return str(raw), None
+    return profile_selection.resolve_scenario(
+        raw, scenario.load, scenario.ScenarioError)
 
 
 def _resolve_format_spec(raw):
@@ -2477,15 +2466,8 @@ def _resolve_format_spec(raw):
     空值返回 None：由 review.py 用配置里的 default（当前 none = 不判版式）。
     不传空字符串给子进程，是因为 --format-spec "" 会被当成"选了空规格"。
     """
-    if raw in (None, "", "default"):
-        return None, None
-    try:
-        known = [s["id"] for s in format_spec.load()["specs"]]
-        if str(raw) not in known:
-            return None, f"未知格式规格：{raw}；可选：{'、'.join(known)}"
-    except format_spec.FormatSpecError as e:
-        return None, f"格式规格配置错误：{e}"
-    return str(raw), None
+    return profile_selection.resolve_format_spec(
+        raw, format_spec.load, format_spec.FormatSpecError)
 
 
 def _resolve_format_custom(raw):

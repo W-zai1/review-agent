@@ -8,5 +8,9 @@ Application（届时复用 `tools/agent_spec.py`、`tools/scenario.py`、`tools/
 from __future__ import annotations
 
 from .resolver import LEGACY_AGENT_ID, resolve_profile
+from .selection import resolve_agent, resolve_format_spec, resolve_scenario
 
-__all__ = ["LEGACY_AGENT_ID", "resolve_profile"]
+__all__ = [
+    "LEGACY_AGENT_ID", "resolve_profile",
+    "resolve_agent", "resolve_format_spec", "resolve_scenario",
+]

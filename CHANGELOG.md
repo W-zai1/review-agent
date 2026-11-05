@@ -42,7 +42,28 @@
 
 ---
 
-# 2026-11-04
+# 2026-11-05
+
+### 2026-11-05 · 修改 · 第二阶段 2.6：V1 报告层抽到 V1Reporter
+
+- **文件**：新增 `review_agent/application/v1_reporting.py`（271 行，`V1Reporter`）；修改 `review.py`（5,171 → 4,992 行，非空 4,726 → 4,553）、`review_agent/application/__init__.py`（导出 `V1Reporter`）、`docs/第二阶段整改任务单.md`（2.6 状态与验收）
+- **改了什么**：把 `_write_shadow_report` / `_write_v1_logs` / `_v1_progress_steps` 及报告专用的 `_attach_purpose` / `_attach_action_plan` 收进 `V1Reporter`；报告构建、渲染、法条块、目的比对、整改建议、路径/时钟/哈希由 `review.py` 的 `_v1_reporter()` 注入，模块不反向 import review。`review.py` 保留三个同名兼容包装，调用方、报告 schema、legacy/shadow 语义、公共 API 均未改。
+- **为什么**：甲方 P1「review.py 上帝模块」成立，但大头是冻结的 legacy `run_one`；v1 正式链的报告组装/落盘约 280 行仍在组合根里，先抽这一刀，风险最低且能被现有双跑/幂等/审计流用例直接覆盖。没有动 legacy、没有搬迁 `run_one`。
+- **验证**：定向 `checks.test_idempotency` + `test_audit_stream` + `test_report_store` + `test_failure_injection` + `test_law_library_parity` **28 项 OK**；全量 `checks` **845 项 OK（skipped=11，16.943s）**、`tests` **686 项 OK（skipped=1，377.770s）**；`py_compile` 通过；`ledger/v1-chain.log` 校验通过；`secret_scan` 238 文件/0 命中；`changelog_guard` 退出 0。
+
+### 2026-11-05 · 修改 · 第二阶段 2.5：配置选择校验统一并修自定义格式
+
+- **文件**：新增 `review_agent/profiles/selection.py`、`checks/test_selection.py`；修改 `server.py`、`interfaces/cli/parser.py`、`docs/第二阶段整改任务单.md`
+- **改了什么**：新增 `resolve_agent()` / `resolve_scenario()` / `resolve_format_spec()` 纯函数，空值归一、未知 id 候选列表、配置错误前缀只此一份；server 的 `_resolve_*` 与 CLI parser 共用。统一接受 `default` 为空值；CLI 的 `--format-spec-json` 把 dict 直接透传，不再拿它查规格表。`server.py:2837` 发送 `--format-spec-json`、`interfaces/cli/parser.py:130` 却报 `未知格式规格` 的断链被修掉。
+- **为什么**：第二阶段 2.5「配置加载统一」——server 与 CLI 各有一套 scenario/format/agent 校验，文案已有差异；同时自定义格式审查会在子进程解析阶段直接 exit 2，任务根本没进入审查。规则与 LLM 已有单入口（`load_rules()` / `llm_client.load_config()`），本轮只收口选择校验。
+- **验证**：`checks.test_selection` 12 项 OK；`tests.test_scenario` 16 项 OK；全量 `checks` **845 项 OK（skipped=11，17.665s）**、`tests` **686 项 OK（skipped=1，336.305s）**；CLI 冒烟：`--format-spec-json` 无目标 exit 0，未知 Agent/情境/格式均 exit 2，`--scenario default --format-spec default` 无目标 exit 0。
+
+### 2026-11-04 · 修改 · 第二阶段 2.4：CLI 错误出口收敛
+
+- **文件**：`interfaces/cli/commands.py`（124 → 106 行）；`docs/第二阶段整改任务单.md`（2.4 状态与验收）
+- **改了什么**：新增 `_fail(runtime, message, exc, code)` 作为 CLI 执行错误唯一出口（打印人话 → `_emit_domain_error` → `sys.exit`），`_fail_config` 只做 ConfigError 包装；v1 的 `--review-id` 直跑与手工 CLI 走 TaskService 两条入口合并到 `_execute_v1()`，共用 Scenario/Format/Config/Unreadable 四个 except；legacy 的 Agent/Scenario/Format/Unreadable 也改走同一出口。删除三套重复的 `print + _emit_* + sys.exit`，错误文案、退出码、`REVIEW_ERROR` 字段未变。
+- **为什么**：第二阶段 2.4「错误处理统一」——同一类错误在 v1 直跑、v1 经 TaskService、legacy 三条路径各写一遍，文案/退出码容易漂移；CLI 执行层只留一个出口，server 仍按 `REVIEW_ERROR` 分类解析。`_run_v1` 内部的引擎级映射属执行语义，不在本轮改动范围。
+- **验证**：`checks.test_error_taxonomy` + `checks.test_engine_switch` 26 项 OK；全量 `checks` **833 项 OK（skipped=11）**、`tests` **686 项 OK（skipped=1）**；CLI 冒烟：缺失目标退出 1、marker `kind=input/http_status=404`；`--engine shadow` 无 `--no-llm` 退出 2、marker `kind=input/http_status=400`。
 
 ### 2026-11-04 · 修改 · 第二阶段 2.3：报告管理抽到 ReportService
 

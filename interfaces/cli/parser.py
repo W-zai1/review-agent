@@ -15,6 +15,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from review_agent.profiles import selection as profile_selection
+
 
 @dataclass
 class CliOptions:
@@ -74,14 +76,14 @@ def parse_args(argv=None, *, runtime):
             if s["keep_note"]:
                 print(f"      仍然检查：{s['keep_note']}")
         return None
-    if scenario and runtime.scenario_mod.get(scenario) is None:
-        try:
-            opts = "、".join(s["id"] for s in runtime.scenario_mod.load()["scenarios"])
-        except runtime.scenario_mod.ScenarioError as e:
-            print(f"审查情境错误：{e}")
+    if scenario:
+        scenario, scenario_err = profile_selection.resolve_scenario(
+            scenario, runtime.scenario_mod.load,
+            runtime.scenario_mod.ScenarioError,
+            config_prefix="审查情境错误")
+        if scenario_err:
+            print(scenario_err)
             sys.exit(2)
-        print(f"未知审查情境：{scenario}；可选：{opts}")
-        sys.exit(2)
     format_spec = None
     if "--format-spec-json" in args:
         i = args.index("--format-spec-json")
@@ -127,14 +129,14 @@ def parse_args(argv=None, *, runtime):
             if s["disable_rules"]:
                 print(f"      不参与：{'、'.join(s['disable_rules'])}")
         return None
-    if format_spec and runtime.format_spec_mod.get(format_spec) is None:
-        try:
-            opts = "、".join(s["id"] for s in runtime.format_spec_mod.load()["specs"])
-        except runtime.format_spec_mod.FormatSpecError as e:
-            print(f"格式规格错误：{e}")
+    if format_spec:
+        format_spec, format_err = profile_selection.resolve_format_spec(
+            format_spec, runtime.format_spec_mod.load,
+            runtime.format_spec_mod.FormatSpecError,
+            config_prefix="格式规格错误", allow_dict=True)
+        if format_err:
+            print(format_err)
             sys.exit(2)
-        print(f"未知格式规格：{format_spec}；可选：{opts}")
-        sys.exit(2)
     if "--agent" in args:
         i = args.index("--agent")
         if i + 1 < len(args):
@@ -156,6 +158,12 @@ def parse_args(argv=None, *, runtime):
             print(f"      规则：{a['rules']} 条｜检查器：{len(a['checks'])} 项｜"
                   f"自动路由：{'是' if a['auto'] else '否（需 --agent 显式指定）'}")
         return None
+    if agent_id:
+        agent_id, agent_err = profile_selection.resolve_agent(
+            agent_id, runtime.agent_spec.list_agents)
+        if agent_err:
+            print(agent_err)
+            sys.exit(2)
     if "--type" in args:
         i = args.index("--type")
         if i + 1 < len(args):
