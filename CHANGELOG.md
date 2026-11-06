@@ -44,6 +44,13 @@
 
 # 2026-11-05
 
+### 2026-11-06 · 修改 · 第二阶段 2.10：server LLM 配置适配层
+
+- **文件**：新增 `interfaces/web/llm_settings.py`（268 行）；修改 `server.py`（2,713 → 2,491 行）、`docs/第二阶段整改任务单.md`（2.10）
+- **改了什么**：把 `_llm_status` / `_save_llm_config` / `_restore_llm_history` / `_test_llm` / `_reset_llm_config` 的校验、密钥切换保护、试连和重置逻辑收进 `LLMSettings`；`llm_client`、配置记忆写入、URL 解析由 `_llm_settings()` 注入。`server.py` 的五个 Handler 方法保留为薄包装，端点、响应字段、错误文案、密钥掩码行为均未改。
+- **为什么**：Handler 仍同时做路由、配置校验和外部模型试连，且这段逻辑含“旧 Key 不能发给新 host”“userinfo 拒绝”“本机端点清空继承 Key”等安全分支，必须单独可测。抽出后 `server.py` 更薄，安全边界集中在 `LLMSettings`；没有新增配置项，也没有把 Key 写进任何日志/响应。
+- **验证**：`checks.test_endpoint_security` + `tests.test_api_contract.LlmConfigTests` + `LlmMemoryTests` **22 项 OK**；全量 `checks` **854 项 OK（skipped=11，32.453s）**；全量 `tests` **686 项 OK（skipped=1，607.395s）**；`py_compile`、`git diff --check` 通过。
+
 ### 2026-11-05 · 修改 · 第二阶段 2.9：server 异步启动适配层
 
 - **文件**：新增 `interfaces/web/review_start.py`（146 行）；修改 `server.py`（2,798 → 2,713 行）、`docs/第二阶段整改任务单.md`（2.9）
