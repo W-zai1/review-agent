@@ -44,6 +44,13 @@
 
 # 2026-11-05
 
+### 2026-11-07 · 修改 · 第二阶段 2.12：server 上传/摄取适配层
+
+- **文件**：新增 `interfaces/web/uploads.py`（322 行）；修改 `server.py`（2,408 → 2,221 行）、`docs/第二阶段整改任务单.md`（2.12）
+- **改了什么**：把 `_upload` / `_purpose_upload` 的名字/扩展名/大小校验、文本 UTF-8/NUL/BOM 处理、二进制归档与 `ingest` 提取、目的暂存记录收进 `UploadService`。读 body 的动作以回调传入，校验失败时 Handler 仍不读 body 并关闭 keep-alive；`server.py` 保留两个薄包装和 `_uploads()` 工厂。
+- **为什么**：上传协议和摄取细节贴在 Handler 里，和路由、响应发送混在一起；抽出后待审对象与目的文件共用同一套前置校验，文本/二进制/OCR 差异有独立入口。未引入通用 `FileService` 或 `BaseTool`，上传仍走原有 `ingest` 与目录结构。
+- **验证**：`tests.test_api_contract.TargetsTests + UploadTests + BinaryUploadTests + PurposeUploadTests` **33 项 OK**；全量 `checks` **854 项 OK（skipped=11，21.760s）**；全量 `tests` **686 项 OK（skipped=1，400.812s）**；`py_compile` 通过。
+
 ### 2026-11-07 · 修改 · 第二阶段 2.11：server 待审文件管理适配层
 
 - **文件**：新增 `interfaces/web/targets.py`（129 行）；修改 `server.py`（2,491 → 2,408 行）、`docs/第二阶段整改任务单.md`（2.11）

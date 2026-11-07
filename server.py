@@ -62,7 +62,14 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 # server 与 review.py 共用它：两边各写一份的下场是「一个按行数推号、一个按记录数推号」，
 # 删过报告之后新记录的 seq 就会撞号。
 from review_agent.infrastructure import ledger as ledger_store
-from interfaces.web import llm_settings, review_requests, review_start, targets, task_lifecycle
+from interfaces.web import (
+    llm_settings,
+    review_requests,
+    review_start,
+    targets,
+    task_lifecycle,
+    uploads,
+)
 from interfaces.web.reports import ReportService
 # 任务记录是「这条审查到底跑完没有」的唯一真相：JOBS 只是给前端看的内存视图。
 from review_agent.application import (
@@ -717,6 +724,28 @@ def _target_files():
     )
 
 
+def _uploads():
+    """按当前模块全局构造上传适配层。"""
+    return uploads.UploadService(
+        root=ROOT,
+        uploads=UPLOADS,
+        purpose_dir=PURPOSE_DIR,
+        purpose_originals=PURPOSE_ORIGINALS,
+        purpose_work=PURPOSE_WORK,
+        allowed=UPLOAD_ALLOWED,
+        binary_exts=UPLOAD_BINARY_EXTS,
+        max_text_bytes=UPLOAD_MAX_BYTES,
+        max_binary_bytes=UPLOAD_MAX_BINARY_BYTES,
+        purpose_file_max=PURPOSE_FILE_MAX,
+        purpose_stage_max=PURPOSE_STAGE_MAX,
+        safe_upload_name=_safe_upload_name,
+        unique_upload_path=_unique_upload_path,
+        marker_safe_name=_marker_safe_name,
+        list_purpose_records=_list_purpose_records,
+        ingest=ingest,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"ReviewAgentConsole/{version.__version__}"
 
@@ -1037,245 +1066,29 @@ class Handler(BaseHTTPRequestHandler):
     def _upload(self, u):
         """接收原始字节上传：只收 UTF-8 文本/代码，落到 targets/uploads/。"""
         q = parse_qs(u.query)
-        name = _safe_upload_name((q.get("name") or [""])[0])
-        if not name:
+        result, close = _uploads().upload_target(
+            (q.get("name") or [""])[0],
+            self.headers.get("Content-Length", 0),
+            self.rfile.read,
+        )
+        if close:
             self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False, "error": "文件名无效"}
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in UPLOAD_ALLOWED:
-            self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False, "error": f"不支持的文件类型：{ext or '无扩展名'}"}
-        try:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
-            self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False, "error": "文件为空"}
-        is_binary = ext in UPLOAD_BINARY_EXTS
-        limit = UPLOAD_MAX_BINARY_BYTES if is_binary else UPLOAD_MAX_BYTES
-        if length > limit:
-            self.close_connection = True
-            return {"ok": False, "error": f"文件超过 {limit // (1024 * 1024)} MB 限制"}
-        data = self.rfile.read(length)
-
-        if not is_binary:
-            # —— 文本路径：严格校验（UTF-8 / 拒 NUL / 剥 BOM）——
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                return {"ok": False, "error": "仅支持 UTF-8 编码的文本文件"}
-            if chr(0) in text:
-                return {"ok": False, "error": "疑似二进制文件，已拒绝"}
-            if text.startswith(chr(0xFEFF)):
-                text = text[1:]
-            payload = text.encode("utf-8")
-            target = _unique_upload_path(name)
-            try:
-                target.write_bytes(payload)
-            except Exception as e:
-                return {"ok": False, "error": f"保存失败：{e}"}
-            return {"ok": True, "kind": "text", "file": {
-                "name": target.name,
-                "rel": target.relative_to(ROOT).as_posix(),
-                "size": len(payload),
-            }}
-
-        # ---------- 二进制路径：归档原件 + 摄取成文本 ----------
-        originals = UPLOADS / "_originals"
-        originals.mkdir(parents=True, exist_ok=True)
-        original = _unique_upload_path(name, base=originals)
-        try:
-            original.write_bytes(data)
-        except Exception as e:
-            return {"ok": False, "error": f"保存失败：{e}"}
-
-        work = UPLOADS / "_work"
-        try:
-            result = ingest.ingest_file(original, work_dir=work)
-        except ingest.IngestError as e:
-            return {"ok": False, "error": str(e),
-                    "original": original.relative_to(ROOT).as_posix()}
-        except Exception as e:                        # noqa: BLE001
-            return {"ok": False, "error": f"文档解析失败：{e}",
-                    "original": original.relative_to(ROOT).as_posix()}
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
-
-        meta_dir = UPLOADS / "_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-        extracted = []
-        for out in result["outputs"]:
-            # 压缩包成员可能带目录层级，压平后落盘，保证都能出现在待审列表里
-            flat = re.sub(r"[\\/]+", "-", out["name"]).lstrip("-")
-            target = _unique_upload_path(flat)
-            try:
-                target.write_text(out["text"], encoding="utf-8")
-            except Exception as e:                    # noqa: BLE001
-                return {"ok": False, "error": f"派生文本保存失败：{e}"}
-            ometa = out.get("meta") or {}
-            (meta_dir / f"{target.name}.json").write_text(
-                json.dumps(ometa, ensure_ascii=False, indent=2), encoding="utf-8")
-            extracted.append({
-                "name": target.name,
-                "rel": target.relative_to(ROOT).as_posix(),
-                "chars": len(out["text"]),
-                "from": ometa.get("source_name"),
-                "archive": ometa.get("archive"),
-            })
-
-        return {
-            "ok": True,
-            "kind": result["kind"],
-            "file": extracted[0] if extracted else None,
-            "extracted": extracted,
-            "warnings": list(result["meta"].get("warnings") or []),
-            "extractor": result["meta"].get("extractor"),
-            "original": original.relative_to(ROOT).as_posix(),
-        }
+        return result
 
     # ------------------------------------------------------------------
     # 「审查目的」上传：与 /api/upload 同一套协议，但产物是**目的文本**而不是待审对象
     # ------------------------------------------------------------------
     def _purpose_upload(self, u):
-        """接收目的说明文件 → 摄取成文本 → 暂存 state/purpose_uploads/。
-
-        与 /api/upload 的三点区别：
-          1. 落点在 state/ 而不是 targets/——目的文件不是待审对象，
-             混进 targets/ 会污染待审列表；
-          2. 文本按 PURPOSE_FILE_MAX 截断（目的会进每个维度的 prompt）；
-          3. 提取不到文本（扫描件/无 OCR 的图片）**明确拒绝**，
-             不留一个空目的文件等着被静默忽略。
-        """
+        """接收目的说明文件 → 摄取成文本 → 暂存 state/purpose_uploads/。"""
         q = parse_qs(u.query)
-        name = _safe_upload_name((q.get("name") or [""])[0])
-        if not name:
+        result, close = _uploads().upload_purpose(
+            (q.get("name") or [""])[0],
+            self.headers.get("Content-Length", 0),
+            self.rfile.read,
+        )
+        if close:
             self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False, "error": "文件名无效"}
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in UPLOAD_ALLOWED:
-            self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False, "error": f"不支持的文件类型：{ext or '无扩展名'}"}
-        try:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
-            self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False, "error": "文件为空"}
-        is_binary = ext in UPLOAD_BINARY_EXTS
-        limit = UPLOAD_MAX_BINARY_BYTES if is_binary else UPLOAD_MAX_BYTES
-        if length > limit:
-            self.close_connection = True
-            return {"ok": False, "error": f"文件超过 {limit // (1024 * 1024)} MB 限制"}
-        if len(_list_purpose_records()) >= PURPOSE_STAGE_MAX:
-            self.close_connection = True   # body 未读，避免 keep-alive 错位
-            return {"ok": False,
-                    "error": f"目的文件暂存已满（{PURPOSE_STAGE_MAX} 个），"
-                             "请先删除不用的目的文件"}
-        data = self.rfile.read(length)
-
-        warnings = []
-        if _marker_safe_name(name)[1]:
-            # 名字里的【】《》（）是目的块定界符：进块时会被改写，先说一声，
-            # 别等到报告里名字看着不一样才发现。
-            warnings.append(
-                "文件名含【】《》（）等定界符，写进目的块时会改写为 [ ] < > ( )，"
-                "不影响内容解析")
-        kind = "text"
-        if not is_binary:
-            # —— 文本路径：严格校验（UTF-8 / 拒 NUL / 剥 BOM），与待审对象上传同一口径 ——
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                return {"ok": False, "error": "仅支持 UTF-8 编码的文本文件"}
-            if chr(0) in text:
-                return {"ok": False, "error": "疑似二进制文件，已拒绝"}
-            if text.startswith(chr(0xFEFF)):
-                text = text[1:]
-        else:
-            # ---------- 二进制路径：归档原件 + 摄取成文本 ----------
-            original = _unique_upload_path(name, base=PURPOSE_ORIGINALS)
-            try:
-                original.write_bytes(data)
-            except Exception as e:
-                return {"ok": False, "error": f"保存失败：{e}"}
-            try:
-                # 每次请求独立工作目录：并发上传时 rmtree 不会删掉别人正在解压的文件
-                work = PURPOSE_WORK / uuid.uuid4().hex[:8]
-                result = ingest.ingest_file(original, work_dir=work)
-            except ingest.IngestError as e:
-                _unlink_quiet(original)
-                return {"ok": False, "error": str(e)}
-            except Exception as e:                    # noqa: BLE001
-                _unlink_quiet(original)
-                return {"ok": False, "error": f"文档解析失败：{e}"}
-            finally:
-                shutil.rmtree(work, ignore_errors=True)
-            kind = str(result.get("kind") or "binary")
-            warnings.extend(str(w) for w in (result["meta"].get("warnings") or []))
-            # 目的文件是"标准"，不是"待审对象"：OCR 认错一个字，改的是**判定口径**
-            # （实测一张招聘 JD 截图里「算法」被认成「篡法」、「本地部署」成「本地署」），
-            # 比审待审对象时认错字更严重——所以单独提示一次，并给出更可靠的做法。
-            if kind == "image":
-                warnings.append(
-                    "目的文件是图片：其中文字靠 OCR 识别，错字会直接改变本次审查的"
-                    "判定标准（如「算法」被认成「篡法」）；篇幅较长的要求建议改传 "
-                    "PDF / Word / 文本，识别更可靠。")
-            # 压缩包可能有多个成员：并成一段文本，成员名写进说明
-            chunks = [out["text"] for out in result["outputs"] if out.get("text")]
-            if len(result["outputs"]) > 1:
-                warnings.append(
-                    f"压缩包内 {len(result['outputs'])} 个成员的文本已合并为一段目的")
-            text = "\n".join(chunks)
-
-        if not text.strip():
-            # 扫描件 / 无 OCR 引擎时的图片：不留空目的文件（会被静默忽略）
-            if is_binary:
-                _unlink_quiet(original)
-            return {"ok": False, "error": "未能从文件中提取到文本"
-                                            "（扫描件或图片需 OCR 能力），"
-                                            "请换用文本版文件或先配置 OCR",
-                    "kind": kind, "warnings": warnings}
-
-        truncated = len(text) > PURPOSE_FILE_MAX
-        if truncated:
-            text = text[:PURPOSE_FILE_MAX]
-            warnings.append(f"目的文件超过 {PURPOSE_FILE_MAX} 字，"
-                            f"已截断至前 {PURPOSE_FILE_MAX} 字参与解析")
-
-        pid = uuid.uuid4().hex[:12]
-        record = {
-            "id": pid,
-            "name": name,
-            "kind": kind,
-            "chars": len(text),
-            "truncated": truncated,
-            "text": text,
-            "warnings": warnings,
-            "original": (original.relative_to(ROOT).as_posix()
-                         if is_binary else ""),
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        try:
-            (PURPOSE_DIR / f"{pid}.json").write_text(
-                json.dumps(record, ensure_ascii=False), encoding="utf-8")
-        except Exception as e:
-            if is_binary:
-                _unlink_quiet(original)
-            return {"ok": False, "error": f"暂存失败：{e}"}
-
-        return {
-            "ok": True,
-            "id": pid,
-            "name": name,
-            "kind": kind,
-            "chars": len(text),
-            "truncated": truncated,
-            "preview": text[:80],
-            "warnings": warnings,
-            "items": _list_purpose_records(),
-        }
+        return result
 
     def _favorites(self):
         return _report_service().favorites()
