@@ -44,6 +44,13 @@
 
 # 2026-11-05
 
+### 2026-11-07 · 修改 · 第二阶段 2.13：server 规则/日志/完整性只读视图抽离
+
+- **文件**：新增 `interfaces/web/diagnostics.py`（245 行）；修改 `server.py`（2,221 → 2,058 行）、`docs/第二阶段整改任务单.md`（2.13）
+- **改了什么**：把 `_rules` / `_toggle_rule` / `_logs` / `_integrity` 的规则投影与开关、日志目录选择与 JSONL 容错、双链台账与报告校验收进 `DiagnosticsService`；`ROOT`/`OUTPUTS`/`LOG_DIR`/`TRASH`/`LEDGER`、`rules_store`、`rule_exec`、`ledger_store`、`integrity`、`_read_json`、`_legacy_task_view` 全部注入。`server.py` 保留四个薄包装和 `_diagnostics()` 工厂，端点、响应字段、错误文案、墓碑解释与 `chain_ok` 口径均未改。
+- **为什么**：Handler 仍在做规则目录投影、日志目录探测和台账/报告双重校验；这段逻辑尤其容易和 CLI 的校验实现漂移（旧实现就出现过控制台只查 `rules_dir_hash`、CLI 报 87 份 stale 的分叉）。抽出后只读视图有独立入口，复用的仍是 `ledger_store.entries_for_api` 与 `integrity.verify_report`，没有新写一套校验。
+- **验证**：`tests.test_api_contract.RulesTests + RulesVersionTests + ReportsLogsIntegrityTests + EmptyIntegrityTests` **13 项 OK**；全量 `checks` **854 项 OK（skipped=11，18.289s）**；全量 `tests` **686 项 OK（skipped=1，360.806s）**；`py_compile` 通过。
+
 ### 2026-11-07 · 修改 · 第二阶段 2.12：server 上传/摄取适配层
 
 - **文件**：新增 `interfaces/web/uploads.py`（322 行）；修改 `server.py`（2,408 → 2,221 行）、`docs/第二阶段整改任务单.md`（2.12）
