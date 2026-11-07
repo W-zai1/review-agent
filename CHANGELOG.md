@@ -44,6 +44,13 @@
 
 # 2026-11-05
 
+### 2026-11-07 · 修改 · 第二阶段 2.11：server 待审文件管理适配层
+
+- **文件**：新增 `interfaces/web/targets.py`（129 行）；修改 `server.py`（2,491 → 2,408 行）、`docs/第二阶段整改任务单.md`（2.11）
+- **改了什么**：把 `_targets` / `_delete_target` / `_restore_target` 的列表投影、软删除（回收区 + manifest）、撤销恢复收进 `TargetFiles`；根目录、`TARGETS`/`UPLOADS`/`TARGET_TRASH`、路径解析、文件角色判断全部注入。`server.py` 保留三个薄包装与 `_target_files()` 工厂；上传仍留在 Handler（下一步单独抽）。
+- **为什么**：待审列表与软删除/撤销是一组内聚的文件管理语义，仍和 HTTP 路由混在 Handler 里；抽出后排序规则（labels 沉底）、跨目录删除限制、manifest 原子写入/搬回补偿有独立入口，且不改页面看到的字段。
+- **验证**：`tests.test_api_contract.TargetsTests + UploadTests + BinaryUploadTests` **19 项 OK**；全量 `checks` **854 项 OK（skipped=11，20.596s）**；全量 `tests` **686 项 OK（skipped=1，454.170s）**；`py_compile` 通过。
+
 ### 2026-11-06 · 修改 · 第二阶段 2.10：server LLM 配置适配层
 
 - **文件**：新增 `interfaces/web/llm_settings.py`（268 行）；修改 `server.py`（2,713 → 2,491 行）、`docs/第二阶段整改任务单.md`（2.10）
