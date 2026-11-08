@@ -68,6 +68,7 @@ from interfaces.web import (
     llm_settings,
     review_requests,
     review_start,
+    review_sync,
     targets,
     task_lifecycle,
     uploads,
@@ -1220,74 +1221,7 @@ class Handler(BaseHTTPRequestHandler):
         return _llm_settings().reset()
 
     def _run_review(self, data):
-        file, target, error = review_requests.resolve_target(data, _resolve_target)
-        if error:
-            return {"ok": False, "error": error}
-        # 同步接口也要占并发闸门：旧实现只查内存 JOBS 里的 running，而同步调用根本不写 JOBS，
-        # 于是「同步 + 异步同时跑」是允许的——两条进程同时写 ledger/outputs。
-        busy = active_tasks(TASKS, stale_after=TASK_STALE_AFTER)
-        if busy:
-            return {"ok": False, "error": "已有审查任务进行中，请稍候",
-                    "review_id": busy[0].review_id}
-        request, error = review_requests.assemble_request(
-            data, file=file, target=target, target_types=TARGET_TYPES,
-            resolve_agent=_resolve_agent,
-            resolve_scenario=_resolve_scenario,
-            resolve_format_spec=_resolve_format_spec,
-            resolve_format_custom=_resolve_format_custom,
-            clean_purpose=_clean_purpose,
-            assemble_purpose=_assemble_purpose,
-            idempotency_key=_idempotency_key,
-            normalize_flags=False)
-        if error:
-            return {"ok": False, "error": error}
-        llm_opt = request.llm
-        agent_opt = request.agent
-        purpose_text = request.purpose_text
-        # 与异步接口同一条链：TaskService 建任务 / 落状态 / 超时；
-        # server 只把「这一次怎么跑」封成 Runner（内部仍是 review.py 子进程）。
-        job_id = "sync-" + uuid.uuid4().hex[:8]
-        progress = JOBS_DIR / f"{job_id}.jsonl"
-        try:
-            progress.unlink()
-        except OSError:
-            pass
-        runner = _SubprocessRunner(review_requests.build_runner_spec(
-            request, job_id=job_id, progress=progress))
-        t0 = time.time()
-        try:
-            record = _task_service().start_review_with(
-                runner, target, profile_id=agent_opt,
-                purpose=(purpose_text or None), engine="v1",
-                use_llm=llm_opt is True, timeout=REVIEW_TIMEOUT)
-        except NotFoundError as exc:
-            return {"ok": False, "error": str(exc)}
-        except OSError as exc:
-            return {"ok": False, "error": f"无法写入任务记录：{exc}"}
-        elapsed = round(time.time() - t0, 1)
-        review_id = record.review_id
-        status = RunStatus(record.status)
-        if status is RunStatus.COMPLETED:
-            report_path = record.report_path
-            if not report_path or not Path(str(report_path)).exists():
-                return {"ok": False, "error": "审查完成但未生成报告",
-                        "timeout": REVIEW_TIMEOUT, "elapsed": elapsed,
-                        "review_id": review_id}
-            report = _read_json(Path(str(report_path)))
-            return {"ok": True, "report": report,
-                    "id": report.get("review_id") or review_id,
-                    "elapsed": elapsed, "timeout": REVIEW_TIMEOUT}
-        error = record.error or "运行失败"
-        payload = {"ok": False, "error": error, "timeout": REVIEW_TIMEOUT,
-                   "elapsed": elapsed, "review_id": review_id}
-        if error.startswith("任务超时"):
-            # 对外沿用「审查超时」措辞；任务记录里保留 TaskService 的统一文案
-            payload["error"] = f"审查超时（{REVIEW_TIMEOUT}s）"
-        info = _parse_review_error(error) or {}
-        if info:
-            payload["error_kind"] = info.get("kind")
-            payload["error_status"] = info.get("http_status")
-        return payload
+        return _sync_review().run(data)
 
 
 def _review_subprocess_env():
@@ -1738,6 +1672,26 @@ def _review_starter() -> review_start.ReviewStarter:
         idempotency_key=_idempotency_key,
         build_runner=lambda spec: _SubprocessRunner(spec),
         job_view=_job_view,
+    )
+
+
+def _sync_review() -> review_sync.SyncReview:
+    """按当前全局构造同步审查适配层，测试替换 TASKS/JOBS 后仍生效。"""
+    return review_sync.SyncReview(
+        tasks=TASKS, task_stale_after=TASK_STALE_AFTER,
+        target_types=TARGET_TYPES,
+        resolve_target=_resolve_target, resolve_agent=_resolve_agent,
+        resolve_scenario=_resolve_scenario,
+        resolve_format_spec=_resolve_format_spec,
+        resolve_format_custom=_resolve_format_custom,
+        clean_purpose=_clean_purpose, assemble_purpose=_assemble_purpose,
+        idempotency_key=_idempotency_key,
+        build_runner=lambda request, job_id, progress: _SubprocessRunner(
+            review_requests.build_runner_spec(
+                request, job_id=job_id, progress=progress)),
+        task_service=_task_service, read_json=_read_json,
+        parse_review_error=_parse_review_error, jobs_dir=JOBS_DIR,
+        timeout=REVIEW_TIMEOUT,
     )
 
 

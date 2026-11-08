@@ -44,8 +44,13 @@
 
 # 2026-11-05
 
-### 2026-11-08 · 修改 · 第二阶段 2.14：server 学习写入口适配层
+### 2026-11-08 · 修改 · 第二阶段 2.15：server 同步审查适配层
+- **文件**：新增 `interfaces/web/review_sync.py`（118 行）、`checks/test_sync_review.py`（8 项）；修改 `server.py`（2,022 → 1,976 行）、`docs/第二阶段整改任务单.md`（2.15）
+- **改了什么**：把 `Handler._run_review` 的“目标解析 → 任务记录并发闸门 → 请求归一 → 建 Runner → TaskService.start_review_with → 结果/超时/错误映射”收进 `SyncReview`；解析器、Runner 工厂、任务服务、错误解析、时钟全部注入。`server.py` 保留 `_run_review` 薄包装与 `_sync_review()` 工厂；端点、响应字段、错误文案、退出语义均未改。
+- **为什么**：同步入口是正式执行链，但 Handler 里仍同时做 HTTP 适配、并发判断、任务提交和结果投影；这段逻辑与异步启动链重复且难以单独测试。抽出后任务记录/超时/状态机仍在 `TaskService`，子进程仍在 `_SubprocessRunner`，本层不直接起进程、不写 JOBS。
+- **验证**：`checks.test_sync_review` **8 项 OK**；与 `test_server_tasks + test_subprocess_runner` **30 项 OK**；全量 `checks` **869 项 OK（skipped=11，20.328s）**；全量 `tests` **686 项 OK（skipped=1，391.441s）**；`py_compile` 通过。
 
+### 2026-11-08 · 修改 · 第二阶段 2.14：server 学习写入口适配层
 - **文件**：新增 `interfaces/web/learning_writes.py`（86 行）、`checks/test_learning_writes.py`（7 项）；修改 `server.py`（2,058 → 2,022 行）、`docs/第二阶段整改任务单.md`（2.14）
 - **改了什么**：把 `_add_annotation` / `_add_annotation_inner` / `_decide_candidate` 的 Token 鉴权、参数归一、`rule_learning` 调用与 `LearningError` 映射收进 `LearningWrites`；`rule_learning`、`ANNOTATION_TOKEN_ENV`、请求 headers、环境变量全部注入。`server.py` 保留三个薄包装与 `_learning_writes(self)` 工厂，路由、鉴权顺序、错误文案、返回结构均未改。
 - **为什么**：这两个接口是 HTTP 面上仅有的“学习”写入口，且鉴权失败必须在写标注/候选之前发生；逻辑留在 Handler 里时无法脱离 HTTP 单测。抽出后 `add_annotation` 先鉴权再进入 `add_annotation_inner`，`decide_candidate` 同样先鉴权；仍不触碰规则库，规则晋升只在 `tools/rule_promote.py`。
