@@ -38,6 +38,19 @@ server.py —— 审查 Agent 本地 Web 控制台（零依赖，仅标准库）
   POST /api/llm/reset             -> 清除本地覆盖，回到 YAML/环境变量
   POST /api/review  {file, llm}   -> 同步运行 review.py，返回最新报告
 
+HTTP 路由索引（实际分派在 interfaces/web/http_routes.py）：
+  "/api/agents", "/api/annotations", "/api/candidates",
+  "/api/candidates/decide", "/api/integrity", "/api/llm/config",
+  "/api/llm/history", "/api/llm/providers", "/api/llm/reset",
+  "/api/learning", "/api/llm/status", "/api/llm/test", "/api/logs",
+  "/api/purpose/files", "/api/purpose/upload", "/api/report",
+  "/api/reports", "/api/reports/batch", "/api/reports/favorite",
+  "/api/reports/favorites", "/api/reports/trash",
+  "/api/reports/trash/restore", "/api/review/cancel",
+  "/api/review/start", "/api/review/status", "/api/rules",
+  "/api/rules/toggle", "/api/scenarios", "/api/target",
+  "/api/target/restore", "/api/targets", "/api/upload"
+
 运行：
   python server.py [--port 8000]
 """
@@ -56,7 +69,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 # 台账的锁 / seq 推导 / 墓碑格式只有一套实现（`infrastructure/ledger.py`）。
 # server 与 review.py 共用它：两边各写一份的下场是「一个按行数推号、一个按记录数推号」，
@@ -64,6 +77,7 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 from review_agent.infrastructure import ledger as ledger_store
 from interfaces.web import (
     diagnostics,
+    http_routes,
     learning_writes,
     llm_settings,
     review_requests,
@@ -290,6 +304,27 @@ def _report_service(favorites_getter=None, favorites_setter=None):
         favorites_getter=favorites_getter,
         favorites_setter=favorites_setter,
         purge_gap=fact_gap.purge_review,
+    )
+
+
+def _http_routes():
+    """按当前模块全局构造路由分发器。
+
+    测试会 monkeypatch `WEB/ROOT/llm_client/...`，所以每次读全局；路由层
+    不 import server，业务方法仍由传入的 Handler 执行。
+    """
+    return http_routes.HttpRoutes(
+        web=WEB,
+        root=ROOT,
+        fingerprint=SERVER_SOURCE_FINGERPRINT,
+        llm_client=llm_client,
+        load_llm_history=_load_llm_history,
+        rule_learning=rule_learning,
+        agent_spec=agent_spec,
+        scenario=scenario,
+        format_spec=format_spec,
+        list_purpose_records=_list_purpose_records,
+        delete_purpose_record=_delete_purpose_record,
     )
 
 
@@ -858,179 +893,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----- GET -----
     def do_GET(self):
-        u = urlparse(self.path)
-        p = u.path
-        if p.startswith("/api/") and not self._guard_api():
-            return
-        if p in ("/", "/index.html"):
-            return self._send_file(WEB / "index.html")
-        if p.startswith("/static/"):
-            fp = (WEB / p[len("/static/"):]).resolve()
-            return self._send_file(fp)
-        if p == "/api/health":
-            return self._send(200, {
-                "ok": True,
-                "service": "review-agent",
-                "pid": os.getpid(),
-                "root": str(ROOT),
-                "fingerprint": SERVER_SOURCE_FINGERPRINT,
-            })
-        if p == "/api/targets":
-            return self._send(200, self._targets())
-        if p == "/api/reports":
-            return self._send(200, self._reports())
-        if p == "/api/reports/trash":
-            return self._send(200, self._trash_reports())
-        if p == "/api/integrity":
-            return self._send(200, self._integrity())
-        if p == "/api/llm/status":
-            return self._send(200, self._llm_status())
-        if p == "/api/llm/providers":
-            return self._send(200, {"ok": True, "items": llm_client.list_providers()})
-        if p == "/api/llm/history":
-            return self._send(200, {"ok": True, "items": _load_llm_history()})
-        if p == "/api/report":
-            q = parse_qs(u.query)
-            rid = q.get("id", [None])[0]
-            return self._send(200, self._report(rid))
-        if p == "/api/learning":
-            # 只读：控制台能看到候选与配额，但**没有任何接口能写规则库**
-            return self._send(200, {"ok": True, **rule_learning.summary()})
-        if p == "/api/candidates":
-            # 待人工审核的规则候选（口径与 CLI 的 rule_review.py 完全一致）
-            items = rule_learning.console_candidates()
-            return self._send(200, {
-                "ok": True, "count": len(items),
-                "pending": sum(1 for i in items if i["pending"]),
-                "items": items,
-            })
-        if p == "/api/annotations":
-            q = parse_qs(u.query)
-            rid = q.get("id", [None])[0]
-            items = [a for a in rule_learning.load_annotations()
-                     if not rid or a.get("report_id") == rid]
-            return self._send(200, {"ok": True, "items": items[-200:]})
-        if p == "/api/agents":
-            return self._send(200, {"ok": True, "items": agent_spec.list_agents()})
-        if p == "/api/scenarios":
-            # 配置坏了要让前端看见（400 语义），不能返回空列表：
-            # 空列表会被当成"没有情境"，用户在下拉里看不到任何选项也不知道为什么
-            try:
-                return self._send(200, scenario.public_list())
-            except scenario.ScenarioError as e:
-                return self._send(200, {"ok": False, "error": str(e), "items": []})
-        if p == "/api/format-specs":
-            # 格式规格（docx 版式按哪套标准判）。同 scenarios：配置坏了要报错而不是空列表
-            try:
-                return self._send(200, format_spec.public_list())
-            except format_spec.FormatSpecError as e:
-                return self._send(200, {"ok": False, "error": str(e), "items": []})
-        if p == "/api/purpose/files":
-            # 暂存的目的文件（说明材料，不是待审对象）；不含原文，只给预览
-            return self._send(200, {"ok": True,
-                                    "items": _list_purpose_records()})
-        if p == "/api/rules":
-            return self._send(200, self._rules())
-        if p == "/api/logs":
-            q = parse_qs(u.query)
-            rid = q.get("id", [None])[0]
-            return self._send(200, self._logs(rid))
-        if p == "/api/review/status":
-            q = parse_qs(u.query)
-            job_id = q.get("job", [None])[0]
-            return self._send(200, self._review_status(job_id))
-        return self._send(404, {"error": "not found"})
+        return _http_routes().get(self)
 
     # ----- POST -----
     def do_POST(self):
-        u = urlparse(self.path)
-        if not self._guard_api():
-            return
-        if u.path == "/api/upload":
-            return self._send(200, self._upload(u))
-        if u.path == "/api/purpose/upload":
-            return self._send(200, self._purpose_upload(u))
-        data = self._json_body()
-        if data is None:            # 超大 body：响应已发出（413），直接结束
-            return
-        if u.path == "/api/review":
-            return self._send(200, self._run_review(data))
-        if u.path == "/api/review/start":
-            return self._send(200, self._start_review(data))
-        if u.path == "/api/review/cancel":
-            return self._send(200, self._cancel_review(data))
-        if u.path == "/api/annotations":
-            return self._send(200, self._add_annotation(data))
-        if u.path == "/api/candidates/decide":
-            return self._send(200, self._decide_candidate(data))
-        if u.path == "/api/rules/toggle":
-            return self._send(200, self._toggle_rule(data))
-        if u.path == "/api/llm/config":
-            return self._send(200, self._save_llm_config(data))
-        if u.path == "/api/llm/test":
-            return self._send(200, self._test_llm(data))
-        if u.path == "/api/llm/reset":
-            return self._send(200, self._reset_llm_config())
-        if u.path == "/api/reports/favorite":
-            return self._send(200, self._set_favorite(data))
-        if u.path == "/api/reports/favorites":
-            return self._send(200, self._set_favorites(data))
-        if u.path == "/api/reports/trash/restore":
-            return self._send(200, self._restore_report(data))
-        if u.path == "/api/target/restore":
-            return self._send(200, self._restore_target(data))
-        if u.path == "/api/llm/history/restore":
-            return self._send(200, self._restore_llm_history(data))
-        return self._send(404, {"error": "not found"})
+        return _http_routes().post(self)
 
     # ----- DELETE -----
     def do_DELETE(self):
-        u = urlparse(self.path)
-        if not self._guard_api():
-            return
-        if u.path == "/api/report":
-            rid = parse_qs(u.query).get("id", [None])[0]
-            data = self._json_body()
-            # 删除是「移文件 + 追加墓碑」两步：任何一步抛异常都要回结构化错误，
-            # 不能让异常掀掉连接（旧实现的台账整文件重写在 Windows 上会 PermissionError）。
-            try:
-                return self._send(200, self._delete_report(rid, data))
-            except Exception as exc:                    # noqa: BLE001 - HTTP 边界
-                return self._send(500, {"ok": False,
-                                        "error": f"删除失败：{type(exc).__name__}: {exc}"})
-        if u.path == "/api/target":
-            rel = parse_qs(u.query).get("rel", [None])[0]
-            try:
-                return self._send(200, self._delete_target(rel))
-            except Exception as exc:                    # noqa: BLE001 - HTTP 边界
-                return self._send(500, {"ok": False,
-                                        "error": f"删除失败：{type(exc).__name__}: {exc}"})
-        if u.path == "/api/reports/batch":
-            data = self._json_body()
-            try:
-                return self._send(200, self._delete_reports(data))
-            except Exception as exc:                    # noqa: BLE001 - HTTP 边界
-                return self._send(500, {"ok": False,
-                                        "error": f"批量删除失败：{type(exc).__name__}: {exc}"})
-        if u.path == "/api/reports/trash":
-            rid = parse_qs(u.query).get("id", [None])[0]
-            data = self._json_body()
-            try:
-                result = (self._purge_trash_report(rid, data) if rid
-                          else self._empty_trash(data))
-                return self._send(200, result)
-            except Exception as exc:                    # noqa: BLE001 - HTTP 边界
-                return self._send(500, {"ok": False,
-                                        "error": f"彻底删除失败：{type(exc).__name__}: {exc}"})
-        if u.path == "/api/purpose/files":
-            pid = parse_qs(u.query).get("id", [None])[0]
-            ok = _delete_purpose_record(pid)
-            if not ok:
-                return self._send(200, {"ok": False,
-                                        "error": f"未找到目的文件：{pid or '（空 id）'}"})
-            return self._send(200, {"ok": True, "id": pid,
-                                    "items": _list_purpose_records()})
-        return self._send(404, {"error": "not found"})
+        return _http_routes().delete(self)
 
     # ----- 未实现的方法 -----
     # 基类 BaseHTTPRequestHandler 对 PUT/PATCH 直接回 **501 + HTML**：
@@ -1078,6 +949,8 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         try:
             data = json.loads(raw)
+            if data is None:
+                return {}
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}

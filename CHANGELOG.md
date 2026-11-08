@@ -44,6 +44,13 @@
 
 # 2026-11-05
 
+### 2026-11-08 · 修改 · 第二阶段 2.16：server 路由分发层
+
+- **文件**：新增 `interfaces/web/http_routes.py`（197 行）、`checks/test_http_routes.py`（6 项）；修改 `server.py`（1,976 → 1,849 行）、`docs/第二阶段整改任务单.md`（2.16）
+- **改了什么**：把 `Handler.do_GET/do_POST/do_DELETE` 的路径匹配、查询参数、GET/POST 简单路由表、DELETE 异常兜底收进 `HttpRoutes`；`server.py` 只保留三个传输入口的薄委托、`_http_routes()` 工厂和 `_send/_send_file/_guard_api/_json_body`。`/api/upload`、`/api/purpose/upload` 仍不读 JSON body；`/api/llm/reset` 改为无参调用（历史 Handler 方法本就是零参签名）；未知 POST 仍 404，DELETE 异常仍折成结构化 500。
+- **为什么**：Handler 只剩传输原语，却仍内嵌约 200 行路由表；同步/异步/删除各入口的路径知识无法脱离 HTTP 单测。抽出后新增端点只需改 `HttpRoutes`，传输层不再判断业务路径。`server.py` 顶部保留路由索引（实际分派在 `http_routes.py`），并保留 `_json_body` 的 `if data is None` 短路，避免源码级契约测试失去锚点。
+- **验证**：新增 `checks.test_http_routes` **6 项 OK**；修复全量 `tests` 首跑的 4 failures + 2 errors（路由源码契约 4 项、`/api/llm/reset` 零参调用 2 项）后，6 个失败用例 **6 项 OK**；`test_http_routes + test_server_tasks + test_subprocess_runner` **28 项 OK**；全量 `checks` **875 项 OK（skipped=11，14.863s）**；全量 `tests` **686 项 OK（skipped=1，342.405s）**；`py_compile`、`git diff --check` 通过。
+
 ### 2026-11-08 · 修改 · 第二阶段 2.15：server 同步审查适配层
 - **文件**：新增 `interfaces/web/review_sync.py`（118 行）、`checks/test_sync_review.py`（8 项）；修改 `server.py`（2,022 → 1,976 行）、`docs/第二阶段整改任务单.md`（2.15）
 - **改了什么**：把 `Handler._run_review` 的“目标解析 → 任务记录并发闸门 → 请求归一 → 建 Runner → TaskService.start_review_with → 结果/超时/错误映射”收进 `SyncReview`；解析器、Runner 工厂、任务服务、错误解析、时钟全部注入。`server.py` 保留 `_run_review` 薄包装与 `_sync_review()` 工厂；端点、响应字段、错误文案、退出语义均未改。
