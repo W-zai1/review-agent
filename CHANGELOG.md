@@ -44,6 +44,13 @@
 
 # 2026-11-05
 
+### 2026-11-08 · 修改 · 第二阶段 2.14：server 学习写入口适配层
+
+- **文件**：新增 `interfaces/web/learning_writes.py`（86 行）、`checks/test_learning_writes.py`（7 项）；修改 `server.py`（2,058 → 2,022 行）、`docs/第二阶段整改任务单.md`（2.14）
+- **改了什么**：把 `_add_annotation` / `_add_annotation_inner` / `_decide_candidate` 的 Token 鉴权、参数归一、`rule_learning` 调用与 `LearningError` 映射收进 `LearningWrites`；`rule_learning`、`ANNOTATION_TOKEN_ENV`、请求 headers、环境变量全部注入。`server.py` 保留三个薄包装与 `_learning_writes(self)` 工厂，路由、鉴权顺序、错误文案、返回结构均未改。
+- **为什么**：这两个接口是 HTTP 面上仅有的“学习”写入口，且鉴权失败必须在写标注/候选之前发生；逻辑留在 Handler 里时无法脱离 HTTP 单测。抽出后 `add_annotation` 先鉴权再进入 `add_annotation_inner`，`decide_candidate` 同样先鉴权；仍不触碰规则库，规则晋升只在 `tools/rule_promote.py`。
+- **验证**：`checks.test_learning_writes` **7 项 OK**；全量 `checks` **861 项 OK（skipped=11，21.631s）**；全量 `tests` **686 项 OK（skipped=1，387.520s）**；`py_compile` 通过。
+
 ### 2026-11-07 · 修改 · 第二阶段 2.13：server 规则/日志/完整性只读视图抽离
 
 - **文件**：新增 `interfaces/web/diagnostics.py`（245 行）；修改 `server.py`（2,221 → 2,058 行）、`docs/第二阶段整改任务单.md`（2.13）

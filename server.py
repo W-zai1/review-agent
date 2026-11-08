@@ -64,6 +64,7 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 from review_agent.infrastructure import ledger as ledger_store
 from interfaces.web import (
     diagnostics,
+    learning_writes,
     llm_settings,
     review_requests,
     review_start,
@@ -764,6 +765,15 @@ def _diagnostics():
     )
 
 
+def _learning_writes(handler):
+    """按当前 Handler 的 headers 与模块级学习实现构造写入口。"""
+    return learning_writes.LearningWrites(
+        rule_learning=rule_learning,
+        token_env=handler.ANNOTATION_TOKEN_ENV,
+        headers=handler.headers,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"ReviewAgentConsole/{version.__version__}"
 
@@ -1177,59 +1187,13 @@ class Handler(BaseHTTPRequestHandler):
     ANNOTATION_TOKEN_ENV = "REVIEW_AGENT_ANNOTATION_TOKEN"
 
     def _add_annotation(self, data):
-        """记录人工标注（可选鉴权 + 作者白名单）。"""
-        need = os.environ.get(self.ANNOTATION_TOKEN_ENV, "").strip()
-        if need and self.headers.get("X-Review-Token", "") != need:
-            # 开放部署时才启用；单机默认不设这个变量，控制台照常可用。
-            # 注意：即使鉴权通过，能否作为学习种子还取决于 config 里的作者白名单。
-            return {"ok": False,
-                    "error": f"标注需要 X-Review-Token 头（服务端已启用标注鉴权）"}
-        return self._add_annotation_inner(data)
+        return _learning_writes(self).add_annotation(data)
 
     def _add_annotation_inner(self, data):
-        """记录人工标注。
-
-        这是整个 HTTP 面上唯一与「学习」有关的写操作，而且它**只能写标注**：
-        规则库的写入只存在于 tools/rule_promote.py 且需要审批。
-        被审文档因此没有任何路径能影响自己的审查规则。
-        """
-        d = data or {}
-        try:
-            item = rule_learning.add_annotation(
-                kind=str(d.get("kind") or ""),
-                by=str(d.get("by") or "console"),
-                target_path=d.get("target_path"),
-                quote=d.get("quote"),
-                dimension=d.get("dimension"),
-                report_id=d.get("report_id"),
-                issue_id=d.get("issue_id"),
-                note=str(d.get("note") or ""),
-            )
-        except rule_learning.LearningError as e:
-            return {"ok": False, "error": str(e)}
-        return {"ok": True, "annotation": item}
+        return _learning_writes(self).add_annotation_inner(data)
 
     def _decide_candidate(self, data):
-        """人工审核决定：**只写候选文件的 human_review，不动规则库**。
-
-        这是 HTTP 面上第二个与「学习」有关的写操作（第一个是写标注）。
-        写规则库依然只存在于 tools/rule_promote.py —— 控制台没有那条路径。
-        """
-        need = os.environ.get(self.ANNOTATION_TOKEN_ENV, "").strip()
-        if need and self.headers.get("X-Review-Token", "") != need:
-            return {"ok": False,
-                    "error": "审核决定需要 X-Review-Token 头（服务端已启用鉴权）"}
-        d = data or {}
-        try:
-            r = rule_learning.decide_candidate(
-                d.get("candidate_id"),
-                str(d.get("decision") or ""),
-                note=str(d.get("note") or ""),
-                by=str(d.get("by") or "console"),
-            )
-        except rule_learning.LearningError as e:
-            return {"ok": False, "error": str(e)}
-        return {"ok": True, **r}
+        return _learning_writes(self).decide_candidate(data)
 
     def _start_review(self, data):
         return _review_starter().start(data)
