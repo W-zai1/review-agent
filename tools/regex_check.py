@@ -7,6 +7,7 @@
 import re
 import sys
 import json
+import os
 
 # 千分位 1,360 / 1,234.5 也要认：会计与财报文本的标准写法
 NUM_RE = re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(亿|万|%|倍)?")
@@ -20,19 +21,13 @@ CASUAL = ["吧", "呢", "啊", "嘛", "哎", "哦", "呗", "哈", "咋", "甭", 
 CASUAL_EXEMPT = re.compile(
     r"(哈尔滨|哈佛|哈哈|酒吧|网吧|氧吧|吧台|书吧|哈欠|哈萨克|哈希|哈工大|宁德时代|啊里)")
 EMOTION = ["我觉着", "我觉得", "太棒了", "泪目", "哭死", "绝绝子", "yyds", "栓Q", "爱了爱了"]
-# 无引号、中文键名、短值都是真实仓库里的常见写法，不能只认 "key = \"value\""
-SECRET_RE = re.compile(
-    r"(?:password|passwd|pwd|pw|secret|api[_-]?key|apikey|access[_-]?key|token|"
-    r"密钥|口令|密码|凭据)\s*[:=]\s*"
-    r"(?:[\"'][^\"']{3,}[\"']"          # 带引号（≥3）
-    r"|[A-Za-z0-9_\-\.]{5,}"              # 无引号裸值（≥5，覆盖 abc12 / 1234567）
-    r"|sk-[A-Za-z0-9]{6,})",                # sk- 前缀
-    re.I,
-)
-# 赋值右值是这些占位/类型名时不是密钥（避免 password = false 之类误报）
-SECRET_PLACEHOLDER = re.compile(
-    r"^[\"']?(null|none|true|false|undefined|nil|str|string|int|bool|bytes|"
-    r"os\.environ.*|getenv.*)[\"']?$", re.I)
+# 凭据正则只有一份：定义在 tools/secret_patterns.py（评审族）。
+# 这里保留旧导出名——agents/security-audit/checks.py 直接引用 SECRET_RE。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import secret_patterns  # noqa: E402
+
+SECRET_RE = secret_patterns.ASSIGNMENT_RE
+SECRET_PLACEHOLDER = secret_patterns.PLACEHOLDER_RE
 
 
 def _is_placeholder(raw):

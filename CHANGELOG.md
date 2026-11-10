@@ -42,6 +42,38 @@
 
 ---
 
+# 2026-11-10
+
+### 2026-11-10 · 修复 · 决策书 4.8：外部 linter 降级与密钥扫描边界
+
+- **文件**：修改 `tools/lint.py`（141 → 213 行）、`review_agent/capabilities/builtin_tools.py`（722 → 737 行）、`review.py`（4,992 → 5,000 行）、`checks/test_builtin_tools.py`（79 → 81 项）；新增 `checks/test_lint.py`（178 行 / 13 项）
+- **改了什么**：
+  1. `tools/lint.py:89 run_lint` 返回两条轴：`lint_status`（外部 linter：`ok/issues/skipped/failed`）、`secret_status`（纯 Python 密钥扫描：`ok/issues/failed`），另加 `exit_code`；旧键 `file/status/details/findings/secret_findings` 全部保留（`checks/test_lint.py::test_return_shape_is_unchanged_for_callers` 钉住）。
+  2. **补齐「起不来」的分支**：原来只捕 `FileNotFoundError` / `TimeoutExpired`，`PermissionError`（Windows WinError 5 / POSIX EACCES）与其余 `OSError` 会**越过整个密钥扫描块**上抛。现在分别落成 `lint_status="failed"` + 明确文案（「无执行权限」「无法执行」），且密钥扫描照跑。
+  3. **退出码判定**：`0` / `1` 视为正常结局（ruff/eslint 都用 1 表示「有告警」）；`≥2` 记 `failed` 并在 `details` 写「退出码 N」（以前 ruff 崩溃 rc=2 且无输出会被报成 `ok` + "无输出"）；`1` 却解析不出结构化告警也记 `failed`（「结果不可信」）。
+  4. **密钥扫描独立成败**：读文件 `OSError` 或正则引擎异常 → `secret_status="failed"` 并把原因拼进 `details`（以前 `secrets=[]`，等于把「没扫成」报成「没命中」）。
+  5. **综合 `status` 优先级**：有命中 → `issues`；无命中但任一轴 `failed` → `failed`；linter 未执行 → `skipped`；其余 `ok`。密钥命中不再**抹掉** linter 失败，而是两轴各记各的。
+  6. `review_agent/capabilities/builtin_tools.py:542-573 TextLintTool.execute`：`data` 增带 `lint_status` / `secret_status` / `exit_code`；降级时给 warning（「以下结果仅来自密钥扫描」/「密钥扫描未完成」）；`failed` 错误文案带 `lint=… secret=…`。
+  7. `review.py:1271-1285 static_scan`：`status=="failed"` 且无命中时工具日志记 `failed`（以前一律 `success`，tools.jsonl 里「没跑成」看不见），`summary` 追加两轴。
+- **为什么**：决策书 4.8 的实测缺口有三个，都不是文案问题：① 权限异常让密钥扫描**整段跳过**，文件等于没查；② 外部程序崩溃的退出码从未被看，rc=2 被当通过；③ 单轴 `status` 让「linter 失败」和「密钥命中」互相覆盖，降级不可见。本机 `ruff`/`eslint` 均未安装（`shutil.which` 皆 None），所以「正常 / 非零退出」两类用例只能注入假 `subprocess.run`——这与「无执行权限」不能靠改系统 ACL 反复复现是同一类理由，测试验的是 `run_lint` 的翻译层，不是 ruff 本身。
+- **验证**：`checks.test_lint` **13 项 OK**（五类结局 × 密钥必命中，含「读不到文件」「非代码文件」）；`checks.test_builtin_tools` **81 项 OK**（79 → 81，新增降级透出与双轴错误文案两项）；全量 `checks` **912 项 OK（skipped=11，18.960s）**，较基线 897 +15；全量 `tests` **686 项 OK（skipped=1，408.081s）**（与基线同数）；`python -m compileall` 通过；`git diff --check` 通过；`tools/changelog_guard.py` 退出码 0（改动=13 漏登记=0）；`tools/secret_scan.py` 扫描 259 文件命中 0。**临时项目副本 E2E**（`%TEMP%/ra_e2e`，不进仓库）：同一份含 `password = "hunter2xyz"` 的 `.py` 目标跑 4 次——① ruff 未安装：`static_scan` 摘要 `lint=skipped secret=issues`，报告 `issues=[STYLE-004 major]`；② 把 `python.exe` 复制成 `ruff.exe` 制造 rc=2：摘要 `ruff 异常退出（退出码 2）…（lint=failed secret=issues）`，密钥仍命中；③ PATH 里放同名目录制造 `[WinError 5] 拒绝访问`：摘要 `ruff 无执行权限，lint 未运行（仍执行密钥扫描）…（lint=failed secret=issues）`，**这正是整改前会整段跳过密钥扫描的分支**；④ `--engine v1`：`schema_version=1.0-v1-shadow`、`engine=architecture-v1`、`rule_execution.executors["STYLE-004"]="static_scan·lint + 密钥扫描"`，报告顶层键与基线逐一相同。四份报告 `integrity.verify_report` 均返回 `[true, "report 自洽通过"]`（report_hash 可复算）。六受保护目录指纹与基线**逐项相同**（outputs 96 / logs 6 / state 37 / ledger 2 / targets 139 / cache 277，manifest sha256 全等）。未改 `run_lint` 签名、未改报告 schema、未装新依赖。回滚：`tools/lint.py` / `builtin_tools.py` / `review.py` 还原为本次 diff 父版本并删 `checks/test_lint.py`（`checks/test_builtin_tools.py` 的两个新用例一并删除）。
+
+### 2026-11-10 · 修改 · 第三阶段第二刀：密钥正则收敛为单一定义（检测集合不变）
+
+- **文件**：新增 `tools/secret_patterns.py`（66 行，3 组正则常量、无逻辑）、`checks/test_secret_patterns.py`（11 项）；修改 `tools/regex_check.py`（268 → 263 行）、`tools/secret_scan.py`（266 → 251 行）、`docs/第三阶段-工具能力分类.md`（主表 46 → 47 行，全文 141 → 145 行）、`checks/test_tool_inventory.py`（行数断言 46 → 47）
+- **改了什么**：把两份互不相干的密钥正则收进 `tools/secret_patterns.py`——评审族 `ASSIGNMENT_RE` / `PLACEHOLDER_RE`（原 `tools/regex_check.py:24-35`，正则文本逐字保留）与交付族 `DELIVERY_PATTERNS`（原 `tools/secret_scan.py:52-71` 的 8 条，kind 与次序逐字保留）。`regex_check.SECRET_RE` / `SECRET_PLACEHOLDER`、`secret_scan.PATTERNS` 改为引用同一对象；同名导出保留，`agents/security-audit/checks.py:100`、`tools/lint.py:39` 的调用方零改动。`secret_scan.py` 不再需要 `import re`，`regex_check.py` 增加 `import os` 用于 `sys.path` 插入。**两族的检测集合没有合并**：评审族命中 `password: 123456` 这类赋值，交付族只认确定 token 格式。
+- **为什么**：这是 `docs/第三阶段-工具能力分类.md` §5-② 登记的待确认重叠。直接合并会把行为改坏——实测把评审族套到受跟踪文件上命中 50 处（README 示例、测试夹具），`secret_scan` 会在 CI 常红；反向给 `lint` 加 token 族则会改变审查 findings。所以本轮只收敛「正则文本只有一份」，两族仍各取子集；`checks/test_secret_patterns.py` 用身份断言（`is`，不是同值副本）与「两族互不污染」断言把这条边界钉住，另有一项 AST 断言保证 `secret_patterns.py` 里不长出函数/类。
+- **验证**：`checks.test_secret_patterns` **11 项 OK**、`checks.test_tool_inventory` **11 项 OK**（47 行同步）；全量 `checks` **897 项 OK（skipped=11，23.435s）**，较上一轮 886 +11；全量 `tests` **686 项 OK（skipped=1，522.978s）**；与 HEAD 逐字对拍：`SECRET_RE` / `PLACEHOLDER_RE` 的 pattern 与 flags 完全相同，交付族 8 条 `(kind, pattern)` 完全相同；`tools/changelog_guard.py` 退出码 0；`tools/secret_scan.py` 命中 0。未改报告 schema、未改公共 API 签名、未动 `outputs/ logs/ state/ ledger/ targets/ cache/`。回滚：删 `tools/secret_patterns.py` 与 `checks/test_secret_patterns.py`，把 `regex_check.py` / `secret_scan.py` / 文档 / 行数断言还原为本次 diff 的父版本。
+
+# 2026-11-09
+
+### 2026-11-09 · 新增 · 第三阶段第一刀：46 个 tools 模块的能力分类清单与守门测试
+
+- **文件**：新增 `docs/第三阶段-工具能力分类.md`（46 行主表 + 12 类总览 + 5 条待确认重叠）、`checks/test_tool_inventory.py`（11 项）
+- **改了什么**：给 `tools/` 全部 46 个模块逐行标注「主职责 / 归类 / 运行期可达 / 注册表工具 / 重复判定 / 处置 / 证据」；归类收敛为 12 类（甲方 11 类 + 工程运维）。结论：27 个运行期可达、19 个纯运维/CLI、34 个带 `__main__`；注册表 13 个工具（静态 12 + `research.web` 条件注册）覆盖 15 个模块；**需要合并的重复为 0 处**，`dup_audit` 唯一命中是 `arith_check`/`logic_checks` 的同名不同物 `run_all`；另登记 3 条待确认重叠（docx 文本抽取、密钥正则、学习配置默认值）与 1 处兼容壳（`integrity.verify_ledger`）的退出条件。新增守门测试 11 项：模块集合 == `tools/*.py`、归类白名单、可达性与实际 import 一致、注册表标注与实际注册表一致、处置取值合法。**未改任何运行代码、未删任何模块、未动 `tools/` 与 `review_agent/` 的依赖方向。**
+- **为什么**：甲方问题 5 的实质不是「文件太多」，而是没有一份能执行的能力边界——哪些模块是审查能力、哪些只是脚本，此前只散落在文档与记忆里。先分类再迁移，才能避免把服务/检查器硬包成 `BaseTool`（甲方明确反对）。把清单写成可被 `checks` 解析的表格，是为了让「新增工具忘了归类」在 CI 里直接变红，而不是等下一次架构审查再发现。
+- **验证**：`checks.test_tool_inventory` **11 项 OK**（其中「可达性取值」一项首次跑出 1 failure——`ocr` 写成「间接（`ingest`）」不符合三态取值，按约定改为「间接」后转绿，说明断言不是空跑）；全量 `checks` **886 项 OK（skipped=11，19.096s）**，较基线 875 项 +11；全量 `tests` **686 项 OK（skipped=1，370.141s）**；`tools/changelog_guard.py` 退出码 0、`tools/secret_scan.py` 扫描 255 个文件命中 0；`git diff --stat` 只含 `CHANGELOG.md` 与两个新文件。
+
 # 2026-11-05
 
 ### 2026-11-08 · 修改 · 第二阶段 2.16：server 路由分发层

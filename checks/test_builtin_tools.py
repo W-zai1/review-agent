@@ -661,6 +661,44 @@ class TextLintToolTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("ruff 崩了", result.errors[0])
 
+    def test_degraded_lint_keeps_secret_results_and_says_so(self):
+        """linter 失败但密钥扫描完成：结果要带出，且用 warning 说明降级。"""
+        class _Runner:
+            def __call__(self, path):
+                return {"file": path, "status": "issues",
+                        "details": "ruff 无执行权限，lint 未运行",
+                        "findings": [{"kind": "secret", "key": "password",
+                                      "line": 1, "preview": "password = \"hun…"}],
+                        "lint_status": "failed", "secret_status": "issues",
+                        "exit_code": None}
+
+        from review_agent.capabilities import TextLintTool
+        tool = TextLintTool(run_lint=_Runner())
+        registry = review.ToolRegistry()
+        registry.register(tool)
+        result, _ = run_tool(registry, "text.lint", {"path": "x.py"})
+        self.assertTrue(result.ok, result.errors[0] if not result.ok else "")
+        self.assertEqual(result.data["lint_status"], "failed")
+        self.assertEqual(result.data["secret_status"], "issues")
+        self.assertEqual(result.data["count"], 1)
+        self.assertTrue(any("仅来自密钥扫描" in w for w in result.warnings))
+
+    def test_failed_message_names_both_axes(self):
+        class _Runner:
+            def __call__(self, path):
+                return {"file": path, "status": "failed", "details": "读取失败",
+                        "findings": [], "lint_status": "failed",
+                        "secret_status": "failed", "exit_code": None}
+
+        from review_agent.capabilities import TextLintTool
+        tool = TextLintTool(run_lint=_Runner())
+        registry = review.ToolRegistry()
+        registry.register(tool)
+        result, _ = run_tool(registry, "text.lint", {"path": "x.py"})
+        self.assertFalse(result.ok)
+        self.assertIn("lint=failed", result.errors[0])
+        self.assertIn("secret=failed", result.errors[0])
+
     def test_empty_path_is_a_failure(self):
         result, _ = self._run(path="  ")
         self.assertFalse(result.ok)

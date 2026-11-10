@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -31,6 +30,10 @@ from typing import Iterable, Iterator
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_BYTES = 2 * 1024 * 1024
+
+# 凭据正则只有一份：定义在 `tools/secret_patterns.py`（交付族）。
+sys.path.insert(0, str(ROOT / "tools"))
+import secret_patterns  # noqa: E402
 
 SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
@@ -49,26 +52,8 @@ SAFE_FIXTURES = {
     "sk-" + "abcdefghijklmnopqrstuvwxyz123456": {"checks/test_invariants.py"},
 }
 
-PATTERNS = (
-    ("OpenAI/DeepSeek 风格 API Key",
-     re.compile(r"sk-[A-Za-z0-9]{20,}")),
-    ("AWS Access Key",
-     re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")),
-    ("GitHub Token",
-     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
-    ("Slack Token",
-     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
-    ("Google API Key",
-     re.compile(r"AIza[0-9A-Za-z_-]{35}")),
-    ("Stripe Secret Key",
-     re.compile(r"sk_live_[A-Za-z0-9]{20,}")),
-    ("私钥文件",
-     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
-    ("疑似硬编码凭据",
-     re.compile(
-         r"(?i)\b(?:api[_-]?key|secret|token|password)\b\s*[:=]\s*"
-         r"[\"'][^\"'\s]{20,}[\"']")),
-)
+# 交付族正则定义在 tools/secret_patterns.py；这里保持同名、同序、同一个对象。
+PATTERNS = secret_patterns.DELIVERY_PATTERNS
 
 
 class SecretScanError(RuntimeError):

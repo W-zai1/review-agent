@@ -513,7 +513,10 @@ class TextLintTool(BaseTool):
 
     状态语义（沿用 `tools/lint.py`）：`ok` / `issues` / `skipped` / `failed`。
     `skipped` 不是成功（例如文件后缀不支持），要以 warning 讲出来；
-    `failed` 是工具坏了，按失败返回。
+    `failed` 是两轴都没产出可用结果，按失败返回。
+    另外两轴分开报（`lint_status` / `secret_status`）：外部 linter 失败但密钥
+    扫描跑完时，结果照常返回，并把「仅密钥结果可用」作为 warning 说出来——
+    这正是决策书 4.8 要的「降级不等于失明」。
     """
 
     name = "text.lint"
@@ -542,17 +545,29 @@ class TextLintTool(BaseTool):
         status = str(result.get("status") or "")
         details = result.get("details")
         findings = tuple(result.get("findings") or ())
+        lint_status = str(result.get("lint_status") or "")
+        secret_status = str(result.get("secret_status") or "")
         if status == "failed":
             return ToolResult.failure(
-                f"lint 执行失败（{path}）：{details or '外部工具返回失败'}")
-        warnings = ()
+                f"lint 执行失败（{path}）：lint={lint_status or '未知'} "
+                f"secret={secret_status or '未知'}；{details or '外部工具返回失败'}")
+        warnings = []
         if status == "skipped":
-            warnings = (f"lint 未执行：{details or '该类型文件不跑 lint'}",)
+            warnings.append(f"lint 未执行：{details or '该类型文件不跑 lint'}")
+        # 两轴分开报：密钥扫描跑完不等于 lint 跑完，反之亦然。
+        if lint_status == "failed":
+            warnings.append(
+                f"外部 lint 失败（{details or '原因未知'}）；以下结果仅来自密钥扫描")
+        if secret_status == "failed":
+            warnings.append("密钥扫描未完成，硬编码密钥类问题未覆盖")
         return ToolResult.success(
             data={"file": result.get("file") or path, "status": status,
                   "details": details, "findings": findings,
-                  "count": len(findings)},
-            warnings=warnings,
+                  "count": len(findings),
+                  "lint_status": lint_status or None,
+                  "secret_status": secret_status or None,
+                  "exit_code": result.get("exit_code")},
+            warnings=tuple(warnings),
             untrusted=True,
         )
 

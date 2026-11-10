@@ -1271,6 +1271,14 @@ def static_scan(s: Session, target_path: Path, text, rules, target_type, force=F
     status = "success"
     if result.get("status") == "skipped" and not findings:
         status = "skipped"
+    elif result.get("status") == "failed" and not findings:
+        # 外部 linter / 密钥扫描都没产出结果：工具日志要如实记 failed，
+        # 不然「没跑成」在 tools.jsonl 里会显示成 success（决策书 4.8）。
+        status = "failed"
+    lint_status = result.get("lint_status")
+    secret_status = result.get("secret_status")
+    if lint_status or secret_status:
+        summary = f"{summary}（lint={lint_status or '?'} secret={secret_status or '?'}）"[:200]
     s.tool("static_scan", target_path.name, summary,
            (time.perf_counter() - tr) * 1000, status)
 
