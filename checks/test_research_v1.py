@@ -60,6 +60,7 @@ from review_agent.domain import (                           # noqa: E402
     SourceRef,
     Stage,
     Verdict,
+    Verification,
 )
 from review_agent.runtime import NodeResult, RunState, advance  # noqa: E402
 from review_agent.runtime.nodes import (                     # noqa: E402
@@ -495,6 +496,42 @@ class ShadowReportResearchTests(unittest.TestCase):
         self.assertEqual(row["source_ref"], "https://example.com/a")
         self.assertEqual(row["note"], "外部检索：refuted")
         self.assertEqual(row["issue_id"], "ISS-0001")
+
+    def test_contradicted_quote_row_carries_the_evidence_id(self):
+        """反证要能从报告读出来：强度 + 指名的外部证据编号（决策书 4.4）。"""
+        from review_agent.domain import FindingOrigin
+        quote = Evidence(id="EV-0001", run_id=RUN_ID,
+                         kind=EvidenceKind.QUOTE, quote=TEXT,
+                         location=Location("第 1 句", 1, 0, len(TEXT)),
+                         verification=Verification.ANCHORED,
+                         verified_by="review.s4.evidence_anchor",
+                         strength=EvidenceStrength.CONTRADICTED,
+                         contradicted_by=("EV-0002",),
+                         finding_ids=("ISS-0001",))
+        source = Evidence(id="EV-0002", run_id=RUN_ID,
+                          kind=EvidenceKind.EXTERNAL_SOURCE, quote="来源片段",
+                          location=Location("第 1 句", 1),
+                          source_ref="https://example.com/a",
+                          source=SourceRef(url="https://example.com/a"),
+                          verified_by="research.web", finding_ids=("ISS-0001",))
+        finding = Finding(id="ISS-0001", run_id=RUN_ID, dimension="fact",
+                          severity=Severity.MAJOR, quote=TEXT,
+                          location=Location("第 1 句", 1), confidence=0.8,
+                          origin=FindingOrigin.RESEARCH)
+        state = RunState(
+            review_id=REVIEW_ID, run_id=RUN_ID, stage=Stage.FINALIZE,
+            profile=ReviewProfile(id="doc-review", name="文档审查", version="1"),
+            completed_stages=STAGE_ORDER, findings=(finding,),
+            evidence=(quote, source),
+            decision=Decision(id="DEC-0001", run_id=RUN_ID, verdict=Verdict.WARN,
+                              rationale="存在 1 条 major"),
+            artifacts={"target_text": TEXT})
+        report = build_shadow_report(state)
+        rows = {row["evidence_id"]: row for row in report["evidence"]}
+        self.assertEqual(rows["EV-0001"]["strength"], "contradicted")
+        self.assertEqual(rows["EV-0001"]["contradicted_by"], ["EV-0002"])
+        self.assertEqual(rows["EV-0001"]["verification"], "anchored")
+        self.assertIn("反证 EV-0002", render_shadow_md(report))
 
     def test_markdown_renders_research_section(self):
         report = build_shadow_report(self._state(
