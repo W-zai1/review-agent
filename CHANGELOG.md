@@ -42,7 +42,83 @@
 
 ---
 
+# 2026-11-12
+
+### 2026-11-12 · 修改 · 决策书 4.4：被外部检索反驳的引用证据落 `CONTRADICTED`
+
+- **文件**：`review_agent/runtime/nodes/evidence_assess.py`（新增 `link_contradictions()`，`EvidenceAssessorNode.run` 评估前先连反证；模块说明补反证链一段）；新增 `checks/test_evidence_contradiction.py`（11 项）；`docs/CURRENT_STATUS.md`（§4 / §5 / §6 / §7）
+- **改了什么**：
+  1. `evidence_assess.py` 加纯函数 `link_contradictions(evidence)`：按 `finding_ids` 分组，若某条发现同时挂着 `EXTERNAL_SOURCE` 证据（有 `source`）与 `QUOTE` 证据，则把 `QUOTE` 那条 `replace(contradicted_by=(外部证据 id,))`；反证编号按证据顺序去重，已有反证不覆盖，其余证据原样返回。
+  2. `EvidenceAssessorNode.run()` 用 `assess_evidence(item) for item in link_contradictions(state.evidence)`——`assess_evidence` 开头的 `if evidence.contradicted_by: → CONTRADICTED` 因而第一次在真实链路里可达；判定表其余分支一行未改。
+  3. 判定依据写进 docstring：`EXTERNAL_SOURCE` 全仓只有 research 节点生产，且只在 `ClaimVerdict.status == "refuted"` 时生产（`evidence_from_verdict` 只在 `outcome.refuted` 循环里被调用），所以「外部证据挂在这条发现上」等价于「这条主张被外部检索反驳」，不必解析 `note` 文案。
+  4. 新增 `checks/test_evidence_contradiction.py`：7 项纯函数用例（只连该连的、别的证据一个字段不动、多来源按序去重、已有反证不覆盖、重复调用同结果）+ 4 项节点用例（反证进 `evidence_revisions`、`advance()` 落盘后仍是 `CONTRADICTED` 且 `verification` 仍 `ANCHORED`、未被反驳的引用仍 `VERIFIED`、两条发现一真一假不串台）；`checks/test_research_v1.py` 补 1 项报告层用例（`report["evidence"]` 带 `strength="contradicted"` 与 `contradicted_by`，Markdown 渲染出「反证 EV-0002」——报告 schema 未改，这两个字段本就在）。
+- **为什么**：4.4 的原始例子是「材料写营收 100 亿，quote 逐字命中 → 标 VERIFIED，外部来源却说 80 亿」。第二根轴 `EvidenceStrength` 与硬不变量早已就位，但 `grep contradicted_by=` 全仓只有序列化层——生产链从不产生 `CONTRADICTED`，读者看到的永远是「已核验」。这是「锚定成功 ≠ 事实成立」在模型上唯一说不出口的地方，所以先接反证链，不动判定表本身。
+- **验证**：`checks.test_evidence_contradiction` **11 项 OK**、`checks.test_research_v1` **35 项 OK**（含新增报告层 1 项）；证据相关 7 个套件 **111 项 OK**（1.022s）；全量 `checks` **966 项 OK（skipped=11，30.146s）**（基线 954，+12）；`compileall`（只跑源码目录）通过；`git diff --check` 通过；`secret_scan` **264 文件 / 命中 0**；`changelog_guard --explain` 退出 0；六受保护目录指纹 **ALL_SAME**。回滚：删 `link_contradictions` 与节点里那一行调用、删 `checks/test_evidence_contradiction.py`；证据对象与报告 schema 均未改，历史报告不受影响。
+- **未覆盖（需决策）**：`supported` 主张仍不产证据，验收样本②（引用存在且独立来源支持）目前只能从报告的 `research.supported` 段看出，证据层看不到「支持」；样本⑥（仅能证明文档写过）仍靠 `PARTIAL` 的语义区分，未单独建「文本存在性」判定——这两项对应决策书 4.4 的 B/C 档，未在本轮范围内实施。
+
+### 2026-11-12 · 修改 · 决策书 4.6 收尾：LLM 外发走 `chat()` 总闸口，审计失败不发
+
+- **文件**：`tools/llm_client.py`（新增 `EgressScope` + 4 个 contextvar 函数，`chat()` 拆成闸口 + `_chat_once`）；`review.py`（`run_one` 与 `run_typed_pipeline` 各补一次 `update_egress_scope`）；`interfaces/cli/commands.py`（`_run_review` 设/复位上下文，原体改为 `_run_review_body`）；`server.py`（`_record_egress` 返回 bool、新增 `_egress_begin` / `_egress_end` / `_EgressBlocked`、`_run_review_job` 起子进程前登记、`_test_llm` 套探针上下文）；新增 `checks/test_llm_egress.py`（13 项）；`checks/test_server_governance.py`（1 项契约更新）；`docs/CURRENT_STATUS.md`（§4 / §5 / §6 / §7）
+- **改了什么**：
+  1. `tools/llm_client.py` 加 `EgressScope`（`begin` 写 `phase="attempt"`，`end` 写配对 `phase="result"`，字段只含 model / host / `prompt_chars` / `review_id` / `run_id` / `target` / `duration_ms` / `usage` / `error[:200]`）；模块级 `ContextVar` 让 `chat()` 感知「这次外发属于哪个任务」。
+  2. `chat()` 改成薄闸口：有上下文时先 `begin`，返回 `None` 则 `raise LLMError("外发审计写入失败（决策书 4.6），已阻止本次模型调用")`，**不发起 HTTP**；成功/失败/异常都写 `end`；每次 `chat()` 只记一对行（重试不增行）。原重试主体整体改名为 `_chat_once`，无上下文时行为逐字节不变。
+  3. `review.py` 在 `run_one` 的 `run_id` 之后、`run_typed_pipeline` 的 `initial_state` 之后各调一次 `llm_client.update_egress_scope(review_id=…, run_id=…, target=…)`，把审查号补进上下文。
+  4. CLI 入口 `interfaces/cli/commands.py::_run_review` 建 `EgressScope(runtime.STATE/"egress.log", target=…)` 并 `try/finally` 复位；服务端子进程（`--review-id`）同样走这条入口，故 OCR / 目的裁决 / 分块语义审的外发自动纳入。
+  5. `server.py` 的 `_record_egress` 从「吞 OSError 只打印」改为返回 `True/False`（`enabled=False` 视为成功）；`_run_review_job` 在 `Popen` **之前** `_egress_begin`，失败抛 `_EgressBlocked` → 任务落 `status="error"` / `error_kind="system"`、不启动子进程；子进程结束后 `_egress_end` 配对（ok/failed + 耗时 + 错误文本）。`_test_llm` 的连通性探针也套上下文（target `web:test-connection`）。
+  6. `checks/test_server_governance.py` 的 `test_write_failure_does_not_raise` 改名为 `test_write_failure_returns_false_without_raising`：契约从「静默吞掉」变成「不抛但如实返回 False」——这是 4.6 的行为变更，不是为了让测试变绿。
+- **为什么**：4.6 的验收是「审计登记失败时阻止外发；请求成败都能关联到 attempt」。Research 已在上一轮改完，但 LLM 才是外发主路径（审查、OCR、目的裁决、Web 探针都经 `llm_client.chat()`）：原实现先调用后记录、写失败只 print，`state/` 不可写时全文照样送出去且无记录；`server.py` 的 `_record_egress` 同样只 print。只在各调用方补记录会漏（7 个调用点），故把闸口放在唯一 HTTP 出口。
+- **验证**：`checks.test_llm_egress` **13 项 OK**（无上下文不写日志；attempt 先于 `urlopen`；attempt/result 配对与 usage；429 重试只一对行；写失败抛 `LLMError` 且 `urlopen` 未被调用；HTTP 失败写 failed 再抛；`update_egress_scope` 补号；CLI 设/复位上下文；server 登记失败不起子进程）；全量 `checks` **954 项 OK（skipped=11，21.441s）**（基线 941，+13）；`compileall` 通过；`git diff --check` 通过；`secret_scan` **263 文件 / 命中 0**；`changelog_guard --explain` 退出 0（改动 20 / 漏登记 0）。临时副本 E2E（本地假 OpenAI 服务，`REVIEW_AGENT_LLM_CACHE=0`）：legacy `--llm` 5 次 HTTP → 5 对 attempt/result，`review_id`/`run_id`/`target`/`prompt_chars` 齐全、日志不含原文；v1 `--llm` 同样 5 对且 `run_id=R-…-RUN01`；把 `state/` 换成普通文件后 → **0 次 HTTP**、报告 `llm.errors` 写明「外发审计写入失败（决策书 4.6），已阻止本次模型调用」、`egress.log` 不存在。回滚：还原 `tools/llm_client.py` 的 `chat()` 与 scope 段、`server.py` 的 egress 段、`review.py`/`commands.py` 的接线，删 `checks/test_llm_egress.py`；`state/egress.log` 仅追加不删改。
+
+# 2026-11-11
+
+### 2026-11-11 · 修改 · 决策书 4.6：Research 外发审计改为「先登记、写不进不发、结束后配对」
+
+- **文件**：`review.py`（`make_research_executor` + 4 个新 helper，约 4547-4630 行）；新增 `checks/test_research_egress.py`（8 项）；`checks/test_research_v1.py`（1 处断言随记录结构更新）；`docs/CURRENT_STATUS.md`（§4 / §5 / §6 / §7）
+- **改了什么**：
+  1. `review.py` 的 `make_research_executor` 在两个分支（`registry is None` 直调 `research.verify`、`use_tool=True` 走 `registry.execute("research.web")`）之前先调 `_begin_research_egress(...)` 写 `phase="attempt"` 行；返回 `None`（写失败）时 `tool_errors.append("外发审计写入失败，已阻止外部检索（4.6 前置策略）")` 并 `continue`，**不发起任何外部请求**。
+  2. 请求结束后（成功 / 工具失败 / 抛异常）都写 `phase="result"` 行，与 attempt 用 `attempt_id` 配对：`result`（ok/failed）、`duration_ms`、`domains`（从 sources 的 hostname 去重）、`sources` 条数、`error`（截断 200 字）。
+  3. 记录只带元信息：`run_id / target(review_id) / detail("外部检索：实体指标（年份）") / query_sha256[:16] / query_chars / providers`，不落原文数值、不落 prompt。
+  4. 删除旧的 `_record_research_egress(review_id, claim)`（调用后才登记、写失败只 print），换成 `_write_egress` / `_research_claim_detail` / `_begin_research_egress` / `_end_research_egress`。
+  5. 未动 `server.py` 的 LLM 外发路径（按 A 档范围），它仍是「先调用后记录、写失败只打印」，已登记进 `CURRENT_STATUS.md` §5 的 4.6 剩余项。
+- **为什么**：决策书 4.6 的验收是「审计登记失败时阻止外发；请求成功或失败都能关联到一次 attempt 记录」。原实现里 `research.web` 是调用之后才登记，写失败只打印——如果 `state/` 不可写，外发照样发生且没有记录；`use_tool=False` 的分支更是完全没有外发记录。
+- **验证**：`checks.test_research_egress` **8 项 OK**（含「审计失败时假 verify 被调即报错」「异常后仍有 attempt+failed result」）；`checks.test_research_v1` **34 项 OK**；全量 `checks` **941 项 OK（skipped=11，16.118s）**（基线 933，+8）；`secret_scan` **262 文件 / 命中 0**；`changelog_guard --explain` 退出 0（改动 10 / 漏登记 0）；`git diff --check` 通过；六受保护目录指纹与基线逐项相同。回滚：还原 `review.py` 的 executor 段与 4 个 helper、删除 `checks/test_research_egress.py`，`state/egress.log` 仅追加不删改。
+
+### 2026-11-11 · 新增 · 决策书 4.2：任务生命周期 7 条验收固化 + 当前状态纠偏
+
+- **文件**：新增 `checks/test_task_acceptance.py`（12 项）；修改 `docs/CURRENT_STATUS.md`（§4 / §5 / §6 / §7 与最后核对日期）
+- **改了什么**：
+  1. 新增 `checks/test_task_acceptance.py`（6 个类 / 12 项），不重复单测细节，直接对应决策书 4.2 的 7 条验收：① 记录优先于 `JOBS` 视图（`test_task_record_wins_over_stale_jobs_view`），只有视图的老任务仍按视图显示（`test_jobs_only_task_without_record_is_still_shown`）；② CLI 与 Web 同语义（`test_cli_builds_the_same_task_service` mock `review.make_task_service`，断言 `_run_v1_via_task` 走 `start_review(engine="v1")`；`test_make_task_service_persists_to_state_tasks` 断言存储为 `state/tasks/`）；③ 同一幂等 key 两次 `start_async` 只建一个任务；④ 取消后 runner 返回 COMPLETED 不覆盖 CANCELLED；⑤ 取消前已产出报告则保留 `report_path`、未产出则为 `None`，状态都是 CANCELLED；⑥ `recover()` 可区分：cancelled 终态不复活、running 无检查点 → orphaned + FAILED、running 有未过期检查点 → resumable；⑦ 并发两个任务各自状态不互相覆盖。
+  2. `docs/CURRENT_STATUS.md` 纠偏：§5 原结论「4.2 仍有 `JOBS` / `TASKS` 第二套视图 → 两个事实来源」是过时判断（`server.py:91` 注释与 `task_lifecycle.py:69-78` 都明确记录优先），改为「已统一；剩余 CLI 没有取消/恢复入口」；§4 增加 4.2 已完成行；§6 数字更新为 933 项 / 261 文件；§7 阶段 1 措辞同步；最后核对日期改 2026-11-11。
+- **为什么**：4.2 的核心整改在生产代码里已由阶段二 2.15/2.16 落地（`TaskService` 唯一业务事实源、`JOBS` 只是前端视图、取消/报告/检查点一致性在 `tasks.py:403-428`、`:561-622` 与 `interfaces/web/task_lifecycle.py:62-150` 中），但没有任何一组测试直接对应决策书那 7 条验收，回归时只能靠零散单测推断；同时 `CURRENT_STATUS.md` 的旧结论会让下一轮把已完成的活重做一遍。本轮只补验收测试与文档纠偏，不改生产代码。
+- **验证**：`checks.test_task_acceptance` **12 项 OK（0.387s）**；全量 `checks` **933 项 OK（skipped=11，19.833s）**（基线 921，+12）；`python tools/secret_scan.py` **261 文件 / 命中 0**；`python tools/changelog_guard.py --explain` 退出 0；`git diff --check` 通过；六受保护目录指纹与基线逐项相同；未改报告 schema、未动 `outputs/logs/state/ledger/targets/cache`。回滚：删除 `checks/test_task_acceptance.py`，还原 `docs/CURRENT_STATUS.md` 对应四节即可，无数据迁移。
+
+---
+
 # 2026-11-10
+
+### 2026-11-10 · 新增 · 决策书 4.11：建立当前状态唯一来源 docs/CURRENT_STATUS.md
+
+- **文件**：新增 `docs/CURRENT_STATUS.md`（10 节）；修改 `docs/README.md`（索引表 +1 行）
+- **改了什么**：
+  1. 新建 `docs/CURRENT_STATUS.md`，固定回答六件事：版本与运行环境、**正式执行链**（v1 默认、legacy 冻结为回滚路径）、能力现状（两套 Agent、工具层、TaskService、完整性、发布检查）、已完成整改（4.8 / 4.3 / 阶段二 2.1–2.16 / 阶段三第二刀）、**已知问题对照 4.1–4.12**、下一阶段任务（阶段 1 → 4）；另附测试质量基线、数据与发布边界、文档地图、复核命令。
+  2. 每条结论尽量带 `file:line` 或可复跑命令（如 `review.py:4245-4255` 缺省 v1、`server.py:1674` 侧车缺省 v1、`shadow_report.py:32-33` 报告 schema），便于下一轮直接核对而不是靠记忆。
+  3. `docs/README.md` 索引表新增一行指向本文件，明确「当前状态看这里，历史流水看 CHANGELOG」。
+  4. 本文件只陈述**现状与差距**，不复制决策书全文、不写计划中的功能清单（那些留在决策书与 REFACTOR_PLAN）。
+- **为什么**：决策书 4.11 要求「当前版本 / 正式执行链 / 已完成能力 / 已知问题 / 下一阶段任务」有唯一落点，且「每次阶段整改结束必须更新当前状态，不允许只更新 CHANGELOG」。此前这些信息散落在 README 开头、CHANGELOG 顶部和对话里，接手的人要拼三处才能知道「现在到底跑哪条链、哪些是已知坑」。
+- **验证**：`python tools/changelog_guard.py` 退出码 0（改动含本文件与 `docs/CURRENT_STATUS.md`、`docs/README.md`，漏登记 0）；`python tools/secret_scan.py` 扫描命中 0；文中引用的测试数字（checks 921 / tests 686 / secret_scan 259 / ledger 290）与 2026-11-10 实测一致；未改任何代码、未动六受保护目录。回滚：删除 `docs/CURRENT_STATUS.md` 与 `docs/README.md` 索引行即可。
+
+### 2026-11-10 · 修改 · 决策书 4.3：发布包白名单与运行时数据边界
+
+- **文件**：修改 `tools/release_check.py`（202 → 278 行）、`checks/test_release_check.py`（5 → 14 项）、`docs/RELEASE_CHECKLIST.md`（42 → 76 行）
+- **改了什么**：
+  1. `tools/release_check.py:56-83` 新增 `RELEASE_TOP_LEVEL` 顶层白名单（24 项：`.github/.githooks/.gitignore/agents/checks/config/demo/docs/holdout/interfaces/knowledge/review_agent/rules/tools/web` + `review.py/server.py/start-console.bat/requirements.txt/VERSION/README.md/CHANGELOG.md/review-agent-framework.md/Agent_逐步优化提示词.md`）。`outputs/logs/state/ledger/targets/cache/.git/__pycache__` 不在名单里，**天然打不进包**。
+  2. 同处新增 `_FORBIDDEN_IN_PACKAGE` 正则：即使落在白名单目录内，`.env*`、`*.local.json`、`config/rules.state.json`、`config/favorites.json`、`*.pem`、`*.key`、`*.pyc` 一律拒绝——`.gitignore` 只决定“是否被跟踪”，本检查决定“是否被打包”，两者不再互相替代。
+  3. `tools/release_check.py:133-154` 新增 `snapshot_manifest()`（文件数 / 总字节 / 顶层条目）与 `snapshot_violations()`（白名单外顶层条目 + 禁止文件，去重后返回）。
+  4. `tools/release_check.py:236-243 check()` 在导出快照后**先打印清单、再断言边界**，最后才做密钥扫描与 `checks/`；违规信息最多列 20 条。
+  5. `checks/test_release_check.py:64-133` 新增 `SnapshotBoundaryTests` 9 项：允许快照零违规、`outputs/` 被拒、白名单外顶层目录被拒、`llm.local.json` 被拒、`.env` 被拒、`*.key` 被拒、运行时状态文件被拒、清单计数正确、**真实仓库里被跟踪的顶层条目必须全部在白名单内**（防止有人加了目录忘了登记白名单，也防止白名单写成摆设）。
+  6. `docs/RELEASE_CHECKLIST.md` 新增第 0 节（本次凭据与历史核查结论）与 §2.1（自动检查覆盖什么/不覆盖什么、新增顶层目录必须改白名单）。
+- **为什么**：决策书 4.3 的验收里有一条“发布包清单可自动检查”，整改前只有 `release_check.py` 的密钥扫描和“工作区必须干净”两道闸，`outputs/` 等目录是否进包完全依赖 `.gitignore` 是否写全；只要有人 `git add -f` 或改 `.gitignore`，运行数据、本地密钥配置就会静默进包。白名单是“想清楚再发布”，禁止文件规则是第二道锁，二者都不依赖 `.gitignore`。
+- **验证**：`checks.test_release_check` **14 项 OK**（5 → 14，+9；其中「跟踪条目必须全在白名单」一项在没有 `.git` 的解压目录里自动 skip）；全量 `checks` **921 项 OK（skipped=11，19.012s）**（基线 912，+9）；`python -m compileall` 通过；`git diff --check` 通过；`tools/secret_scan.py` 扫描 259 文件命中 0；`tools/changelog_guard.py` 退出码 0。**临时克隆 E2E**（`%TEMP%/ra_relchk/repo`，不碰用户仓库）：① 只含本轮修改 → `快照清单：258 个文件 / 3766759 字节 / 顶层 24 项` → 通过；② 强制暂存 `outputs/R-9.json` → 退出 1，`顶层条目不在发布白名单：outputs`；③ 强制暂存 `config/llm.local.json` → 退出 1，`禁止进入发布包：config/llm.local.json`；④ 强制暂存 `notes/x.txt` → 退出 1，`顶层条目不在发布白名单：notes`；⑤ 强制暂存 `docs/server.key` → 退出 1，`禁止进入发布包：docs/server.key`；⑥ 拒绝后复位再跑正向 → 再次通过（证明检查可重复）。**空目录验收**（`git archive` → 全新目录解压）：包内无 `outputs/logs/state/ledger/targets/cache/config/*.local.json`，`checks` **921 项 OK（skipped=42）**，`python review.py --list-agents` 正常列出 doc-review / security-audit。六受保护目录指纹与基线逐项相同。未改 Git 历史、未轮换密钥（历史核查结论：`config/llm.local.json` 从未进过 Git，47 个提交 / 966 个 blob 的 193 处命中全为占位符与测试夹具）。回滚：还原 `tools/release_check.py` 与 `checks/test_release_check.py` 至本次 diff 父版本，`docs/RELEASE_CHECKLIST.md` 删第 0 节与 §2.1 即可，无数据迁移。
 
 ### 2026-11-10 · 修复 · 决策书 4.8：外部 linter 降级与密钥扫描边界
 

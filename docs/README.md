@@ -5,6 +5,7 @@
 
 | 文档 | 回答什么问题 | 谁必须读 |
 | --- | --- | --- |
+| [CURRENT_STATUS.md](CURRENT_STATUS.md) | **现在是什么状态**：版本、正式执行链、能力、已知问题、下一阶段任务 | 所有人（先读这个） |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 分几层、依赖方向、为什么这样选、旧代码边界在哪 | 所有人 |
 | [DOMAIN_MODEL.md](DOMAIN_MODEL.md) | 六个对象与值对象、状态机、旧报告怎么映射 | 改模型/报告/裁定的人 |
 | [AGENT_RUNTIME.md](AGENT_RUNTIME.md) | 节点清单、八阶段、失败与恢复语义 | 改流程/加节点的人 |
