@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -46,6 +47,48 @@ REQUIRED_PATHS = (
     "config/retention.yaml",
     "tools/double_run.py",
     "tools/secret_scan.py",
+)
+
+# 发布快照的顶层白名单：只允许这些条目出现在对外包里。
+# 新增顶层目录/文件时必须显式加到这里——“想清楚再发布”，
+# 而不是“暂存区里有什么就打包什么”。运行目录（outputs/logs/state/
+# ledger/targets/cache）与 .git 不在名单里，天然被挡住。
+RELEASE_TOP_LEVEL = frozenset({
+    ".github",
+    ".githooks",
+    ".gitignore",
+    "Agent_逐步优化提示词.md",
+    "CHANGELOG.md",
+    "README.md",
+    "VERSION",
+    "agents",
+    "checks",
+    "config",
+    "demo",
+    "docs",
+    "holdout",
+    "interfaces",
+    "knowledge",
+    "requirements.txt",
+    "review-agent-framework.md",
+    "review.py",
+    "review_agent",
+    "rules",
+    "server.py",
+    "start-console.bat",
+    "tools",
+    "web",
+})
+
+# 即使落在白名单目录内，这些文件也不许进包：本地密钥配置、运行时状态
+# 和证书私钥都不属于源码交付物。.gitignore 只影响“是否被跟踪”，
+# 本检查影响“是否被打包”，两者不能互相替代。
+_FORBIDDEN_IN_PACKAGE = re.compile(
+    r"(^|/)(\.env(\.[^/]*)?"
+    r"|[^/]+\.local\.json(\.tmp)?"
+    r"|rules\.state\.json(\.tmp)?"
+    r"|favorites\.json(\.tmp)?"
+    r"|[^/]+\.(pem|key|pyc|pyo))$"
 )
 
 
@@ -85,6 +128,30 @@ def require_clean(root: Path) -> None:
 
 def missing_required(root: Path) -> list[str]:
     return [p for p in REQUIRED_PATHS if not (root / p).is_file()]
+
+
+def snapshot_manifest(root: Path) -> dict[str, object]:
+    """统计快照清单：发布检查把它打印出来，便于人工核对“打进去了什么”。"""
+    files = [p for p in root.rglob("*") if p.is_file()]
+    top_level = sorted({p.relative_to(root).parts[0] for p in root.rglob("*")})
+    return {
+        "files": len(files),
+        "bytes": sum(p.stat().st_size for p in files),
+        "top_level": top_level,
+    }
+
+
+def snapshot_violations(root: Path) -> list[str]:
+    """返回发布包里不该出现的东西：白名单外的顶层条目、禁止文件。"""
+    problems: list[str] = []
+    for entry in sorted(root.iterdir()):
+        if entry.name not in RELEASE_TOP_LEVEL:
+            problems.append(f"顶层条目不在发布白名单：{entry.name}")
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if _FORBIDDEN_IN_PACKAGE.search(rel):
+            problems.append(f"禁止进入发布包：{rel}")
+    return list(dict.fromkeys(problems))
 
 
 def _safe_members(root: Path, members: Iterable[tarfile.TarInfo]) -> None:
@@ -165,6 +232,15 @@ def check(root: Path = ROOT, *, no_tests: bool = False,
             raise ReleaseCheckError(
                 "关键文件没有进入待提交快照（多半是忘了 git add）：\n"
                 + "\n".join(f"  - {p}" for p in missing_in_clean))
+
+        manifest = snapshot_manifest(clean)
+        print(f"[release-check] 快照清单：{manifest['files']} 个文件 / "
+              f"{manifest['bytes']} 字节 / 顶层 {len(manifest['top_level'])} 项")
+        violations = snapshot_violations(clean)
+        if violations:
+            raise ReleaseCheckError(
+                "发布包边界检查失败（白名单见 RELEASE_TOP_LEVEL）：\n"
+                + "\n".join(f"  - {v}" for v in violations[:20]))
 
         findings, scanned = secret_scan.scan_tree(clean, include_tests=False)
         print(f"[release-check] 快照密钥扫描：{scanned} 个文件，命中 {len(findings)}")
