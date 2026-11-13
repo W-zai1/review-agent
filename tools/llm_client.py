@@ -16,7 +16,11 @@ import os
 import sys
 import json
 import time
+import uuid
+import datetime
+import contextvars
 import ipaddress
+import threading
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
@@ -483,6 +487,116 @@ def load_config(use_llm=None):
     )
 
 
+class EgressScope:
+    """一次审查运行的「外发审计」上下文（决策书 4.6）。
+
+    为什么把审计放在 `chat()` 这个总闸口，而不是各个调用方：
+        模型外发不止审查链一处——OCR、目的裁决、服务端连通性探针都会走
+        `chat()`。只在调用方各写一遍，漏一个就等于「有外发、无记录」。
+
+    语义（与 Research 分支同一套）：
+        · 调用**前**写 `phase="attempt"`；写不进去 → `chat()` 抛 LLMError，
+          **不发起请求**（审计不可用时不外发）；
+        · 调用结束（成功/失败/异常）写 `phase="result"`，用 `attempt_id` 配对；
+        · 只记元信息：模型、host、字符数、耗时、usage、结果，不记 prompt 正文。
+
+    默认**不生效**：没通过 `set_egress_scope()` 设置上下文时（单元测试、
+    `llm_client.py --check`、bench 脚本），`chat()` 行为与以前完全一致。
+    """
+
+    def __init__(self, log_path, *, review_id="", run_id="", target="", kind="llm"):
+        self.log_path = Path(log_path)
+        self.review_id = str(review_id or "")
+        self.run_id = str(run_id or "")
+        self.target = str(target or "")
+        self.kind = str(kind or "llm")
+        self._lock = threading.Lock()
+
+    def identify(self, *, review_id=None, run_id=None, target=None):
+        """运行号/任务号在跑起来之后才知道：由调用方补登记（幂等）。"""
+        if review_id is not None:
+            self.review_id = str(review_id or "")
+        if run_id is not None:
+            self.run_id = str(run_id or "")
+        if target is not None:
+            self.target = str(target or "")
+
+    def begin(self, *, model, chars, endpoint):
+        """外发前登记；返回 attempt_id，写不进去返回 None（调用方必须放弃）。"""
+        attempt_id = uuid.uuid4().hex[:12]
+        record = {
+            "ts": _now_iso(),
+            "kind": self.kind,
+            "phase": "attempt",
+            "attempt_id": attempt_id,
+            "run_id": self.run_id or None,
+            "target": self.target or None,
+            "job_id": None,
+            "review_id": self.review_id or None,
+            "model": str(model or ""),
+            "host": (urlsplit(str(endpoint or "")).hostname or ""),
+            "prompt_chars": int(chars),
+        }
+        return attempt_id if self._write(record) else None
+
+    def end(self, attempt_id, *, ok, duration_ms, usage=None, error="", model=""):
+        """调用结束后登记结果；与 attempt 用 attempt_id 配对。"""
+        record = {
+            "ts": _now_iso(),
+            "kind": self.kind,
+            "phase": "result",
+            "attempt_id": attempt_id,
+            "run_id": self.run_id or None,
+            "target": self.target or None,
+            "job_id": None,
+            "review_id": self.review_id or None,
+            "model": str(model or ""),
+            "result": "ok" if ok else "failed",
+            "duration_ms": int(duration_ms),
+            "usage": {k: int((usage or {}).get(k) or 0)
+                      for k in ("input", "output")},
+            "error": str(error or "")[:200],
+        }
+        self._write(record)
+
+    def _write(self, record):
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock, open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return True
+        except OSError:
+            return False
+
+
+def _now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+_EGRESS_SCOPE = contextvars.ContextVar("llm_egress_scope", default=None)
+
+
+def set_egress_scope(scope):
+    """设置当前上下文的外发审计；返回 token，交给 `reset_egress_scope`。"""
+    return _EGRESS_SCOPE.set(scope)
+
+
+def reset_egress_scope(token):
+    _EGRESS_SCOPE.reset(token)
+
+
+def current_egress_scope():
+    return _EGRESS_SCOPE.get()
+
+
+def update_egress_scope(**fields):
+    """review_id / run_id 运行中才知道：补登记到当前上下文（没有上下文时忽略）。"""
+    scope = _EGRESS_SCOPE.get()
+    if scope is not None:
+        scope.identify(**fields)
+    return scope
+
+
 class LLMClient:
     RETRYABLE = (408, 409, 429, 500, 502, 503, 504)
 
@@ -490,7 +604,38 @@ class LLMClient:
         self.cfg = cfg
 
     def chat(self, messages, temperature=None, max_tokens=None):
-        """一次 chat completion；失败抛 LLMError（已含重试）。"""
+        """一次 chat completion；失败抛 LLMError（已含重试）。
+
+        设了外发审计上下文时：先写 attempt（写不进就不发），结束后写 result。
+        """
+        scope = _EGRESS_SCOPE.get()
+        attempt_id = None
+        result = None
+        started_at = None
+        if scope is not None:
+            chars = sum(len(str(m.get("content") or "")) for m in messages)
+            attempt_id = scope.begin(model=self.cfg.model, chars=chars,
+                                     endpoint=self.cfg.endpoint)
+            if attempt_id is None:
+                raise LLMError("外发审计写入失败（决策书 4.6），已阻止本次模型调用")
+            started_at = time.perf_counter()
+        try:
+            result = self._chat_once(messages, temperature, max_tokens)
+            return result
+        except LLMError as exc:
+            if scope is not None and attempt_id is not None:
+                scope.end(attempt_id, ok=False, model=self.cfg.model,
+                          duration_ms=round((time.perf_counter() - started_at) * 1000),
+                          error=str(exc))
+            raise
+        finally:
+            if scope is not None and attempt_id is not None and result is not None:
+                scope.end(attempt_id, ok=True, model=result.model,
+                          duration_ms=round((time.perf_counter() - started_at) * 1000),
+                          usage=result.usage)
+
+    def _chat_once(self, messages, temperature, max_tokens):
+        """真正的 HTTP 调用（含重试）；审计只在外层 `chat()` 做一次。"""
         endpoint_error = self.cfg.endpoint_error
         if endpoint_error:
             raise LLMError(endpoint_error)

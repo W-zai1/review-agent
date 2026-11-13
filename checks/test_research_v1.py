@@ -788,13 +788,17 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(all(i["permission"] == "research"
                             for i in session.tool_invocations
                             if i["tool"] == "research.web"))
-        # 出网留痕（只记元信息）
+        # 出网留痕（只记元信息）：4.6 起是 attempt + result 两行，按 attempt_id 配对
         egress = self.base / "state" / "egress.log"
         if egress.exists():
-            for line in egress.read_text(encoding="utf-8").splitlines():
-                record = json.loads(line)
+            rows = [json.loads(line) for line in
+                    egress.read_text(encoding="utf-8").splitlines() if line]
+            self.assertEqual([r["phase"] for r in rows], ["attempt", "result"])
+            self.assertEqual(rows[0]["attempt_id"], rows[1]["attempt_id"])
+            for record in rows:
                 self.assertEqual(record["kind"], "research")
-                self.assertNotIn("出货量为 5 亿台", record["detail"])
+                self.assertNotIn("出货量为 5 亿台", json.dumps(
+                    record, ensure_ascii=False))
 
         report = build_shadow_report(
             state, target_meta=state.artifacts.get("target_meta"),

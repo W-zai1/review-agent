@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """checks/test_server_governance.py —— 服务端的"不外发"与"删得干净"（批次 2 / C5）。
 
@@ -80,11 +80,17 @@ class EgressLogTests(unittest.TestCase):
             server._record_egress("research", target=f"t{i}")
         self.assertEqual(len(server.EGRESS_LOG.read_text(encoding="utf-8").splitlines()), 3)
 
-    def test_write_failure_does_not_raise(self):
-        """记录失败不能把审查跑挂了：它只是审计，不是主流程。"""
+    def test_write_failure_returns_false_without_raising(self):
+        """写失败不抛异常，但必须**如实返回 False**。
+
+        决策书 4.6 之后「不抛」不等于「可以继续外发」：调用方拿 False 就要
+        放弃这次外部请求。4.6 之前这里直接吞掉，调用方根本不知道没记上。
+        """
         server.EGRESS_LOG = Path(self.tmp.name) / "nested" / "file" / "egress.log"
         (Path(self.tmp.name) / "nested").write_text("我是文件不是目录", encoding="utf-8")
-        server._record_egress("llm", target="x")     # 不该抛
+        self.assertFalse(server._record_egress("llm", target="x"))
+        # 根本没外发（enabled=False）不算失败，否则关闭审计会把所有任务拦死
+        self.assertTrue(server._record_egress("llm", target="x", enabled=False))
 
 
 class _StubHandler:

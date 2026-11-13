@@ -50,6 +50,26 @@ def main(argv=None, *, runtime):
 
 
 def _run_review(opts, runtime):
+    """审查入口：先套一层外发审计上下文（决策书 4.6），再走引擎分支。
+
+    为什么套在 CLI 入口而不是各条链里：真正的 HTTP 出口只有
+    `llm_client.chat()` 一处，它由 contextvar 决定「这次外发属于哪个任务」。
+    入口处设一次，OCR、目的裁决、分块语义审的外发就自动有了 attempt/result。
+    `_fail()` 走 `sys.exit`，所以必须 try/finally 复位，否则同进程后续任务
+    会把记录写到上一个任务名下。
+    """
+    target_path = ((runtime.ROOT / opts.target_arg)
+                   if not os.path.isabs(opts.target_arg) else Path(opts.target_arg))
+    scope = runtime.llm_client.EgressScope(
+        runtime.STATE / "egress.log", target=str(target_path), kind="llm")
+    token = runtime.llm_client.set_egress_scope(scope)
+    try:
+        return _run_review_body(opts, runtime)
+    finally:
+        runtime.llm_client.reset_egress_scope(token)
+
+
+def _run_review_body(opts, runtime):
     target_path = ((runtime.ROOT / opts.target_arg)
                    if not os.path.isabs(opts.target_arg) else Path(opts.target_arg))
     if not target_path.exists():

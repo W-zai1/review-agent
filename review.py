@@ -19,6 +19,8 @@ import asyncio
 import atexit
 import hashlib
 import os
+import urllib.parse
+import uuid
 import sys
 import re
 import json
@@ -2596,6 +2598,10 @@ def run_one(target_path: Path, rules, use_llm=None, progress_path=None,
     # 本次执行的 run_id：旧流程没有「多次执行」概念，第一次执行就是 RUN01。
     # S4（证据锚定）与 S6（裁定）都要它——证据与裁定必须能归属到同一次执行。
     run_id = domain_ids.format_run_id(review_id, 1)
+    # 外发审计（决策书 4.6）：号确定后把「哪次审查、哪个目标」补登记到当前
+    # 上下文，此后的 llm_client.chat() 才会写成这个任务的 attempt/result。
+    llm_client.update_egress_scope(
+        review_id=review_id, run_id=run_id, target=target_rel)
 
     if scenario_info:
         _ids = [x["rule_id"] for x in scenario_info["skipped"]]
@@ -3704,6 +3710,9 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
         review_id=review_id, run_id=run_id, profile=profile,
         target_hash=integrity_inputs["target_hash"],
     )
+    # 外发审计（决策书 4.6）：v1 的号在进入核心后才确定，这里补登记一次。
+    llm_client.update_egress_scope(
+        review_id=review_id, run_id=run_id, target=target_rel)
     if semantic_review_fn is None and use_llm is not False:
         semantic_review_fn, llm_meta = make_llm_review_fn(
             active, text, chosen_type, use_llm=use_llm, agent=agent,
@@ -4394,8 +4403,8 @@ def make_research_executor(*, review_id, run_id, cfg=None, web=True, provider=No
            与旧链路是同一对函数，TTL 与「已学断言」口径不会漂移。
 
     `use_tool=False` 只给测试用（不想起注册表时直接调 verify）。
-    `record_egress`：把「这次把哪些实体/指标发给了第三方」写进 `state/egress.log`
-    （只记元信息，不记原文）。
+    `record_egress`：出网前先写 `egress_attempt`，写不进去就**不发起检索**
+    （决策书 4.6）；请求结束后写配对的结果行。只记元信息，不记原文。
     """
     cfg = dict(cfg or research.load_config())
     limit = int(cfg.get("max_claims_per_doc") or 3)
@@ -4453,22 +4462,54 @@ def make_research_executor(*, review_id, run_id, cfg=None, web=True, provider=No
                 claim, cfg, owner=review_id)
             if verdict is None:
                 method = "search"
-                if registry is None:
-                    verdict = research.verify(claim, cfg, web=web, provider=provider)
-                else:
-                    data = {k: claim.get(k) for k in
-                            ("quote", "entity", "metric", "kind", "value",
-                             "unit", "year", "sentence_index", "raw")}
-                    result, _invocation = await registry.execute(
-                        "research.web", data, context)
-                    if record_egress:
-                        _record_research_egress(review_id, claim)
-                    if not result.ok:
-                        # 检索失败不能变成「这条主张没问题」：记进 errors，
-                        # 该主张不进结论（与旧链路 verify() 抛错同口径）
-                        tool_errors.append("；".join(result.errors)[:200])
+                attempt_id = None
+                if record_egress:
+                    # 4.6：先登记再外发。写不进审计就**不发请求**——
+                    # 「已外发但没有记录」比「这一条没核验」更难追责。
+                    attempt_id = _begin_research_egress(
+                        review_id, run_id, claim, cfg)
+                    if attempt_id is None:
+                        tool_errors.append(
+                            "外发审计写入失败，已阻止外部检索（4.6 前置策略）")
                         continue
-                    verdict = dict(result.data)
+                call_started = time.perf_counter()
+                call_ok = True
+                call_error = ""
+                try:
+                    if registry is None:
+                        verdict = research.verify(
+                            claim, cfg, web=web, provider=provider)
+                    else:
+                        data = {k: claim.get(k) for k in
+                                ("quote", "entity", "metric", "kind", "value",
+                                 "unit", "year", "sentence_index", "raw")}
+                        result, _invocation = await registry.execute(
+                            "research.web", data, context)
+                        if not result.ok:
+                            # 检索失败不能变成「这条主张没问题」：记进 errors，
+                            # 该主张不进结论（与旧链路 verify() 抛错同口径）
+                            call_ok = False
+                            call_error = "；".join(result.errors)[:200]
+                        else:
+                            verdict = dict(result.data)
+                except Exception as exc:
+                    if attempt_id is not None:
+                        _end_research_egress(
+                            attempt_id, review_id, run_id, None,
+                            ok=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                            duration_ms=round(
+                                (time.perf_counter() - call_started) * 1000))
+                    raise
+                if attempt_id is not None:
+                    _end_research_egress(
+                        attempt_id, review_id, run_id, verdict,
+                        ok=call_ok, error=call_error,
+                        duration_ms=round(
+                            (time.perf_counter() - call_started) * 1000))
+                if not call_ok:
+                    tool_errors.append(call_error)
+                    continue
                 if verdict is not None:
                     research.remember_verdict(claim, verdict, owner=review_id)
             if verdict is None:
@@ -4510,29 +4551,80 @@ def make_research_executor(*, review_id, run_id, cfg=None, web=True, provider=No
     return executor
 
 
-def _record_research_egress(review_id, claim):
-    """记一条「这条主张的实体/指标被发给了第三方检索」。
+def _write_egress(record):
+    """写一行外发审计（append-only jsonl）；返回是否写成功。
 
-    与 `server._record_egress` 同一条流（`state/egress.log`）、同样只记元信息。
-    检索查询里只有实体 + 指标 + 年份（`build_query` 刻意不含原文数值），
-    但「哪家企业、核哪个指标」本身也可能是敏感信息，所以必须留痕。
+    4.6 的语义是「登记失败就阻止外发」，所以这里**不吞异常**成静默通过：
+    返回 False，由调用方决定不发请求。
     """
     try:
         path = STATE / "egress.log"
         path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "ts": now_iso(),
-            "kind": "research",
-            "target": review_id,
-            "job_id": None,
-            "detail": (f"外部检索：{claim.get('entity') or ''}"
-                       f"{claim.get('metric') or ''}"
-                       f"（{claim.get('year') or '无年份'}）"),
-        }
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:                              # pragma: no cover - 落盘失败不阻断
-        print(f"[egress] 外发记录写入失败：{exc}", flush=True)
+        return True
+    except OSError:
+        return False
+
+
+def _research_claim_detail(claim):
+    return (f"外部检索：{claim.get('entity') or ''}"
+            f"{claim.get('metric') or ''}"
+            f"（{claim.get('year') or '无年份'}）")
+
+
+def _begin_research_egress(review_id, run_id, claim, cfg):
+    """出网前登记 attempt；返回 attempt_id，写失败返回 None（调用方必须阻止外发）。
+
+    只记元信息：查询串本身能暴露「哪家企业、核哪个指标」，但不落原文；
+    需要复算时用 `query_sha256`（查询串的短哈希）而不是明文。
+    """
+    query = research.build_query(claim)
+    attempt_id = uuid.uuid4().hex[:12]
+    ok = _write_egress({
+        "ts": now_iso(),
+        "kind": "research",
+        "phase": "attempt",
+        "attempt_id": attempt_id,
+        "run_id": run_id,
+        "target": review_id,
+        "job_id": None,
+        "detail": _research_claim_detail(claim),
+        "query_sha256": hashlib.sha256(
+            query.encode("utf-8")).hexdigest()[:16],
+        "query_chars": len(query),
+        "providers": list(cfg.get("providers") or ()),
+    })
+    return attempt_id if ok else None
+
+
+def _end_research_egress(attempt_id, review_id, run_id, verdict, *,
+                         ok, error="", duration_ms=0):
+    """请求结束登记结果行，与 attempt 用 `attempt_id` 关联。
+
+    成功/失败都要写：否则「attempt 有、result 没有」无法区分
+    「请求失败」和「进程被杀」，审计链就断了。
+    """
+    sources = (verdict or {}).get("sources") or ()
+    domains = []
+    for source in sources:
+        host = urllib.parse.urlparse(str(source.get("url") or "")).hostname
+        if host and host not in domains:
+            domains.append(host.lower())
+    _write_egress({
+        "ts": now_iso(),
+        "kind": "research",
+        "phase": "result",
+        "attempt_id": attempt_id,
+        "run_id": run_id,
+        "target": review_id,
+        "job_id": None,
+        "result": "ok" if ok else "failed",
+        "duration_ms": int(duration_ms),
+        "domains": domains,
+        "sources": len(sources),
+        "error": (error or "")[:200],
+    })
 
 
 def _run_v1_core(target_path, rules, *, type_override=None, agent_id=None,

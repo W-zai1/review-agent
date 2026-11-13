@@ -1088,7 +1088,18 @@ class Handler(BaseHTTPRequestHandler):
         return _llm_settings().restore(data)
 
     def _test_llm(self, data):
-        return _llm_settings().test(data)
+        """连通性探针也要过 4.6 闸口：它确实会把固定文本发给外部模型。
+
+        审计写失败时 `chat()` 抛 LLMError，由 `llm_settings.test()` 折成
+        `{"ok": False, "error": ...}` 返回；探针本身不会因写日志失败而崩。
+        """
+        scope = llm_client.EgressScope(
+            EGRESS_LOG, target="web:test-connection", kind="llm")
+        token = llm_client.set_egress_scope(scope)
+        try:
+            return _llm_settings().test(data)
+        finally:
+            llm_client.reset_egress_scope(token)
 
     def _reset_llm_config(self):
         return _llm_settings().reset()
@@ -1118,29 +1129,79 @@ def _llm_flag(llm_opt) -> str:
     return "--llm" if llm_opt is True else "--no-llm"
 
 
+def _append_egress(record):
+    """写一行审计（append-only jsonl）；返回是否写成功。
+
+    决策书 4.6 的硬要求：**写不进去就不外发**。以前这里吞掉 OSError 只打印，
+    结果是「外发了但没有记录」——审计日志失效时最危险的正是那一刻。
+    现在把成功与否交给调用方决定是否放行。
+    """
+    try:
+        EGRESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(EGRESS_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError as exc:
+        print(f"[egress] 外发记录写入失败：{exc}", flush=True)
+        return False
+
+
 def _record_egress(kind, *, target=None, job_id=None, detail="", enabled=True):
     """记一行"哪些内容发给了第三方"（append-only jsonl）。
 
     为什么单独记：报告里能查到"用过模型"，查不到"这次把哪份材料送出去了"。
     出问题时要回答的是后者。这里只记**元信息**（对象、任务号、提供方），
     不记 prompt 内容——审计日志本身不该成为新的泄露面。
+
+    返回 True 表示记录已落盘；False 表示写失败（调用方按 4.6 拒绝外发）。
+    `enabled=False` 表示本次根本不外发，不算失败。
     """
     if not enabled:
+        return True
+    return _append_egress({
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "kind": str(kind),
+        "target": (str(target) if target else None),
+        "job_id": job_id,
+        "detail": str(detail or ""),
+    })
+
+
+class _EgressBlocked(RuntimeError):
+    """外发审计登记失败：按决策书 4.6 阻止启动外部调用。"""
+
+
+def _egress_begin(kind, *, target=None, job_id=None, detail=""):
+    """外发前登记 attempt；返回 attempt_id，写不进去返回 None。"""
+    attempt_id = uuid.uuid4().hex[:12]
+    ok = _append_egress({
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "kind": str(kind),
+        "phase": "attempt",
+        "attempt_id": attempt_id,
+        "target": (str(target) if target else None),
+        "job_id": job_id,
+        "detail": str(detail or ""),
+    })
+    return attempt_id if ok else None
+
+
+def _egress_end(attempt_id, *, job_id=None, target=None, ok=False,
+                duration_ms=0, error=""):
+    """外发结束后登记配对结果（与 attempt 用 attempt_id 关联）。"""
+    if not attempt_id:
         return
-    try:
-        EGRESS_LOG.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "kind": str(kind),
-            "target": (str(target) if target else None),
-            "job_id": job_id,
-            "detail": str(detail or ""),
-        }
-        with open(EGRESS_LOG, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        # 记录失败不该让审查跑不下去：但要显式说一句，不能静默
-        print(f"[egress] 外发记录写入失败：{exc}", flush=True)
+    _append_egress({
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "kind": "llm",
+        "phase": "result",
+        "attempt_id": attempt_id,
+        "target": (str(target) if target else None),
+        "job_id": job_id,
+        "result": "ok" if ok else "failed",
+        "duration_ms": int(duration_ms),
+        "error": str(error or "")[:200],
+    })
 
 
 def _trash_destination(name):
@@ -1689,9 +1750,6 @@ def _run_review_job(job_id, review_id, file, llm_opt, progress_path, type_opt=No
     cmd.extend(["--engine", str(engine or "v1")])
     # 显式开关：不传就等于"按配置文件决定"，而配置里 enabled 通常是 true
     cmd.append(_llm_flag(llm_opt))
-    if llm_opt is True:
-        _record_egress("llm", target=file, job_id=job_id,
-                       detail="review.py --llm（全文分块送审）")
     if research_opt is True:
         cmd.append("--research")
     else:
@@ -1729,9 +1787,19 @@ def _run_review_job(job_id, review_id, file, llm_opt, progress_path, type_opt=No
     error_kind = None
     report_id = None
     result = None
+    attempt_id = None
     print(f"[review] 任务 {job_id}（{review_id}）开始：{file}"
           f"（超时 {timeout}s）", flush=True)
     try:
+        if llm_opt is True:
+            # 决策书 4.6：登记不成功就不起 LLM 子进程。放 Popen 之前是因为
+            # 子进程一旦起来，全文就已经在往外发的路上了，事后补记没有意义。
+            attempt_id = _egress_begin(
+                "llm", target=file, job_id=job_id,
+                detail="review.py --llm（全文分块送审）")
+            if attempt_id is None:
+                raise _EgressBlocked(
+                    "外发审计登记失败，已阻止启动 LLM 子进程（决策书 4.6）")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, cwd=str(ROOT),
                                 env=_review_subprocess_env())
@@ -1784,6 +1852,12 @@ def _run_review_job(job_id, review_id, file, llm_opt, progress_path, type_opt=No
         status = "error"
         error = str(e)[:2000]
         error_kind = "system"
+
+    if attempt_id is not None:
+        # 配对写结果行：成功/失败都留痕（4.6 验收：请求成败都能关联到 attempt）
+        _egress_end(attempt_id, job_id=job_id, target=file,
+                    ok=(status == "done"), duration_ms=round((time.time() - started) * 1000),
+                    error=error or "")
 
     # 任务状态由 TaskService 落盘；这里只把结果带回去。
     current = TASKS.get(review_id)
