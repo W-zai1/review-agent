@@ -320,6 +320,11 @@ class Orchestrator:
     def _save(self, state: RunState, stage: Stage) -> None:
         if self.checkpoints is None:
             return
+        # 状态文件必须先于检查点记录落盘：即使进程在下一阶段开始时被杀，
+        # 「已完成到这里」仍是可加载的事实。检查点适配器没有该能力时保持原行为。
+        save_state = getattr(self.checkpoints, "save_state", None)
+        if callable(save_state):
+            save_state(state)
         history = self.checkpoints.for_run(state.run_id)
         self.checkpoints.append(Checkpoint(
             run_id=state.run_id,

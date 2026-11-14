@@ -31,6 +31,7 @@ from review_agent.domain import (                       # noqa: E402
 )
 from review_agent.runtime import (                      # noqa: E402
     FileRunStore,
+    MemoryCheckpointStore,
     NodeContext,
     NodeResult,
     state_to_dict,
@@ -150,6 +151,27 @@ class StartAndPersistTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def test_completed_stage_is_persisted_before_hard_interrupt(self):
+        """进程级中断不会走到 run() 的末尾，阶段状态必须已经落盘。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileRunStore(Path(tmp))
+            app = ReviewApplication(
+                store=store, checkpoints=MemoryCheckpointStore())
+            state = app.initial_state(
+                review_id=REVIEW_ID, run_id=RUN_ID, profile=profile())
+
+            def interrupt(step):
+                raise KeyboardInterrupt("模拟进程被中断")
+
+            with self.assertRaises(KeyboardInterrupt):
+                asyncio.run(app.run(
+                    state, ports(rule_executor=interrupt), config=config()))
+
+            loaded = app.state_of(RUN_ID)
+            self.assertIsNotNone(loaded)
+            self.assertIs(loaded.stage, Stage.ANALYSIS)
+            self.assertIn(Stage.INGESTION, loaded.completed_stages)
+
     def test_failed_run_can_resume_and_finish(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FileRunStore(Path(tmp))

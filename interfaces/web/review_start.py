@@ -104,11 +104,13 @@ class ReviewStarter:
             runner = self.build_runner(review_requests.build_runner_spec(
                 request, job_id=job_id, progress=progress))
             try:
-                record = self.task_service.start_async_with(
+                record = self.task_service.start_async_with_manifest(
                     runner, request.target, profile_id=request.agent,
                     purpose=(request.purpose_text or None), engine="v1",
                     use_llm=request.llm is True, timeout=self.review_timeout,
-                    idempotency_key=key)
+                    idempotency_key=key,
+                    execution_options=review_requests.build_execution_options(
+                        request))
             except NotFoundError as exc:
                 return {"ok": False, "error": str(exc)}
             except OSError as exc:

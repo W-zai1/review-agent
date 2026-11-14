@@ -62,6 +62,23 @@ class PipelinePorts:
     research_executor: ResearchExecutor | None = None
 
 
+class _StatePersistingCheckpoints:
+    """在每次阶段检查点写入前保存完整 RunState，供进程重启后恢复。"""
+
+    def __init__(self, inner, store: FileRunStore) -> None:
+        self._inner = inner
+        self._store = store
+
+    def append(self, checkpoint) -> None:
+        self._inner.append(checkpoint)
+
+    def for_run(self, run_id: str):
+        return self._inner.for_run(run_id)
+
+    def save_state(self, state: RunState) -> None:
+        self._store.save(state)
+
+
 class ReviewApplication:
     """组装 + 执行 + 保存 + 恢复。"""
 
@@ -133,8 +150,9 @@ class ReviewApplication:
     async def run(self, state: RunState, ports: PipelinePorts,
                   *, config: Mapping[str, Any] | None = None) -> RunOutcome:
         workflow = self.workflow(ports)
+        checkpoints = self._checkpoint_store()
         outcome = await Orchestrator(
-            workflow, checkpoints=self.checkpoints,
+            workflow, checkpoints=checkpoints,
             max_attempts=self.max_attempts, config=config or {},
             timeout=self.node_timeout, token=self.token,
         ).run(state)
@@ -159,3 +177,10 @@ class ReviewApplication:
     def _save(self, state: RunState) -> None:
         if self.store is not None:
             self.store.save(state)
+
+    def _checkpoint_store(self):
+        if self.checkpoints is None or self.store is None:
+            return self.checkpoints
+        if callable(getattr(self.checkpoints, "save_state", None)):
+            return self.checkpoints
+        return _StatePersistingCheckpoints(self.checkpoints, self.store)

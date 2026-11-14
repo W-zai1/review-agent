@@ -44,6 +44,12 @@ class ParseTaskControlTests(unittest.TestCase):
         self.assertEqual(opts.task_action, "recover")
         self.assertIsNone(opts.task_review_id)
 
+    def test_task_resume_requires_and_preserves_review_id(self):
+        opts = parser.parse_args(
+            ["--task-resume", "R-20261114-009"], runtime=_Runtime())
+        self.assertEqual(opts.task_action, "resume")
+        self.assertEqual(opts.task_review_id, "R-20261114-009")
+
 
 class CommandTaskControlTests(unittest.TestCase):
     def _service(self, record):
@@ -131,3 +137,19 @@ class CommandTaskControlTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "recover")
         self.assertIs(calls[0][1], runtime.has_run_state)
         self.assertEqual(calls[-1], ("close",))
+
+    def test_resume_uses_the_execution_manifest_entry(self):
+        record = SimpleNamespace(
+            status="completed",
+            to_dict=lambda: {"review_id": "R-20261114-009",
+                             "status": "completed"},
+        )
+        runtime = _Runtime()
+        runtime.resume_task = lambda review_id: record
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            commands.main(
+                ["--task-resume", "R-20261114-009"], runtime=runtime)
+
+        self.assertEqual(json.loads(out.getvalue())["status"], "completed")

@@ -60,11 +60,13 @@ def parse_args(argv=None, *, runtime):
     for flag, action, needs_id in (
             ("--task-status", "status", True),
             ("--task-cancel", "cancel", True),
-            ("--task-recover", "recover", False)):
+            ("--task-recover", "recover", False),
+            ("--task-resume", "resume", True)):
         if flag not in args:
             continue
         if task_action is not None:
-            print("--task-status / --task-cancel / --task-recover 不能同时使用")
+            print("--task-status / --task-cancel / --task-recover / "
+                  "--task-resume 不能同时使用")
             sys.exit(2)
         i = args.index(flag)
         if not needs_id:
@@ -329,6 +331,7 @@ def parse_args(argv=None, *, runtime):
               "差异写 state/double_run/；shadow 需配合 --no-llm，v1 可带 --llm）；"
               "--task-status R-... 查看任务记录；--task-cancel R-... 取消任务"
               "（可选 --task-reason 文案）；--task-recover 体检可续/已废弃任务；"
+              "--task-resume R-... 从持久检查点续跑；"
               "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return None
     target_arg = args[0]

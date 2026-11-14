@@ -54,6 +54,14 @@ def main(argv=None, *, runtime):
 
 def _run_task_control(opts, runtime):
     """只读状态与取消：复用 TaskService，不进入审查装配。"""
+    if opts.task_action == "resume":
+        try:
+            record = runtime.resume_task(opts.task_review_id)
+        except runtime.DomainError as exc:
+            _fail(runtime, f"续跑任务失败：{exc}", exc, 1)
+        payload = {"ok": True, **record.to_dict()}
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return record
     service = runtime.make_task_service()
     try:
         if opts.task_action == "status":

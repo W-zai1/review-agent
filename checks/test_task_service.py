@@ -37,7 +37,12 @@ from review_agent.application import (  # noqa: E402
     TaskRecord,
     TaskService,
 )
-from review_agent.domain import NotFoundError, RunStatus, Stage  # noqa: E402
+from review_agent.domain import (  # noqa: E402
+    InvalidTransition,
+    NotFoundError,
+    RunStatus,
+    Stage,
+)
 from review_agent.domain.ids import format_run_id  # noqa: E402
 
 
@@ -108,6 +113,29 @@ class TaskRecordTests(unittest.TestCase):
         data["schema"] = 99
         with self.assertRaises(ValueError):
             TaskRecord.from_dict(data)
+
+    def test_schema_v1_remains_readable(self):
+        data = make_record().to_dict()
+        data["schema"] = 1
+        data.pop("execution", None)
+        restored = TaskRecord.from_dict(data)
+        self.assertEqual(restored.review_id, "R-20261030-001")
+        self.assertEqual(restored.execution, {})
+
+    def test_execution_options_round_trip(self):
+        record = make_record(execution={
+            "engine": "v1",
+            "use_llm": False,
+            "type_override": "contract",
+            "purpose_max": 300,
+            "purpose_notes": ["目的文本被截断"],
+            "scenario": "internal",
+            "format_spec": "none",
+            "research_enabled": False,
+        })
+        restored = TaskRecord.from_dict(json.loads(json.dumps(record.to_dict())))
+        self.assertEqual(restored.execution, record.execution)
+        self.assertEqual(restored.to_dict()["schema"], 2)
 
     def test_run_must_belong_to_review(self):
         with self.assertRaises(ValueError):
@@ -203,6 +231,39 @@ class TaskServiceTests(unittest.TestCase):
         self.assertEqual(call["purpose"], "p")
         self.assertEqual(call["engine"], "v1")
         self.assertFalse(call["use_llm"])
+
+    def test_start_with_options_persists_execution_manifest(self):
+        runner = StubRunner()
+        options = {
+            "engine": "v1",
+            "use_llm": False,
+            "type_override": "contract",
+            "scenario": "internal",
+        }
+        record = self.service(runner).start_review_with_options(
+            self.target, profile_id="doc-review", execution_options=options)
+        restored = self.store.get(record.review_id)
+        self.assertEqual(restored.execution, options)
+
+    def test_resume_review_reuses_the_existing_task_identity(self):
+        record = make_record(
+            status=RunStatus.RUNNING.value,
+            execution={"engine": "v1", "use_llm": False})
+        self.store.save(record)
+        runner = StubRunner()
+        resumed = self.service(runner).resume_review(
+            record.review_id, use_llm=False)
+
+        self.assertEqual(resumed.review_id, record.review_id)
+        self.assertEqual(resumed.run_id, record.run_id)
+        self.assertEqual(resumed.status, RunStatus.COMPLETED.value)
+        self.assertEqual(runner.calls[0]["review_id"], record.review_id)
+
+    def test_resume_review_rejects_cancelled_task(self):
+        record = make_record(status=RunStatus.CANCELLED.value)
+        self.store.save(record)
+        with self.assertRaises(InvalidTransition):
+            self.service(StubRunner()).resume_review(record.review_id)
 
     def test_running_is_persisted_before_execution(self):
         """执行前就得有一条 running 记录——否则进程被杀时「有没有这个任务」无从判断。"""

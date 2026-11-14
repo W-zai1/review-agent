@@ -131,3 +131,21 @@ def build_runner_spec(request, *, job_id, progress):
         "spec_opt": request.format_spec,
         "custom_opt": request.format_custom,
     }
+
+
+def build_execution_options(request):
+    """保存可重建续跑 ports 的请求参数（不包含临时进度/任务视图身份）。"""
+    notes = request.purpose_quality if isinstance(
+        request.purpose_quality, (list, tuple)) else []
+    return {
+        "manifest_version": 1,
+        "engine": "v1",
+        "use_llm": request.llm,
+        "type_override": request.type,
+        "agent_id": request.agent,
+        "purpose_max": request.purpose_max,
+        "purpose_notes": [str(x) for x in notes],
+        "scenario": request.scenario,
+        "format_spec": (request.format_custom or request.format_spec),
+        "research_enabled": request.research is True,
+    }

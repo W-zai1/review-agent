@@ -44,6 +44,29 @@
 
 # 2026-11-14
 
+### 2026-11-14 · 新增 · 决策书 4.2-C：任务 schema v2 与 CLI 自动续跑
+
+- **文件**：`review_agent/application/tasks.py`（task schema v2、执行清单、`resume_review()`）；`review.py`（执行清单、续跑入口、V1 身份/目标哈希/Agent 版本校验）；`interfaces/cli/parser.py` / `commands.py`（`--task-resume`）；`interfaces/web/review_requests.py` / `review_start.py` / `review_sync.py`（Web/同步入口保存执行清单）；`checks/test_task_service.py`、`checks/test_pipeline_parity.py`、`checks/test_cli_task_control.py`、`checks/test_server_tasks.py`、`checks/test_sync_review.py`；`docs/CURRENT_STATUS.md`
+- **改了什么**：
+  1. `TaskRecord` schema 从 v1 升到 v2，新增 `execution` 执行清单；新读取器兼容 v1（旧记录 execution 为空），新任务写入 `use_llm`、type override、agent、scenario、format spec、research、purpose 长度/提示等可重建参数。
+  2. `TaskService` 新增 `start_review_with_manifest` / `start_async_with_manifest` 与 `resume_review()`；已有 `start_review_with` 等签名不变。CLI 新建任务与 Web 异步/同步入口都持久化执行清单。
+  3. `run_typed_pipeline()` 新增 `resume_run_id`：从 `FileRunStore` 加载既有 RunState，经 `ReviewApplication.resume()` 从断点继续；校验状态 review_id、Agent id/version 和 target_hash，不一致即拒绝。
+  4. CLI 新增 `python review.py --task-resume R-...`：要求任务有 schema v2 执行清单和持久检查点；取消/完成/aborted 任务拒绝续跑，失败或进程中断但仍有检查点的任务可恢复。续跑继续使用原 review_id/run_id，报告落回同一身份。
+- **为什么**：4.2-C 前置已完成阶段状态持久化，但任务记录不保存原始执行选项；直接使用当前默认参数重建 ports 会把 `llm / research / scenario / format` 等语义换掉。schema v2 把执行清单变成任务事实的一部分，v1 只读兼容避免破坏历史任务。
+- **验证**：`test_task_service` 37 项 OK（v1 兼容、v2 往返、续跑身份、取消拒绝）；`test_pipeline_parity` 6 项 OK（含分析阶段中断后重载、自动续跑到报告、任务级中断恢复）；`test_cli_task_control` 9 项 OK；`test_server_tasks` 17 项 OK（Web 任务保存执行清单）；全量 `checks` **986 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1，约 563s）**；`compileall` 通过；`secret_scan` 265 文件 / 命中 0。回滚：保留 v2 读取代码、将新任务写回 schema v1 并删除 `--task-resume` 入口；已写入的 v2 记录不应降级覆盖。
+- **保留边界**：跨进程的两个 `--task-resume` 同时启动尚未加操作系统级锁；进程内重复续跑由 TaskService 拒绝。续跑写报告时沿用现有日志写入器，会覆盖同一 review_id 的上一轮节点日志；RunState 与检查点历史保留。
+
+### 2026-11-14 · 修复 · 决策书 4.2-C 前置：阶段检查点先持久化状态
+
+- **文件**：`review_agent/runtime/orchestrator.py`（检查点写入前调用可选 `save_state`）；`review_agent/application/service.py`（状态持久化检查点适配器）；`review.py`（有 `store` 时使用文件检查点，未请求持久恢复时保持内存）；`checks/test_application_service.py`（+1 项硬中断用例）；`checks/test_pipeline_parity.py`（重定向 `STATE`，+1 项无存储检查）；`docs/CURRENT_STATUS.md`
+- **改了什么**：
+  1. `Orchestrator._save()` 在追加阶段检查点前，如检查点适配器提供 `save_state`，先把完整 `RunState` 写入 `FileRunStore`。没有该能力的既有测试/调用方保持原行为。
+  2. `ReviewApplication` 自动把「状态存储 + 检查点存储」包成持久化适配器；状态文件先落盘，随后才追加检查点，进程在下一阶段被硬中断时仍能加载已完成的阶段。
+  3. `run_typed_pipeline()` 在调用方传 `store`（正式 V1 执行）时使用 `FileCheckpointStore(STATE / "checkpoints")`，检查点历史不再随进程退出丢失；单纯做双跑/契约测试且未请求持久恢复时仍用内存，避免测试污染运行态。
+- **为什么**：原实现虽然提供了 `ReviewApplication.resume()`，但 `ReviewApplication.run()` 只在整次流水线返回后保存状态，阶段检查点又只在内存；进程在中途被杀时，`state/runs/` 没有可加载事实，自动续跑没有可靠前置条件。
+- **验证**：`checks.test_application_service` 10 项 OK（新增模拟 `KeyboardInterrupt` 后仍能加载已完成阶段）；`test_pipeline_parity` 3 项 OK（新增无 `store` 不落检查点）；`test_orchestrator` 27 项、`test_v1_integrity` 6 项、`test_failure_injection` 3 项 OK；全量 `checks` **976 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1）**；`compileall` 通过；`secret_scan` 265 文件 / 命中 0。首次全量验证时发现 6 个测试检查点误写真实 `state/checkpoints/`，已整体移动到临时备份，未删除；`state/` 恢复为基线 37 文件、3,821,941 字节、SHA256 `bc266d...c306bc9`。回滚：还原生产文件与本项测试；临时备份可单独恢复，仓库运行数据无需迁移。
+- **未完成**：4.2-C 仍未开放 CLI 自动续跑。`TaskRecord` 当前只保存 target / engine / profile / purpose，不保存 `use_llm`、type override、scenario、format spec、research 等执行选项；若续跑时用默认值重建 ports，可能改变原任务的审查语义。需先决定持久化执行清单还是要求续跑时显式重传参数。
+
 ### 2026-11-14 · 新增 · 决策书 4.2-B：CLI 任务恢复体检
 
 - **文件**：`interfaces/cli/parser.py`（新增 `--task-recover`）；`interfaces/cli/commands.py`（输出 `resumable` / `orphaned` / `total`）；`checks/test_cli_task_control.py`（+2 项）；`docs/CURRENT_STATUS.md`（§2 / §4 / §5 / §6 / §7）

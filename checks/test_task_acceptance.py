@@ -134,6 +134,9 @@ class CliParityTests(_Harness):
                     status=RunStatus.FAILED.value, error="忽略：只验证装配",
                     review_id="R-20261111-099")
 
+            def start_review_with_options(self, target, **kwargs):
+                return self.start_review(target, **kwargs)
+
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(review, "make_task_service",
                                lambda **kwargs: FakeService()), \

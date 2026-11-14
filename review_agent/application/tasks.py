@@ -39,7 +39,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -47,7 +47,8 @@ from ..domain import InvalidTransition, NotFoundError, RunStatus, Stage
 from ..domain.ids import format_run_id, parse_run_id
 from ..runtime.cancel import CancellationToken
 
-TASK_SCHEMA = 1
+TASK_SCHEMA = 2
+COMPATIBLE_TASK_SCHEMAS = frozenset({1, TASK_SCHEMA})
 
 
 def _now_iso() -> str:
@@ -107,6 +108,7 @@ class TaskRecord:
     engine: str = "v1"
     profile_id: str | None = None
     purpose: str | None = None
+    execution: dict[str, Any] = field(default_factory=dict)
     verdict: str | None = None
     findings: int = 0
     evidence: int = 0
@@ -125,6 +127,9 @@ class TaskRecord:
                 f"run_id {self.run_id!r} 不属于 review_id {self.review_id!r}")
         RunStatus(self.status)          # 非法状态立刻报错，不静默降级
         Stage(self.stage)
+        if not isinstance(self.execution, Mapping):
+            raise ValueError("execution 必须是对象")
+        object.__setattr__(self, "execution", dict(self.execution))
 
     # ---- 序列化 ----
     def to_dict(self) -> dict[str, Any]:
@@ -135,9 +140,13 @@ class TaskRecord:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TaskRecord":
         version = int(data.get("schema") or 0)
-        if version != TASK_SCHEMA:
+        if version not in COMPATIBLE_TASK_SCHEMAS:
             raise ValueError(
-                f"不认识的 task schema={version}（期望 {TASK_SCHEMA}）")
+                f"不认识的 task schema={version}"
+                f"（支持 1..{TASK_SCHEMA}）")
+        execution = data.get("execution") or {}
+        if not isinstance(execution, Mapping):
+            raise ValueError("execution 必须是对象")
         return cls(
             review_id=str(data["review_id"]),
             run_id=str(data["run_id"]),
@@ -147,6 +156,7 @@ class TaskRecord:
             engine=str(data.get("engine") or "v1"),
             profile_id=data.get("profile_id"),
             purpose=data.get("purpose"),
+            execution=dict(execution),
             verdict=data.get("verdict"),
             findings=int(data.get("findings") or 0),
             evidence=int(data.get("evidence") or 0),
@@ -316,10 +326,23 @@ class TaskService:
         为什么保留同步入口：迁移期一次只跑一个任务，把同步路径也改成队列会让
         所有既有调用点被迫处理「还没跑完」的中间态，而它换不来可观测性。
         """
-        return self.start_review_with(
+        return self.start_review_with_options(
+            target, profile_id=profile_id, purpose=purpose, engine=engine,
+            use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key, execution_options=None)
+
+    def start_review_with_options(
+            self, target: Path | str, *, profile_id: str | None = None,
+            purpose: str | None = None, engine: str = "v1",
+            use_llm: bool = False, timeout: float | None = None,
+            idempotency_key: str | None = None,
+            execution_options: Mapping[str, Any] | None = None) -> TaskRecord:
+        """建任务时保存可重建执行装配的选项清单（task schema v2）。"""
+        return self._start_review_with(
             self._runner, target, profile_id=profile_id, purpose=purpose,
             engine=engine, use_llm=use_llm, timeout=timeout,
-            idempotency_key=idempotency_key)
+            idempotency_key=idempotency_key,
+            execution_options=execution_options)
 
     def start_review_with(self, runner: Runner, target: Path | str, *,
                           profile_id: str | None = None,
@@ -332,9 +355,34 @@ class TaskService:
         比 `Runner` 协议里的通用字段多，所以由入口把「这一次怎么跑」封在 runner 里；
         任务层仍只负责建任务、落状态、超时与取消，不 import `review.py` 或 `subprocess`。
         """
-        record = self._open(target, profile_id=profile_id, purpose=purpose,
-                            engine=engine, status=RunStatus.RUNNING,
-                            idempotency_key=idempotency_key)
+        return self._start_review_with(
+            runner, target, profile_id=profile_id, purpose=purpose,
+            engine=engine, use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key, execution_options=None)
+
+    def start_review_with_manifest(
+            self, runner: Runner, target: Path | str, *,
+            profile_id: str | None = None, purpose: str | None = None,
+            engine: str = "v1", use_llm: bool = False,
+            timeout: float | None = None,
+            idempotency_key: str | None = None,
+            execution_options: Mapping[str, Any] | None = None) -> TaskRecord:
+        """用调用方 runner 执行，同时保存 schema v2 执行清单。"""
+        return self._start_review_with(
+            runner, target, profile_id=profile_id, purpose=purpose,
+            engine=engine, use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key,
+            execution_options=execution_options)
+
+    def _start_review_with(
+            self, runner: Runner, target: Path | str, *,
+            profile_id: str | None, purpose: str | None, engine: str,
+            use_llm: bool, timeout: float | None, idempotency_key: str | None,
+            execution_options: Mapping[str, Any] | None) -> TaskRecord:
+        record = self._open(
+            target, profile_id=profile_id, purpose=purpose, engine=engine,
+            status=RunStatus.RUNNING, idempotency_key=idempotency_key,
+            execution_options=execution_options)
         return self._execute(record, timeout=timeout, use_llm=use_llm,
                              runner=runner)
 
@@ -347,10 +395,22 @@ class TaskService:
         QUEUED 是真实状态而非占位：用户能看到「已提交、还没开始」，
         而 RUNNING 只在后台线程真正拿到执行权后才写。
         """
-        return self.start_async_with(
+        return self.start_async_with_options(
+            target, profile_id=profile_id, purpose=purpose, engine=engine,
+            use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key, execution_options=None)
+
+    def start_async_with_options(
+            self, target: Path | str, *, profile_id: str | None = None,
+            purpose: str | None = None, engine: str = "v1",
+            use_llm: bool = False, timeout: float | None = None,
+            idempotency_key: str | None = None,
+            execution_options: Mapping[str, Any] | None = None) -> TaskRecord:
+        return self._start_async_with(
             self._runner, target, profile_id=profile_id, purpose=purpose,
             engine=engine, use_llm=use_llm, timeout=timeout,
-            idempotency_key=idempotency_key)
+            idempotency_key=idempotency_key,
+            execution_options=execution_options)
 
     def start_async_with(self, runner: Runner, target: Path | str, *,
                          profile_id: str | None = None,
@@ -358,9 +418,33 @@ class TaskService:
                          use_llm: bool = False, timeout: float | None = None,
                          idempotency_key: str | None = None) -> TaskRecord:
         """同 `start_async`，但本次执行用传入的 runner（见 `start_review_with`）。"""
-        record = self._open(target, profile_id=profile_id, purpose=purpose,
-                            engine=engine, status=RunStatus.QUEUED,
-                            idempotency_key=idempotency_key)
+        return self._start_async_with(
+            runner, target, profile_id=profile_id, purpose=purpose,
+            engine=engine, use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key, execution_options=None)
+
+    def start_async_with_manifest(
+            self, runner: Runner, target: Path | str, *,
+            profile_id: str | None = None, purpose: str | None = None,
+            engine: str = "v1", use_llm: bool = False,
+            timeout: float | None = None,
+            idempotency_key: str | None = None,
+            execution_options: Mapping[str, Any] | None = None) -> TaskRecord:
+        return self._start_async_with(
+            runner, target, profile_id=profile_id, purpose=purpose,
+            engine=engine, use_llm=use_llm, timeout=timeout,
+            idempotency_key=idempotency_key,
+            execution_options=execution_options)
+
+    def _start_async_with(
+            self, runner: Runner, target: Path | str, *,
+            profile_id: str | None, purpose: str | None, engine: str,
+            use_llm: bool, timeout: float | None, idempotency_key: str | None,
+            execution_options: Mapping[str, Any] | None) -> TaskRecord:
+        record = self._open(
+            target, profile_id=profile_id, purpose=purpose, engine=engine,
+            status=RunStatus.QUEUED, idempotency_key=idempotency_key,
+            execution_options=execution_options)
         if record.status != RunStatus.QUEUED.value:
             return record          # 幂等命中：已有任务在跑，不再起线程
         future = self._executor().submit(self._async_body_with, runner, record,
@@ -368,6 +452,32 @@ class TaskService:
         with self._lock:
             self._futures[record.review_id] = future
         return record
+
+    def resume_review(self, review_id: str, *, use_llm: bool = False,
+                      timeout: float | None = None) -> TaskRecord:
+        """显式续跑已有任务；调用方必须先确认检查点存在。"""
+        return self.resume_review_with(
+            self._runner, review_id, use_llm=use_llm, timeout=timeout)
+
+    def resume_review_with(
+            self, runner: Runner, review_id: str, *,
+            use_llm: bool = False,
+            timeout: float | None = None) -> TaskRecord:
+        with self._state_lock:
+            record = self._require(review_id)
+            status = RunStatus(record.status)
+            if status in (RunStatus.CANCELLED, RunStatus.COMPLETED,
+                          RunStatus.ABORTED):
+                raise InvalidTransition(
+                    f"任务 {review_id} 已是 {status.value}，不能续跑")
+            if self.is_live(review_id):
+                raise InvalidTransition(f"任务 {review_id} 仍在执行，不能重复续跑")
+            running = replace(
+                record, status=RunStatus.RUNNING.value, error=None,
+                updated_at=_now_iso())
+            self._store.save(running)
+        return self._execute(
+            running, timeout=timeout, use_llm=use_llm, runner=runner)
 
     def _async_body(self, record: TaskRecord, timeout: float | None,
                     use_llm: bool) -> TaskRecord:
@@ -535,7 +645,8 @@ class TaskService:
 
     def _open(self, target: Path | str, *, profile_id: str | None,
               purpose: str | None, engine: str, status: RunStatus,
-              idempotency_key: str | None) -> TaskRecord:
+              idempotency_key: str | None,
+              execution_options: Mapping[str, Any] | None) -> TaskRecord:
         target_path = Path(target)
         if not target_path.exists():
             raise NotFoundError(f"找不到待审文件：{target_path}")
@@ -554,6 +665,7 @@ class TaskService:
             engine=engine,
             profile_id=profile_id,
             purpose=purpose,
+            execution=dict(execution_options or {}),
             idempotency_key=idempotency_key,
             created_at=created,
             updated_at=created,

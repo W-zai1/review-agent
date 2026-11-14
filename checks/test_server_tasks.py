@@ -192,6 +192,9 @@ class StartReviewTests(unittest.TestCase):
         self.assertEqual(record.status, RunStatus.RUNNING.value)
         self.assertEqual(record.stage, Stage.INTAKE.value)
         self.assertTrue(record.idempotency_key)
+        self.assertEqual(record.execution["manifest_version"], 1)
+        self.assertEqual(record.execution["engine"], "v1")
+        self.assertIs(record.execution["use_llm"], False)
         self.assertEqual(len(_BlockingRunner.calls), 1)
         self.assertEqual(_BlockingRunner.calls[0][0], RID)
         job = server.JOBS[result["job_id"]]

@@ -39,6 +39,9 @@ def _make(record=None, *, service=None, store=None, target_error=None,
                 return service(*args, **kw)
             return record
 
+        def start_review_with_manifest(self, *args, **kw):
+            return self.start_review_with(*args, **kw)
+
     def build_runner(request, job_id, progress):
         return {"job_id": job_id, "progress": progress}
 

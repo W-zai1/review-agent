@@ -82,10 +82,12 @@ class SyncReview:
 
         t0 = self._clock()
         try:
-            record = self._task_service().start_review_with(
+            record = self._task_service().start_review_with_manifest(
                 runner, target, profile_id=request.agent,
                 purpose=(request.purpose_text or None), engine="v1",
-                use_llm=request.llm is True, timeout=self._timeout)
+                use_llm=request.llm is True, timeout=self._timeout,
+                execution_options=review_requests.build_execution_options(
+                    request))
         except NotFoundError as exc:
             return {"ok": False, "error": str(exc)}
         except OSError as exc:

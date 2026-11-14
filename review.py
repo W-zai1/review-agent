@@ -110,6 +110,7 @@ from review_agent.application import (
     write_audit_stream,
 )
 from review_agent.runtime import (
+    FileCheckpointStore,
     FileRunStore,
     MemoryCheckpointStore,
     NodeResult,
@@ -3617,7 +3618,8 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
                        integrity_out=None, token=None, research_enabled=False,
                        research_cfg=None, research_web=True,
                        scenario_id=None, format_spec=None,
-                       context_out=None, progress_path=None):
+                       context_out=None, progress_path=None,
+                       resume_run_id=None):
     """用新的六节点流水线跑一次审查，返回 (RunState, RunOutcome, Session)。
 
     失败时抛 UnreadableTargetError（与 run_one 同语义），调用方不必区分两套异常。
@@ -3681,7 +3683,7 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
     except Exception:                              # noqa: BLE001 - UI metadata only
         source_meta = None
 
-    run_id = domain_ids.format_run_id(review_id, 1)
+    run_id = resume_run_id or domain_ids.format_run_id(review_id, 1)
     session = Session(review_id, target_rel, chosen_type,
                       progress_path=progress_path)
     session.type_confidence = float(type_info.get("confidence") or 0.6)
@@ -3703,13 +3705,31 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
         integrity_out.update(integrity_inputs)
     app = ReviewApplication(
         store=FileRunStore(store) if store else None,
-        checkpoints=MemoryCheckpointStore(),
+        checkpoints=(FileCheckpointStore(STATE / "checkpoints")
+                     if store else MemoryCheckpointStore()),
         token=token,
     )
-    state = app.initial_state(
-        review_id=review_id, run_id=run_id, profile=profile,
-        target_hash=integrity_inputs["target_hash"],
-    )
+    if resume_run_id:
+        state = app.state_of(resume_run_id)
+        if state is None:
+            raise NotFoundError(f"找不到可续跑状态：{resume_run_id}")
+        if state.review_id != review_id:
+            raise ConfigError(
+                f"续跑身份不一致：状态属于 {state.review_id}，"
+                f"任务要求 {review_id}")
+        if (state.profile.id != profile.id
+                or state.profile.version != profile.version):
+            raise ConfigError(
+                f"续跑 Agent 不一致：状态为 {state.profile.id}@{state.profile.version}，"
+                f"当前为 {profile.id}@{profile.version}")
+        old_target_hash = state.artifacts.get("target_hash")
+        if old_target_hash and old_target_hash != integrity_inputs["target_hash"]:
+            raise ConfigError("待审目标已变化，不能从旧检查点续跑")
+    else:
+        state = app.initial_state(
+            review_id=review_id, run_id=run_id, profile=profile,
+            target_hash=integrity_inputs["target_hash"],
+        )
     # 外发审计（决策书 4.6）：v1 的号在进入核心后才确定，这里补登记一次。
     llm_client.update_egress_scope(
         review_id=review_id, run_id=run_id, target=target_rel)
@@ -3747,7 +3767,12 @@ def run_typed_pipeline(target_path: Path, rules, *, review_id=None,
         "handlers": {dim: (agent.handler_for(dim) or "") for dim in dims},
         "checks": list(agent.checks),
     }
-    outcome = asyncio.run(app.run(state, ports, config=config))
+    if resume_run_id:
+        outcome = asyncio.run(app.resume(resume_run_id, ports, config=config))
+        if outcome is None:
+            raise NotFoundError(f"找不到可续跑状态：{resume_run_id}")
+    else:
+        outcome = asyncio.run(app.run(state, ports, config=config))
     if context_out is not None:
         context_out.update({"scenario": scenario_info,
                             "format_spec": format_info,
@@ -4630,7 +4655,8 @@ def _end_research_egress(attempt_id, review_id, run_id, verdict, *,
 def _run_v1_core(target_path, rules, *, type_override=None, agent_id=None,
                  use_llm=False, purpose=None, purpose_max=None, review_id=None,
                  research_enabled=False, purpose_notes=None, scenario=None,
-                 format_spec=None, progress_path=None, token=None):
+                 format_spec=None, progress_path=None, token=None,
+                 resume_run_id=None):
     """执行 V1 并写正式报告；**不打印、不退出**。
 
     返回 info（state / outcome / report_path / llm_meta / context）。
@@ -4653,7 +4679,8 @@ def _run_v1_core(target_path, rules, *, type_override=None, agent_id=None,
         purpose_info=purpose_info, integrity_out=integrity_inputs,
         research_enabled=research_enabled,
         scenario_id=scenario, format_spec=format_spec,
-        context_out=context_out, progress_path=progress_path, token=token)
+        context_out=context_out, progress_path=progress_path, token=token,
+        resume_run_id=resume_run_id)
     info = {
         "state": state,
         "outcome": outcome,
@@ -4969,7 +4996,7 @@ def _path_for_record(path: Path) -> str:
 def make_task_runner(*, rules=None, type_override=None, agent_id=None,
                      scenario=None, format_spec=None, research_enabled=False,
                      purpose_max=None, purpose_notes=None, progress_path=None,
-                     diag=None):
+                     diag=None, resume_run_id=None):
     """把 V1 执行包成 TaskService 的 runner（不打印、不 sys.exit）。
 
     与 `_run_v1` 的分工：`_run_v1` 是「服务端子进程 / 直跑」入口（打印摘要、错误码），
@@ -4991,7 +5018,8 @@ def make_task_runner(*, rules=None, type_override=None, agent_id=None,
             purpose=purpose, purpose_max=purpose_max, review_id=review_id,
             research_enabled=research_enabled, purpose_notes=purpose_notes,
             scenario=scenario, format_spec=format_spec,
-            progress_path=progress_path, token=token)
+            progress_path=progress_path, token=token,
+            resume_run_id=resume_run_id)
         if diag is not None:
             diag.update(info)
         state, outcome = info["state"], info["outcome"]
@@ -5027,7 +5055,7 @@ def has_run_state(run_id) -> bool:
 def make_task_service(*, rules=None, type_override=None, agent_id=None,
                       scenario=None, format_spec=None, research_enabled=False,
                       purpose_max=None, purpose_notes=None, progress_path=None,
-                      diag=None) -> TaskService:
+                      diag=None, resume_run_id=None) -> TaskService:
     """装配任务服务：执行走 V1 核心，记录落 `state/tasks/`。
 
     `STATE` 在调用时才读：测试会把模块级目录重定向到临时目录，
@@ -5039,11 +5067,29 @@ def make_task_service(*, rules=None, type_override=None, agent_id=None,
             scenario=scenario, format_spec=format_spec,
             research_enabled=research_enabled, purpose_max=purpose_max,
             purpose_notes=purpose_notes, progress_path=progress_path,
-            diag=diag),
+            diag=diag, resume_run_id=resume_run_id),
         store=FileTaskStore(STATE / "tasks"),
         allocate=_allocate_task_review_id,
         root=ROOT,
     )
+
+
+def _v1_execution_options(*, use_llm, type_override, agent_id, purpose_max,
+                          purpose_notes, scenario, format_spec,
+                          research_enabled):
+    """任务 schema v2 的执行清单：只存重建 ports 所需的参数。"""
+    return {
+        "manifest_version": 1,
+        "engine": "v1",
+        "use_llm": use_llm,
+        "type_override": type_override,
+        "agent_id": agent_id,
+        "purpose_max": purpose_max,
+        "purpose_notes": list(purpose_notes or ()),
+        "scenario": scenario,
+        "format_spec": format_spec,
+        "research_enabled": bool(research_enabled),
+    }
 
 
 def _run_v1_via_task(target_path, rules, *, type_override=None, agent_id=None,
@@ -5056,14 +5102,20 @@ def _run_v1_via_task(target_path, rules, *, type_override=None, agent_id=None,
     子进程再建一条会把幂等键/创建时间覆盖掉（见 `main` 的分支）。
     """
     diag: dict = {}
+    execution_options = _v1_execution_options(
+        use_llm=use_llm, type_override=type_override, agent_id=agent_id,
+        purpose_max=purpose_max, purpose_notes=purpose_notes,
+        scenario=scenario, format_spec=format_spec,
+        research_enabled=research_enabled)
     service = make_task_service(
         rules=rules, type_override=type_override, agent_id=agent_id,
         scenario=scenario, format_spec=format_spec,
         research_enabled=research_enabled, purpose_max=purpose_max,
         purpose_notes=purpose_notes, progress_path=progress_path, diag=diag)
-    record = service.start_review(
+    record = service.start_review_with_options(
         target_path, profile_id=agent_id, purpose=purpose,
-        engine="v1", use_llm=use_llm)
+        engine="v1", use_llm=use_llm,
+        execution_options=execution_options)
     if record.status == RunStatus.COMPLETED.value and diag.get("report_path"):
         _print_v1_result(diag)
         return record
@@ -5074,6 +5126,45 @@ def _run_v1_via_task(target_path, rules, *, type_override=None, agent_id=None,
           f"{errors[:300]}")
     _emit_error(errors, kind="system", http_status=500)
     sys.exit(1)
+
+
+def resume_task(review_id):
+    """按任务 schema v2 的执行清单从持久检查点续跑。"""
+    record = FileTaskStore(STATE / "tasks").get(review_id)
+    if record is None:
+        raise NotFoundError(f"找不到任务：{review_id}")
+    options = dict(record.execution or {})
+    if not options:
+        raise ConfigError(
+            f"任务 {review_id} 没有执行清单（schema v1），无法安全自动续跑")
+    if not has_run_state(record.run_id):
+        raise InputError(f"任务 {review_id} 没有可加载的检查点")
+
+    diag: dict = {}
+    service = make_task_service(
+        rules=load_rules(),
+        type_override=options.get("type_override"),
+        agent_id=record.profile_id or options.get("agent_id"),
+        scenario=options.get("scenario"),
+        format_spec=options.get("format_spec"),
+        research_enabled=bool(options.get("research_enabled")),
+        purpose_max=options.get("purpose_max"),
+        purpose_notes=list(options.get("purpose_notes") or ()),
+        diag=diag,
+        resume_run_id=record.run_id,
+    )
+    try:
+        resumed = service.resume_review(
+            review_id, use_llm=options.get("use_llm"))
+    finally:
+        service.close()
+    if resumed.status == RunStatus.COMPLETED.value and diag.get("report_path"):
+        _print_v1_result(diag)
+        return resumed
+    outcome = diag.get("outcome")
+    errors = ("；".join(getattr(outcome, "errors", []) or [])
+              or resumed.error or "续跑未完成")
+    raise InputError(errors[:500])
 
 
 def make_report_service() -> ReportService:
