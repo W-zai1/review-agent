@@ -22,6 +22,7 @@ import tempfile
 import unittest
 import contextlib
 import io
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -116,7 +117,9 @@ class DoubleRunTests(unittest.TestCase):
 
         self.assertTrue(first["outcome"].ok, first["outcome"].errors)
         self.assertTrue(second["outcome"].ok, second["outcome"].errors)
-        self.assertEqual(second["outcome"].events, ())
+        self.assertEqual(
+            [event.node for event in second["outcome"].events],
+            ["resume/boundary"])
         self.assertEqual(second["state"].run_id, run_id)
 
     @unittest.skipUnless(PRIVATE_OK, "私有审查资产缺失，跳过中断续跑检查")
@@ -168,6 +171,15 @@ class DoubleRunTests(unittest.TestCase):
             review.has_run_state(record.run_id),
             "中断前应已持久化阶段状态")
 
+        old_log = review.LOGS / "v1" / review_id / "events.jsonl"
+        old_log.parent.mkdir(parents=True, exist_ok=True)
+        old_log.write_text(json.dumps({
+            "seq": 1, "run_id": record.run_id, "kind": "tool",
+            "name": "old.tool", "status": "success", "latency_ms": 1,
+            "ts": None, "ref": None,
+            "detail": {"tool": "old.tool", "status": "success"},
+        }, ensure_ascii=False) + "\n", encoding="utf-8")
+
         with TaskResumeLock(review.STATE / "tasks", review_id):
             with self.assertRaises(review.InputError):
                 review.resume_task(review_id)
@@ -179,6 +191,15 @@ class DoubleRunTests(unittest.TestCase):
         self.assertTrue(Path(resumed.report_path).exists())
         self.assertFalse(
             (review.STATE / "tasks" / f".{review_id}.resume.lock").exists())
+        events = [
+            json.loads(line) for line in old_log.read_text(
+                encoding="utf-8").splitlines() if line.strip()
+        ]
+        names = [row["name"] for row in events]
+        self.assertIn("old.tool", names, "续跑不得覆盖中断前工具日志")
+        self.assertTrue(any(name.endswith("/resume/boundary")
+                            for name in names))
+        self.assertTrue(any(name.startswith("analysis/") for name in names))
 
 
 if __name__ == "__main__":

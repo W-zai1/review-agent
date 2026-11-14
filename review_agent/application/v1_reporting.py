@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from .audit import (
     build_stream as build_audit_stream,
+    load_stream as load_audit_stream,
     to_legacy as audit_to_legacy,
     write_stream as write_audit_stream,
 )
@@ -45,14 +47,28 @@ class V1Reporter:
         """把审计事件流写成 `logs/v1/<review_id>/`，返回目录哈希。"""
         log_dir = self.logs / "v1" / review_id
         log_dir.mkdir(parents=True, exist_ok=True)
-        stream = build_audit_stream(
+        events_path = log_dir / "events.jsonl"
+        previous = load_audit_stream(events_path)
+        node_events = (outcome.state.artifacts.get("audit_node_events")
+                       or outcome.events)
+        current = list(build_audit_stream(
             run_id=outcome.state.run_id,
-            node_events=outcome.events,
+            node_events=node_events,
             tool_logs=session.tool_logs,
             decisions=session.decisions,
             checkpoints=outcome.checkpoints,
-        )
-        write_audit_stream(log_dir / "events.jsonl", stream)
+        ))
+        # 步骤事件已由 RunState 持久化；上一轮只保留工具/决策等非步骤事实，
+        # 避免续跑时把旧步骤再复制一遍。
+        preserved = [
+            event for event in previous
+            if event.kind.value not in {"step", "state"}
+        ]
+        stream = [
+            replace(event, seq=index)
+            for index, event in enumerate([*preserved, *current], start=1)
+        ]
+        write_audit_stream(events_path, stream)
         legacy = audit_to_legacy(stream)
         steps = self.progress_steps(
             outcome, purpose_info=purpose_info,
@@ -171,7 +187,7 @@ class V1Reporter:
         report = self.build_report(
             state,
             target_meta=state.artifacts.get("target_meta"),
-            events=outcome.events,
+            events=(state.artifacts.get("audit_node_events") or outcome.events),
             checkpoints=outcome.checkpoints,
             integrity_inputs=integrity_inputs,
             logs_hash=logs_hash,

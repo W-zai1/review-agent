@@ -139,6 +139,8 @@ def load_stream(path: Path) -> tuple[AuditEvent, ...]:
                 latency_ms=int(data.get("latency_ms") or 0),
                 detail=dict(data.get("detail") or {}),
                 ref=data.get("ref"),
+                ts=(datetime.datetime.fromisoformat(data["ts"])
+                    if data.get("ts") else None),
             ))
         except (ValueError, KeyError, TypeError):
             continue

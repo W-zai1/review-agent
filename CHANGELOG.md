@@ -44,6 +44,17 @@
 
 # 2026-11-14
 
+### 2026-11-14 · 修复 · 决策书 4.2-E：续跑保留历史节点与审计日志
+
+- **文件**：`review_agent/runtime/orchestrator.py`（阶段事件写回 RunState，恢复时追加边界）；`review_agent/application/audit.py`（读回事件时间戳）；`review_agent/application/v1_reporting.py`（合并上一轮非步骤事件、统一重排 seq）；`checks/test_pipeline_parity.py`（中断前日志保留、恢复边界、续跑节点断言）；`checks/test_application_service.py`（完成态续跑的边界契约）；`docs/CURRENT_STATUS.md`
+- **改了什么**：
+  1. Orchestrator 每完成一个阶段，把本阶段 `NodeEvent` 持久化到 `RunState.artifacts["audit_node_events"]`；检查点落盘时这些事件同状态一起保存，硬中断不再丢失已完成节点记录。
+  2. 从非初始状态续跑时追加 `resume/boundary` 事件，明确区分中断前与续跑后的执行段；完成态续跑不重跑节点，但仍记录边界。
+  3. `V1Reporter.write_logs()` 从 RunState 读取完整节点事件，并保留上一轮 `events.jsonl` 中的工具、决策、模型、人工等非步骤事件；排除旧步骤/状态后统一重排 `seq`，再投影 `task.json / tools.jsonl / decisions.jsonl`。
+  4. `load_stream()` 同时恢复 `ts`，避免日志合并时丢失已有时间戳。
+- **为什么**：此前节点事件只在内存，硬中断后无日志可保留；最终写日志又使用 `write` 整文件覆盖。即使检查点和任务能续跑，审计中心也看不到中断前的处理轨迹，无法回答“续跑从哪接上”。
+- **验证**：`test_pipeline_parity` 6 项 OK（中断前工具日志保留、恢复边界、续跑分析的证据链/裁定/证据/完整性）；`test_audit_stream` 14 项 OK；`test_v1_integrity` 6 项 OK；`test_application_service` 10 项 OK；全量 `checks` **989 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1，约 460s）**；`compileall` 通过；`secret_scan` 267 文件 / 命中 0。回滚：删除 RunState 事件写回、边界事件与日志合并，恢复 `write_logs` 直接覆盖；历史日志无需迁移。
+
 ### 2026-11-14 · 修复 · 决策书 4.2-D：跨进程续跑租约互斥
 
 - **文件**：新增 `review_agent/infrastructure/task_lock.py`（原子租约 + 心跳）；`review.py`（`resume_task()` 全程持锁并在锁内重读任务）；新增 `checks/test_task_lock.py`（3 项）；`checks/test_pipeline_parity.py`（续跑端到端增加锁冲突/释放断言）；`review_agent/infrastructure/__init__.py`；`docs/CURRENT_STATUS.md`

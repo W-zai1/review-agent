@@ -35,8 +35,8 @@ import datetime
 import hashlib
 import json
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -226,6 +226,12 @@ class Orchestrator:
 
     async def run(self, state: RunState) -> RunOutcome:
         events: list[NodeEvent] = []
+        if len(state.completed_stages) > 1:
+            boundary = NodeEvent(
+                stage=state.stage, node="resume/boundary", ok=True,
+                attempt=0, warnings=("从持久检查点续跑",))
+            events.append(boundary)
+            state = self._remember_events(state, (boundary,))
         while state.stage not in state.completed_stages:
             stage = state.stage
             # 阶段边界（原子点）：取消在这里生效 = 已完成的阶段全部保留，
@@ -241,6 +247,7 @@ class Orchestrator:
                     checkpoints=self._history(state),
                 )
             results: list[NodeResult] = []
+            stage_event_start = len(events)
             next_seq = next_finding_seq(state)
             for node in nodes:
                 result, node_events = await self._run_node(node, state, next_seq)
@@ -261,6 +268,7 @@ class Orchestrator:
             merged = merge_results(results)
             state = advance(state, stage, merged,
                             required=stage_requirements(nodes))
+            state = self._remember_events(state, events[stage_event_start:])
             self._save(state, stage)
         return RunOutcome(state=state, status=COMPLETED, events=tuple(events),
                           checkpoints=self._history(state))
@@ -338,3 +346,14 @@ class Orchestrator:
 
     def _history(self, state: RunState) -> tuple[Checkpoint, ...]:
         return self.checkpoints.for_run(state.run_id) if self.checkpoints else ()
+
+    @staticmethod
+    def _remember_events(state: RunState, events: Iterable[NodeEvent]) -> RunState:
+        rows = [event.as_dict() for event in events]
+        if not rows:
+            return state
+        previous = list(state.artifacts.get("audit_node_events") or ())
+        return replace(state, artifacts={
+            **state.artifacts,
+            "audit_node_events": [*previous, *rows],
+        })

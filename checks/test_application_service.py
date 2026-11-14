@@ -196,7 +196,10 @@ class ResumeTests(unittest.TestCase):
             asyncio.run(app.run(state, ports(), config=config()))
             again = asyncio.run(app.resume(RUN_ID, ports(), config=config()))
             self.assertTrue(again.ok)
-            self.assertEqual(again.events, ())
+            self.assertEqual(
+                [event.node for event in again.events],
+                ["resume/boundary"],
+                "完成态续跑不重跑节点，但必须留恢复边界")
 
     def test_resume_unknown_run_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
