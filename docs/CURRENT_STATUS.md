@@ -65,7 +65,7 @@
 | 条目 | 现状 | 影响 |
 |---|---|---|
 | 4.1 双引擎 | v1 已是默认，但 Legacy 仍可运行、两套报告 schema 并存 | 新功能只进 v1；legacy 仅回滚/对照 |
-| 4.2 任务生命周期 | 已统一：CLI 已有状态、跨进程取消、恢复体检和自动续跑；task schema v2 保存执行清单并兼容 v1。剩余：跨进程同时续跑未加 OS 级互斥；续跑节点日志会覆盖同 review_id 的上一轮日志 | 单进程续跑闭环；并发与历史日志保留待增强 |
+| 4.2 任务生命周期 | 已统一：CLI 已有状态、跨进程取消、恢复体检和自动续跑；task schema v2 保存执行清单并兼容 v1；同一 review_id 的续跑由跨进程租约互斥。剩余：续跑节点日志会覆盖同 review_id 的上一轮日志 | 并发续跑已拒绝，历史节点日志保留待增强 |
 | 4.4 证据可信度 | 已整改反证链路：被外部检索反驳的主张，其引用证据落 `CONTRADICTED` 并指名外部证据（不再是 VERIFIED）。剩余：supported 主张不产证据（样本②只能从 `research.supported` 段看出）、文本存在性仍与事实成立同轴（B 档未做） | 反证可见；「文档写过」与「事实成立」仍靠强度语义区分 |
 | 4.5 工具与能力层 | `tools/*` 与注册表工具两套并存，部分能力只在一边 | 行为分叉风险 |
 | 4.6 外发审计 | 已整改：Research 与 LLM 都是「先登记、写不进不发、结果配对」；LLM 的记录点在 `tools/llm_client.chat()`，CLI 在 `interfaces/cli/commands.py::_run_review` 设上下文、server 在 `server.py::_run_review_job` 起进程前登记。剩余：`state/egress.log` 没有轮转/容量策略 | 外发可追溯；日志长期增长需运维关注 |
@@ -77,8 +77,8 @@
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 公开不变量 | `python -m unittest discover -s checks` | **986 项 OK（skipped=11，约 42s）** |
-| 私有回归 | `python -m unittest discover -s tests` | **686 项 OK（skipped=1，约 563s）** |
+| 公开不变量 | `python -m unittest discover -s checks` | **989 项 OK（skipped=11，约 27s）** |
+| 私有回归 | `python -m unittest discover -s tests` | **686 项 OK（skipped=1，约 453s）** |
 | 密钥扫描 | `python tools/secret_scan.py` | 265 文件 / 命中 0 |
 | 账本守门 | `python tools/changelog_guard.py` | 退出 0 |
 | 发布检查 | `python tools/release_check.py --no-tests` | 快照 258 文件 / 3,766,759 字节 / 顶层 24 项 → 通过 |
@@ -90,7 +90,7 @@
 
 1. **阶段 1（消除双重事实来源）**：4.1 固定 V1 为唯一新功能入口、Legacy 冻结；
    4.2 任务生命周期闭环已完成：schema v2 执行清单、阶段状态持久化、CLI 自动续跑。
-   后续增强：跨进程续跑互斥与历史节点日志合并。
+   后续增强：历史节点日志合并。
 2. **阶段 2（证据与外发）**：4.6 外发审计已完成（Research + LLM 两条路径同一约束：
    先登记、写不进不发、结果配对）；4.4 反证链路已接通（`CONTRADICTED` 可达），
    剩余「文本存在性 vs 事实核验」分轴（B 档，需决策是否把锚定降为 PARTIAL）。

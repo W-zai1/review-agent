@@ -125,6 +125,10 @@ from review_agent.runtime import (
 # 结果两边的 seq 口径不同（一个按行数、一个按记录数），删过报告之后必然对不上。
 from review_agent.infrastructure import ledger as ledger_store
 from review_agent.infrastructure.report_store import ReportStore
+from review_agent.infrastructure.task_lock import (
+    TaskLockUnavailable,
+    TaskResumeLock,
+)
 from review_agent.runtime.nodes import (
     ClaimVerdict,
     CrossReviewerNode,
@@ -5130,6 +5134,15 @@ def _run_v1_via_task(target_path, rules, *, type_override=None, agent_id=None,
 
 def resume_task(review_id):
     """按任务 schema v2 的执行清单从持久检查点续跑。"""
+    try:
+        with TaskResumeLock(STATE / "tasks", review_id):
+            return _resume_task_locked(review_id)
+    except TaskLockUnavailable as exc:
+        raise InputError(str(exc)) from exc
+
+
+def _resume_task_locked(review_id):
+    """已持有跨进程租约时的续跑主体。"""
     record = FileTaskStore(STATE / "tasks").get(review_id)
     if record is None:
         raise NotFoundError(f"找不到任务：{review_id}")

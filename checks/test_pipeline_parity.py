@@ -25,6 +25,8 @@ import io
 from pathlib import Path
 from unittest import mock
 
+from review_agent.infrastructure.task_lock import TaskResumeLock
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -166,11 +168,17 @@ class DoubleRunTests(unittest.TestCase):
             review.has_run_state(record.run_id),
             "中断前应已持久化阶段状态")
 
+        with TaskResumeLock(review.STATE / "tasks", review_id):
+            with self.assertRaises(review.InputError):
+                review.resume_task(review_id)
+
         with contextlib.redirect_stdout(io.StringIO()):
             resumed = review.resume_task(review_id)
         self.assertEqual(resumed.status, "completed")
         self.assertTrue(resumed.report_path)
         self.assertTrue(Path(resumed.report_path).exists())
+        self.assertFalse(
+            (review.STATE / "tasks" / f".{review_id}.resume.lock").exists())
 
 
 if __name__ == "__main__":

@@ -44,6 +44,17 @@
 
 # 2026-11-14
 
+### 2026-11-14 · 修复 · 决策书 4.2-D：跨进程续跑租约互斥
+
+- **文件**：新增 `review_agent/infrastructure/task_lock.py`（原子租约 + 心跳）；`review.py`（`resume_task()` 全程持锁并在锁内重读任务）；新增 `checks/test_task_lock.py`（3 项）；`checks/test_pipeline_parity.py`（续跑端到端增加锁冲突/释放断言）；`review_agent/infrastructure/__init__.py`；`docs/CURRENT_STATUS.md`
+- **改了什么**：
+  1. 每个 `review_id` 使用独立锁文件，`O_CREAT|O_EXCL` 原子占用；锁内容带随机 token、PID 和创建时间。
+  2. 持锁后台线程每 5 秒刷新 mtime，租约默认 30 秒；正常/异常退出都停止心跳并只删除 token 匹配的自己锁文件。
+  3. 锁已存在且心跳新鲜时拒绝第二次续跑；进程崩溃留下陈旧锁后，超过租约期限可由下一进程接管。
+  4. `resume_task()` 在锁内重新读取 TaskRecord、执行清单和检查点，覆盖整个服务装配、续跑、报告和任务终态更新。
+- **为什么**：4.2-C 的进程内 `is_live()` 无法约束两个独立 CLI 进程；两边都能读到 `state/runs/`，会重复恢复、竞争写报告和任务状态。只加线程锁不能跨进程生效。
+- **验证**：`checks.test_task_lock` 3 项 OK（同进程第二所有者、真实子进程持锁、陈旧租约接管）；`test_pipeline_parity` 6 项 OK（续跑端到端含抢锁失败与锁释放）；全量 `checks` **989 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1，约 453s）**；首次私有全量遇到一次独立复制临时候选文件竞态，单测通过后完整重跑通过；`compileall` 通过；`secret_scan` 267 文件 / 命中 0。回滚：删除锁模块、CLI 入口的上下文包装和锁测试；已释放锁文件无需迁移。
+
 ### 2026-11-14 · 新增 · 决策书 4.2-C：任务 schema v2 与 CLI 自动续跑
 
 - **文件**：`review_agent/application/tasks.py`（task schema v2、执行清单、`resume_review()`）；`review.py`（执行清单、续跑入口、V1 身份/目标哈希/Agent 版本校验）；`interfaces/cli/parser.py` / `commands.py`（`--task-resume`）；`interfaces/web/review_requests.py` / `review_start.py` / `review_sync.py`（Web/同步入口保存执行清单）；`checks/test_task_service.py`、`checks/test_pipeline_parity.py`、`checks/test_cli_task_control.py`、`checks/test_server_tasks.py`、`checks/test_sync_review.py`；`docs/CURRENT_STATUS.md`
