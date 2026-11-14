@@ -61,13 +61,23 @@ def _run_task_control(opts, runtime):
             if record is None:
                 exc = runtime.NotFoundError(f"找不到任务：{opts.task_review_id}")
                 _fail(runtime, str(exc), exc, 1)
-        else:
+        elif opts.task_action == "cancel":
             try:
                 record = service.cancel(
                     opts.task_review_id,
                     reason=opts.task_reason or "CLI 用户取消")
             except runtime.DomainError as exc:
                 _fail(runtime, f"取消任务失败：{exc}", exc, 1)
+        else:
+            report = service.recover(has_checkpoint=runtime.has_run_state)
+            payload = {
+                "ok": True,
+                "resumable": [record.to_dict() for record in report.resumable],
+                "orphaned": [record.to_dict() for record in report.orphaned],
+                "total": report.total,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return report
         payload = {"ok": True, **record.to_dict()}
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return record

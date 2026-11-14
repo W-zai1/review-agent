@@ -57,14 +57,20 @@ def parse_args(argv=None, *, runtime):
         return None
     task_action = None
     task_review_id = None
-    for flag, action in (("--task-status", "status"),
-                         ("--task-cancel", "cancel")):
+    for flag, action, needs_id in (
+            ("--task-status", "status", True),
+            ("--task-cancel", "cancel", True),
+            ("--task-recover", "recover", False)):
         if flag not in args:
             continue
         if task_action is not None:
-            print("--task-status 与 --task-cancel 不能同时使用")
+            print("--task-status / --task-cancel / --task-recover 不能同时使用")
             sys.exit(2)
         i = args.index(flag)
+        if not needs_id:
+            task_action = action
+            del args[i]
+            continue
         if i + 1 >= len(args) or args[i + 1].startswith("--"):
             del args[i]
             print(f"{flag} 缺少任务号（形如 R-20261114-001）")
@@ -322,7 +328,7 @@ def parse_args(argv=None, *, runtime):
               "写报告 outputs/v1/ 并落状态；legacy 为旧链路回滚；shadow 出旧报告并双跑比对，"
               "差异写 state/double_run/；shadow 需配合 --no-llm，v1 可带 --llm）；"
               "--task-status R-... 查看任务记录；--task-cancel R-... 取消任务"
-              "（可选 --task-reason 文案）；"
+              "（可选 --task-reason 文案）；--task-recover 体检可续/已废弃任务；"
               "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return None
     target_arg = args[0]

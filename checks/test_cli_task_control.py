@@ -15,6 +15,10 @@ class _Runtime:
     def _take_engine(args):
         return "v1", args
 
+    @staticmethod
+    def has_run_state(run_id):
+        return run_id.endswith("-RUN01")
+
 
 class ParseTaskControlTests(unittest.TestCase):
     def test_task_cancel_is_an_action_not_a_target(self):
@@ -35,6 +39,11 @@ class ParseTaskControlTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["--task-status"], runtime=_Runtime())
 
+    def test_task_recover_does_not_require_review_id(self):
+        opts = parser.parse_args(["--task-recover"], runtime=_Runtime())
+        self.assertEqual(opts.task_action, "recover")
+        self.assertIsNone(opts.task_review_id)
+
 
 class CommandTaskControlTests(unittest.TestCase):
     def _service(self, record):
@@ -54,6 +63,16 @@ class CommandTaskControlTests(unittest.TestCase):
                         "status": "cancelled",
                         "error": reason,
                     },
+                )
+
+            def recover(self, *, has_checkpoint=None):
+                calls.append(("recover", has_checkpoint))
+                return SimpleNamespace(
+                    resumable=(SimpleNamespace(
+                        to_dict=lambda: {"review_id": "R-20261114-002",
+                                         "status": "running"}),),
+                    orphaned=(),
+                    total=1,
                 )
 
             def close(self):
@@ -94,4 +113,21 @@ class CommandTaskControlTests(unittest.TestCase):
         self.assertEqual(
             calls[0], ("cancel", "R-20261114-001", "运维窗口取消"))
         self.assertEqual(json.loads(out.getvalue())["status"], "cancelled")
+        self.assertEqual(calls[-1], ("close",))
+
+    def test_recover_reports_resumable_and_orphaned_tasks(self):
+        service, calls = self._service(None)
+        runtime = _Runtime()
+        runtime.make_task_service = lambda: service
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            commands.main(["--task-recover"], runtime=runtime)
+
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["resumable"][0]["status"], "running")
+        self.assertEqual(payload["orphaned"], [])
+        self.assertEqual(calls[0][0], "recover")
+        self.assertIs(calls[0][1], runtime.has_run_state)
         self.assertEqual(calls[-1], ("close",))

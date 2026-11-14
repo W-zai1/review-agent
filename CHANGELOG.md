@@ -44,6 +44,13 @@
 
 # 2026-11-14
 
+### 2026-11-14 · 新增 · 决策书 4.2-B：CLI 任务恢复体检
+
+- **文件**：`interfaces/cli/parser.py`（新增 `--task-recover`）；`interfaces/cli/commands.py`（输出 `resumable` / `orphaned` / `total`）；`checks/test_cli_task_control.py`（+2 项）；`docs/CURRENT_STATUS.md`（§2 / §4 / §5 / §6 / §7）
+- **改了什么**：CLI 新增无任务号要求的 `--task-recover`。它复用 `TaskService.recover(has_checkpoint=runtime.has_run_state)`，与 Web 启动体检使用同一套判断：可续任务原样列出；无检查点或超龄失联的任务落 FAILED 并归入 `orphaned`。输出为顶层 JSON，便于脚本读取。
+- **为什么**：4.2-A 已补齐状态与取消，但 CLI 仍无法在服务中断后执行同一套恢复体检，运维只能读磁盘或依赖 Web 启动。本步先消除入口缺口；自动重建 ports 并从检查点续跑属于另一项行为，本次不伪装成已完成。
+- **验证**：`checks.test_cli_task_control` 7 项 OK；全量 `checks` **974 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1）**；`compileall` 通过；`secret_scan` 265 文件 / 命中 0；`changelog_guard` 漏登记 0。回滚：删除 CLI 的 `recover` 分支和两项测试，恢复 `TaskService.recover()` 原调用方，无数据迁移。
+
 ### 2026-11-14 · 新增 · 决策书 4.2-A：CLI 跨进程取消与任务状态查询
 
 - **文件**：`review_agent/application/tasks.py`（执行期间轮询持久任务记录，镜像外部取消）；`interfaces/cli/parser.py`（新增 `--task-status` / `--task-cancel` / `--task-reason`）；`interfaces/cli/commands.py`（任务控制分发与 JSON 输出）；`checks/test_task_acceptance.py`（+1 项跨进程取消）；新增 `checks/test_cli_task_control.py`（5 项）；`docs/CURRENT_STATUS.md`（§2 / §4 / §5 / §6 / §7）
