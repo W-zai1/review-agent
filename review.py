@@ -4335,6 +4335,13 @@ def _run_shadow(report, target_path, rules, *, type_override=None, agent_id=None
         "engine": "shadow",
         "status": outcome.status,
         "errors": list(outcome.errors),
+        "sample": {
+            "target_hash": integrity_inputs.get("target_hash"),
+            "profile_id": state.profile.id,
+            "profile_version": state.profile.version,
+            "model_version": report.get("model_version"),
+            "target_type": (state.artifacts.get("target_meta") or {}).get("type"),
+        },
         "diff": diff,
         "state": state_to_dict(state),
     }

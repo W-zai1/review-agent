@@ -23,8 +23,9 @@ import double_run                                       # noqa: E402
 
 
 def payload(rid, *, ok=True, unexplained=0, missing=0, folded=0,
-            verdict_new="warn", verdict_legacy="warn", errors=()):
-    return {
+            verdict_new="warn", verdict_legacy="warn", errors=(),
+            target_hash=None, profile="doc-review", model="m1"):
+    data = {
         "review_id": rid,
         "engine": "shadow",
         "status": "completed",
@@ -38,6 +39,14 @@ def payload(rid, *, ok=True, unexplained=0, missing=0, folded=0,
             "folded": [["R-3", "引用"] for _ in range(folded)],
         },
     }
+    if target_hash:
+        data["sample"] = {
+            "target_hash": target_hash,
+            "profile_id": profile,
+            "profile_version": "1.0",
+            "model_version": model,
+        }
+    return data
 
 
 class SummarizeTests(unittest.TestCase):
@@ -102,6 +111,35 @@ class SummarizeTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("样本不足", reasons[0])
 
+    def test_duplicate_targets_do_not_satisfy_representative_requirement(self):
+        rows = [
+            payload("R-20261101-001", target_hash="a" * 64),
+            payload("R-20261101-002", target_hash="a" * 64),
+        ]
+        summary = double_run.summarize(rows)
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["unique_samples"], 1)
+        passed, reasons = double_run.check(summary, require=2)
+        self.assertFalse(passed)
+        self.assertIn("代表性样本不足", reasons[0])
+
+    def test_seven_consecutive_days_are_required(self):
+        consecutive = [
+            payload(f"R-202611{day:02d}-001", target_hash=str(day) * 64)
+            for day in range(1, 8)
+        ]
+        summary = double_run.summarize(consecutive)
+        self.assertEqual(summary["continuous_days"], 7)
+        passed, reasons = double_run.check(summary, days=7)
+        self.assertTrue(passed, reasons)
+
+        gapped = consecutive[:3] + consecutive[4:]
+        summary = double_run.summarize(gapped)
+        self.assertLess(summary["continuous_days"], 7)
+        passed, reasons = double_run.check(summary, days=7)
+        self.assertFalse(passed)
+        self.assertIn("连续观察不足", reasons[0])
+
 
 class LoadTests(unittest.TestCase):
     def setUp(self):
@@ -129,6 +167,14 @@ class LoadTests(unittest.TestCase):
         self.write("R-20261101-002.json", payload("R-20261101-002", ok=False,
                                                   unexplained=1))
         self.assertEqual(double_run.main(["--root", str(self.base.parents[1])]), 1)
+
+    def test_cli_day_gate(self):
+        self.write("R-20261101-001.json", payload("R-20261101-001"))
+        root = str(self.base.parents[1])
+        self.assertEqual(
+            double_run.main(["--root", root, "--days", "1"]), 0)
+        self.assertEqual(
+            double_run.main(["--root", root, "--days", "2"]), 1)
 
 
 if __name__ == "__main__":

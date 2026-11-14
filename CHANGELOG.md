@@ -44,6 +44,18 @@
 
 # 2026-11-14
 
+### 2026-11-14 · 修改 · 决策书 4.1-A：双跑门槛校验代表样本与连续天数
+
+- **文件**：`tools/double_run.py`（代表性样本身份、连续天数、`--days`）；`review.py`（新增 shadow payload 的 sample 元信息）；`checks/test_double_run.py`（+3 项）；`docs/CURRENT_STATUS.md`
+- **改了什么**：
+  1. 每个新 shadow 结果保存 `target_hash / profile_id / profile_version / model_version / target_type`；汇总时以「目标 + Profile + 模型」作为代表样本身份，同目标重复运行不再虚增样本数。
+  2. 汇总新增 `unique_samples / observed_days / continuous_days`；`--require 20` 现在约束代表样本而非原始运行数。
+  3. 新增 `--days 7`，按日历日期计算最长连续观测段；有日期缺口时明确报“连续观察不足”。
+  4. `check()` 继续要求未解释差异、缺失和裁定冲突均为 0。
+- **为什么**：决策书 4.1 的门槛是“至少 20 个代表性样本、连续观察不少于 7 天、未解释差异为 0”。原工具只校验原始文件数和差异，重复跑同一目标也能凑数，且无法回答是否连续。
+- **验证**：`test_double_run` 16 项 OK（重复目标挡门槛、7 天连续窗口、断日拒绝、CLI `--days`）；全量 `checks` **992 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1，约 455s）**；`compileall` 通过；`secret_scan` 267 文件 / 命中 0。当前真实仓库 `--require 20 --days 7`：5 条记录、2 个代表样本、连续 1 天、0 差异，结论未通过（代表性样本不足、连续观察不足）。
+- **未完成**：4.1 切流结论必须等待 20 个代表性真实/脱敏样本及连续 7 天观察；工具门槛已就绪，不能用合成数据或重复运行绕过。
+
 ### 2026-11-14 · 修复 · 决策书 4.2-E：续跑保留历史节点与审计日志
 
 - **文件**：`review_agent/runtime/orchestrator.py`（阶段事件写回 RunState，恢复时追加边界）；`review_agent/application/audit.py`（读回事件时间戳）；`review_agent/application/v1_reporting.py`（合并上一轮非步骤事件、统一重排 seq）；`checks/test_pipeline_parity.py`（中断前日志保留、恢复边界、续跑节点断言）；`checks/test_application_service.py`（完成态续跑的边界契约）；`docs/CURRENT_STATUS.md`
