@@ -22,6 +22,7 @@ import io
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -271,6 +272,44 @@ class RecoverabilityTests(_Harness):
         report = service.recover(has_checkpoint=lambda run_id: True)
         self.assertEqual(len(report.resumable), 1)
         self.assertEqual(report.orphaned, ())
+
+
+class CrossProcessCancelTests(_Harness):
+    """CLI 是独立进程：取消必须靠持久任务记录到达执行进程。"""
+
+    def test_external_cancel_reaches_executing_runner(self):
+        started = threading.Event()
+        result = {}
+        observed = {}
+
+        def runner(target, *, review_id, token=None, **kwargs):
+            started.set()
+            deadline = time.monotonic() + 2
+            while not token.cancelled and time.monotonic() < deadline:
+                time.sleep(0.01)
+            observed["cancelled"] = bool(token and token.cancelled)
+            return TaskOutcome(
+                status=RunStatus.ABORTED, stage=Stage.ANALYSIS,
+                error="cancelled")
+
+        executing = self.make_service(runner)
+        writer = self.make_service(lambda *args, **kwargs: TaskOutcome(
+            status=RunStatus.COMPLETED, stage=Stage.FINALIZE))
+
+        worker = threading.Thread(
+            target=lambda: result.update(
+                record=executing.start_review(self.target)))
+        worker.start()
+        self.assertTrue(started.wait(1), "runner 没有开始")
+
+        review_id = self.tasks.all()[0].review_id
+        writer.cancel(review_id, reason="外部 CLI 取消")
+        worker.join(3)
+
+        self.assertFalse(worker.is_alive(), "外部取消没有让 runner 结束")
+        self.assertTrue(observed.get("cancelled"),
+                        "外部取消没有传到执行中的 token")
+        self.assertEqual(result["record"].status, RunStatus.CANCELLED.value)
 
 
 # ---------------------------------------------------------------------------

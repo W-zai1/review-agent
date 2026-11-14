@@ -24,8 +24,9 @@
     * **不复制恢复语义**：续跑由 `ReviewApplication.resume(run_id)` +
       `FileRunStore` 负责（见 runtime/serialization.py）。`recover()` 只回答
       「该不该续」，不自己再实现一套「从哪继续」。
-    * **进程内才有的东西不落盘**：取消令牌是运行时对象。跨进程取消不支持，
-      要靠入口改进程内调用（见 docs/V1-架构收口与整改方案.md 的 C2）。
+    * **取消信号借任务记录跨进程传播**：令牌仍是进程内对象，但执行中的
+      `TaskService` 会观察同一份持久记录；外部 CLI 写入 CANCELLED 后，
+      执行侧在下一个节点/阶段边界协作式退出。
 """
 from __future__ import annotations
 
@@ -296,6 +297,9 @@ class TaskService:
         # 这两件事在不同线程：不互斥就会出现「取消写 CANCELLED、执行线程写 RUNNING」
         # 的覆盖，用户看到取消了却照样跑完。
         self._state_lock = threading.RLock()
+        # 外部 CLI 与服务端可能是不同进程，不能直接拿到这里的 token。
+        # 轮询周期保持短于常见节点耗时；测试可覆盖此私有值加速。
+        self._cancel_poll = 0.2
 
     # ---- 写 ----
     def start_review(self, target: Path | str, *, profile_id: str | None = None,
@@ -407,8 +411,8 @@ class TaskService:
           * 已 CANCELLED → 原样返回（幂等：用户连点两下不该报错）
           * 已终态（completed / failed / aborted）→ 抛 InvalidTransition
             （改历史结论不是"取消"，那是另一件事）
-          * 执行者只在本进程内才有令牌。跨进程取消**不支持**：服务端必须改进程内
-            调用（见 V1 方案 C2），在那之前「取消」只能取消本进程发起的任务。
+          * 本进程有令牌时直接置位；外部 CLI 进程只能写这条持久记录，
+            执行侧的观察器发现 CANCELLED 后会在节点/阶段边界协作式退出。
         """
         with self._state_lock:
             record = self._require(review_id)
@@ -572,6 +576,16 @@ class TaskService:
         call = lambda: self._call_runner(runner, record, target_path, token,  # noqa: E731
                                          use_llm)
         cancelled_by_user = False
+        stop_watch = threading.Event()
+        watcher = None
+        if self._runner_accepts_token(runner):
+            watcher = threading.Thread(
+                target=self._watch_persisted_cancel,
+                args=(record.review_id, token, stop_watch),
+                name=f"cancel-watch-{record.review_id}",
+                daemon=True,
+            )
+            watcher.start()
         try:
             if timeout is None:
                 outcome = call()
@@ -596,6 +610,9 @@ class TaskService:
             self._forget(record.review_id)
             raise
         finally:
+            stop_watch.set()
+            if watcher is not None:
+                watcher.join(timeout=max(1.0, self._cancel_poll * 2))
             # 记下"跑之前是不是已被取消"，再作废令牌：
             # `is_live()` 靠令牌存在与否判断本进程还有没有执行者，
             # 所以运行一结束就必须清掉，否则恢复逻辑会以为它还在跑。
@@ -620,6 +637,20 @@ class TaskService:
         record = self._finish(record, outcome)
         self._forget(record.review_id)
         return record
+
+    def _watch_persisted_cancel(self, review_id: str, token: CancellationToken,
+                                stop: threading.Event) -> None:
+        """把其他进程写下的 CANCELLED 转成本进程的协作式取消令牌。"""
+        while not stop.wait(self._cancel_poll):
+            try:
+                current = self._store.get(review_id)
+            except (OSError, ValueError):
+                # 原子 replace 期间可能出现瞬时读失败；下一轮继续观察。
+                continue
+            if current is None or current.status != RunStatus.CANCELLED.value:
+                continue
+            token.cancel(current.error or "任务已被外部进程取消")
+            return
 
     def _call_runner(self, runner: Runner, record: TaskRecord, target_path: Path,
                      token: CancellationToken, use_llm: bool) -> TaskOutcome:

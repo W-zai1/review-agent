@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -46,7 +47,32 @@ def main(argv=None, *, runtime):
     opts = parse_args(argv, runtime=runtime)
     if opts is None:
         return
+    if opts.task_action:
+        return _run_task_control(opts, runtime)
     return _run_review(opts, runtime)
+
+
+def _run_task_control(opts, runtime):
+    """只读状态与取消：复用 TaskService，不进入审查装配。"""
+    service = runtime.make_task_service()
+    try:
+        if opts.task_action == "status":
+            record = service.get_task(opts.task_review_id)
+            if record is None:
+                exc = runtime.NotFoundError(f"找不到任务：{opts.task_review_id}")
+                _fail(runtime, str(exc), exc, 1)
+        else:
+            try:
+                record = service.cancel(
+                    opts.task_review_id,
+                    reason=opts.task_reason or "CLI 用户取消")
+            except runtime.DomainError as exc:
+                _fail(runtime, f"取消任务失败：{exc}", exc, 1)
+        payload = {"ok": True, **record.to_dict()}
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return record
+    finally:
+        service.close()
 
 
 def _run_review(opts, runtime):

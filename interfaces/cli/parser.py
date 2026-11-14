@@ -33,6 +33,9 @@ class CliOptions:
     format_spec: dict | str | None = None
     research_enabled: bool = False
     review_id: str | None = None
+    task_action: str | None = None
+    task_review_id: str | None = None
+    task_reason: str | None = None
 
 
 def parse_args(argv=None, *, runtime):
@@ -52,6 +55,39 @@ def parse_args(argv=None, *, runtime):
     engine, args = runtime._take_engine(args)
     if engine == "off":
         return None
+    task_action = None
+    task_review_id = None
+    for flag, action in (("--task-status", "status"),
+                         ("--task-cancel", "cancel")):
+        if flag not in args:
+            continue
+        if task_action is not None:
+            print("--task-status 与 --task-cancel 不能同时使用")
+            sys.exit(2)
+        i = args.index(flag)
+        if i + 1 >= len(args) or args[i + 1].startswith("--"):
+            del args[i]
+            print(f"{flag} 缺少任务号（形如 R-20261114-001）")
+            sys.exit(2)
+        task_action = action
+        task_review_id = args[i + 1]
+        del args[i:i + 2]
+    task_reason = None
+    if "--task-reason" in args:
+        i = args.index("--task-reason")
+        if task_action != "cancel":
+            print("--task-reason 只能配合 --task-cancel 使用")
+            sys.exit(2)
+        if i + 1 >= len(args) or args[i + 1].startswith("--"):
+            del args[i]
+            print("--task-reason 缺少取值")
+            sys.exit(2)
+        task_reason = args[i + 1]
+        del args[i:i + 2]
+    if task_action is not None:
+        return CliOptions(
+            engine=engine, task_action=task_action,
+            task_review_id=task_review_id, task_reason=task_reason)
     if "--scenario" in args:
         i = args.index("--scenario")
         if i + 1 < len(args):
@@ -285,6 +321,8 @@ def parse_args(argv=None, *, runtime):
               "--engine legacy|v1|shadow 选择执行引擎（v1 默认；v1 跑八阶段流水线、"
               "写报告 outputs/v1/ 并落状态；legacy 为旧链路回滚；shadow 出旧报告并双跑比对，"
               "差异写 state/double_run/；shadow 需配合 --no-llm，v1 可带 --llm）；"
+              "--task-status R-... 查看任务记录；--task-cancel R-... 取消任务"
+              "（可选 --task-reason 文案）；"
               "--no-gap-log 不把知识库缺口写进 state/（缺口里含被审文本片段，涉密材料用）")
         return None
     target_arg = args[0]

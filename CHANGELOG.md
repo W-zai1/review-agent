@@ -42,6 +42,18 @@
 
 ---
 
+# 2026-11-14
+
+### 2026-11-14 · 新增 · 决策书 4.2-A：CLI 跨进程取消与任务状态查询
+
+- **文件**：`review_agent/application/tasks.py`（执行期间轮询持久任务记录，镜像外部取消）；`interfaces/cli/parser.py`（新增 `--task-status` / `--task-cancel` / `--task-reason`）；`interfaces/cli/commands.py`（任务控制分发与 JSON 输出）；`checks/test_task_acceptance.py`（+1 项跨进程取消）；新增 `checks/test_cli_task_control.py`（5 项）；`docs/CURRENT_STATUS.md`（§2 / §4 / §5 / §6 / §7）
+- **改了什么**：
+  1. `TaskService._execute()` 在 runner 接受 token 时启动私有取消观察线程，按 0.2 秒轮询同一份持久任务记录；外部 CLI 把记录写成 `CANCELLED` 后，观察器置位执行进程的 `CancellationToken`，V1 在节点/阶段边界协作式退出。观察线程只存活于本次执行，`finally` 中停止并回收。
+  2. CLI 增加 `--task-status R-...`、`--task-cancel R-... [--task-reason 文案]`。两者复用 `make_task_service()` 的同一个 `state/tasks/` 事实源；输出顶层 JSON（`ok` + 任务字段），不进入待审目标解析，也不加载规则/模型。
+  3. 重复取消仍幂等；终态任务仍由 `InvalidTransition` 拒绝。现有审查命令、`TaskService.cancel()` 公共签名、报告 schema 均未改变。
+- **为什么**：CLI 和取消请求通常位于两个进程，原实现只有执行进程内的 token；外部实例即使把记录改成 `CANCELLED`，正在运行的 runner 仍会继续跑完。没有 `--task-status` 时，CLI 运维人员也无法使用与 Web 相同的任务事实源查看状态。本次只解决取消与状态查询；从检查点自动续跑仍留给 4.2-B。
+- **验证**：`checks.test_task_acceptance` 13 项 OK（新增外部取消到达执行 token）；新增 `checks.test_cli_task_control` 5 项 OK；任务相关 6 组共 **97 项 OK**；全量 `checks` **972 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1）**；`compileall` 通过；`secret_scan` 265 文件 / 命中 0；`git diff --check` 通过。回滚：还原上述三个生产文件和两个测试文件，删除本账本条目，无数据迁移；已写下的任务记录无需修复。
+
 # 2026-11-12
 
 ### 2026-11-12 · 修改 · 决策书 4.4：被外部检索反驳的引用证据落 `CONTRADICTED`

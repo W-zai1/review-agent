@@ -6,7 +6,7 @@
 > 文中每条结论都尽量带 `file:line` 或命令；与代码冲突时以代码 + 测试为准，
 > 并立刻回来改本文件。
 >
-> **最后核对：2026-11-12**（Python 3.14.0 / Windows 11 10.0.26100 / HEAD `69a9d72`）
+> **最后核对：2026-11-14**（Python 3.14.0 / Windows 11 10.0.26100 / 本轮基线 `db38d1a`）
 
 ## 1. 版本与运行环境
 
@@ -24,6 +24,7 @@
 | 入口 | 命令 | 说明 |
 |---|---|---|
 | CLI | `python review.py <target> [--engine v1\|legacy] [--agent <name>] [--no-llm]` | 缺省 `--engine` 取环境变量 `REVIEW_ENGINE`，再缺省 **v1**（`review.py:4245-4255`；`:4241` 明写「正式执行链路是 v1（--engine v1，默认）」） |
+| CLI 任务控制 | `python review.py --task-status R-...` / `--task-cancel R-... [--task-reason 文案]` | 与 Web 共用 `state/tasks/` 任务记录；外部取消通过持久状态观察器传到执行 token（决策书 4.2-A） |
 | Web 控制台 | `python server.py [--port 8000]` → `http://127.0.0.1:8000` | 零依赖，仅标准库（`server.py` 文件头与 `main()`） |
 | 控制台快捷方式 | `start-console.bat` | 调 `server.py` |
 
@@ -53,7 +54,7 @@
 |---|---|---|
 | 决策书 **4.8** | 外部 linter 降级与密钥扫描边界：`lint_status` / `secret_status` 双轴，补齐权限 / 其他 OSError / 非零退出码，密钥扫描独立执行 | `checks/test_lint.py` 13 项；全量 `checks` 921 OK；临时副本 4 组 E2E |
 | 决策书 **4.3** | 发布包白名单与运行时数据边界：`RELEASE_TOP_LEVEL` + `_FORBIDDEN_IN_PACKAGE` + 快照清单；历史凭据核查结论 | `checks/test_release_check.py` 14 项；克隆内 4 组反例 + 空目录解压 |
-| 决策书 **4.2** | 任务生命周期统一（阶段二 2.15/2.16 落地）：`TaskService` 为唯一业务事实源，`JOBS` 降为前端视图；本轮补 7 条验收的固化测试 | `checks/test_task_acceptance.py` 12 项；`checks/test_task_service.py` 等任务相关 87 项 |
+| 决策书 **4.2** | 任务生命周期统一（阶段二 2.15/2.16 落地）：`TaskService` 为唯一业务事实源，`JOBS` 降为前端视图；7 条验收固化，并补齐 CLI 状态/取消及跨进程协作式取消 | `checks/test_task_acceptance.py` 13 项 + `checks/test_cli_task_control.py` 5 项；任务相关 97 项 |
 | 决策书 **4.6** | 外发审计前置，两条路径全覆盖：① Research 先写 `egress_attempt`、写不进不发、结束写 `egress_result`；② LLM 在唯一出口 `tools/llm_client.chat()` 上做总闸口（contextvar 决定归属，attempt → 调用 → result 配对，写不进抛 `LLMError` 不调用）；③ server 起 `review.py --llm` 子进程前登记，失败直接落 FAILED 不 `Popen`。日志只记元信息 | `checks/test_research_egress.py` 8 项；`checks/test_llm_egress.py` 13 项；临时副本 E2E：本地假模型 5 次调用 → 5 对 attempt/result（review_id/run_id 齐全、无原文）；审计不可写 → 0 次 HTTP、报告写明阻断 |
 | 决策书 **4.4** | 反证接入（A 档）：`EvidenceAssessorNode` 评估前先 `link_contradictions()`——被外部检索反驳的主张，其原文引用证据标 `CONTRADICTED` 并用 `contradicted_by` 指名外部证据；未被反驳的引用仍按原判定表评 | `checks/test_evidence_contradiction.py` 11 项 + `test_research_v1.py` 报告层 1 项；证据相关 111 项；全量 `checks` 966 OK |
 | 第二阶段 2.1–2.16 | 应用层 / 领域层 / 基础设施层拆分（`server.py` → 1849 行、`review.py` → 约 5000 行） | `docs/第二阶段整改任务单.md`；`tests` 686 OK |
@@ -64,7 +65,7 @@
 | 条目 | 现状 | 影响 |
 |---|---|---|
 | 4.1 双引擎 | v1 已是默认，但 Legacy 仍可运行、两套报告 schema 并存 | 新功能只进 v1；legacy 仅回滚/对照 |
-| 4.2 任务生命周期 | 已统一：`TaskService` 是唯一业务事实源，`JOBS` 仅前端视图（本轮 12 项验收固化）。剩余：CLI 没有取消/恢复入口，中断经 `except BaseException` 落 FAILED | 不影响状态一致性；CLI 运维体验与 Web 有差距 |
+| 4.2 任务生命周期 | 已统一：`TaskService` 是唯一业务事实源；CLI 已有状态/取消，跨进程取消经持久记录传到执行 token。剩余 **4.2-B**：CLI 尚无自动恢复/续跑入口；中断仍经 `except BaseException` 落 FAILED | 取消语义与状态查询已对齐 Web；自动恢复仍待实现 |
 | 4.4 证据可信度 | 已整改反证链路：被外部检索反驳的主张，其引用证据落 `CONTRADICTED` 并指名外部证据（不再是 VERIFIED）。剩余：supported 主张不产证据（样本②只能从 `research.supported` 段看出）、文本存在性仍与事实成立同轴（B 档未做） | 反证可见；「文档写过」与「事实成立」仍靠强度语义区分 |
 | 4.5 工具与能力层 | `tools/*` 与注册表工具两套并存，部分能力只在一边 | 行为分叉风险 |
 | 4.6 外发审计 | 已整改：Research 与 LLM 都是「先登记、写不进不发、结果配对」；LLM 的记录点在 `tools/llm_client.chat()`，CLI 在 `interfaces/cli/commands.py::_run_review` 设上下文、server 在 `server.py::_run_review_job` 起进程前登记。剩余：`state/egress.log` 没有轮转/容量策略 | 外发可追溯；日志长期增长需运维关注 |
@@ -76,9 +77,9 @@
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 公开不变量 | `python -m unittest discover -s checks` | **966 项 OK（skipped=11，约 30s）** |
-| 私有回归 | `python -m unittest discover -s tests` | **686 项 OK（skipped=1，约 408s）** |
-| 密钥扫描 | `python tools/secret_scan.py` | 264 文件 / 命中 0 |
+| 公开不变量 | `python -m unittest discover -s checks` | **972 项 OK（skipped=11，约 24s）** |
+| 私有回归 | `python -m unittest discover -s tests` | **686 项 OK（skipped=1，约 359s）** |
+| 密钥扫描 | `python tools/secret_scan.py` | 265 文件 / 命中 0 |
 | 账本守门 | `python tools/changelog_guard.py` | 退出 0 |
 | 发布检查 | `python tools/release_check.py --no-tests` | 快照 258 文件 / 3,766,759 字节 / 顶层 24 项 → 通过 |
 | 账本完整性 | `python tools/integrity.py verify` | 290 条记录（含 290 墓碑），链完整 |
@@ -88,7 +89,8 @@
 ## 7. 下一阶段任务（按决策书路线图）
 
 1. **阶段 1（消除双重事实来源）**：4.1 固定 V1 为唯一新功能入口、Legacy 冻结；
-   4.2 `TaskService` 已是唯一任务业务状态来源（本轮 12 项验收固化）；剩余 CLI 的取消/恢复入口。
+   4.2 `TaskService` 已是唯一任务业务状态来源，CLI 状态/跨进程取消已完成；
+   剩余 **4.2-B**：决定并实现从检查点自动恢复/续跑。
 2. **阶段 2（证据与外发）**：4.6 外发审计已完成（Research + LLM 两条路径同一约束：
    先登记、写不进不发、结果配对）；4.4 反证链路已接通（`CONTRADICTED` 可达），
    剩余「文本存在性 vs 事实核验」分轴（B 档，需决策是否把锚定降为 PARTIAL）。
