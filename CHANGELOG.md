@@ -42,6 +42,20 @@
 
 ---
 
+# 2026-11-15
+
+### 2026-11-15 · 修复 · 决策书 4.4-B：原文锚定不再等同事实核验
+
+- **文件**：`review_agent/runtime/nodes/evidence_assess.py`（证据语义判定表与结构化匹配门槛）；`checks/test_evidence_assessor.py`（锚定 PARTIAL、完整四项 VERIFIED）；`checks/test_evidence_contradiction.py`（未反驳引用 PARTIAL）；`docs/CURRENT_STATUS.md`
+- **改了什么**：
+  1. `QUOTE + ANCHORED` 无论有无字符位置，只把 `source_identity` 判为通过，明确为“文档写过这句话”；`subject / metric / period` 保持 `None`（无法判定），综合强度固定为 `PARTIAL`。
+  2. 只有证据已带完整四项 `MatchCheck` 且全部明确通过，才允许升级为 `VERIFIED`；外部来源还必须具备正文快照。
+  3. 删除把主体/指标/时间由 quote 自动置 True 的规则，避免“原文命中”被报告读成“现实事实成立”。
+  4. 反证链语义不变：`CONTRADICTED` 仍优先于其它强度；未反驳的普通引用从 `VERIFIED` 降为 `PARTIAL`。
+- **为什么**：原文引用只能回答“材料里有没有这句话”，不能回答来源可靠、主体一致、指标口径正确或时间范围匹配。旧实现借字符位置自动填满四项，直接违反 `Verification` 与 `EvidenceStrength` 正交设计，会让报告把文档陈述误标为事实已核验。
+- **验证**：`test_evidence_assessor` 9 项 OK（锚定 PARTIAL、三项未知、完整结构化匹配 VERIFIED）；`test_evidence_contradiction` 11 项 OK；`test_research_v1` 35 项 OK；证据相关专项 85 项 OK；全量 `checks` **993 项 OK（skipped=11）**；全量 `tests` **686 项 OK（skipped=1，约 404s）**；`compileall` 通过；`secret_scan` 267 文件 / 命中 0。报告 schema 未改。回滚：恢复旧锚定判定表与两处测试期望；历史报告不迁移。
+- **未完成**：当前没有生产者为主体/指标/时间提供真实结构化核验，因此普通合同/文档引用的 `VERIFIED` 基本不可达，这是保守结果。下一步需做 Evidence Gate 金标准评测，决定是否启用闸门及对历史 verdict 的影响。
+
 # 2026-11-14
 
 ### 2026-11-14 · 修改 · 决策书 4.1-A：双跑门槛校验代表样本与连续天数

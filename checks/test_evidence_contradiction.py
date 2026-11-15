@@ -166,14 +166,14 @@ class AssessorNodeTests(unittest.TestCase):
         self.assertEqual(stored["EV-0001"].verification,
                          Verification.ANCHORED)
 
-    def test_unrefuted_quote_stays_verified(self):
+    def test_unrefuted_quote_stays_partial(self):
         result = self._run(quote())
         self.assertTrue(result.success, result.errors)
         self.assertEqual(len(result.evidence_revisions), 1)
         self.assertIs(result.evidence_revisions[0].strength,
-                      EvidenceStrength.VERIFIED)
+                      EvidenceStrength.PARTIAL)
 
-    def test_two_findings_one_refuted_one_verified(self):
+    def test_two_findings_one_refuted_one_partial(self):
         result = self._run(
             quote(1, ("ISS-0001",)), external(2, ("ISS-0001",)),
             quote(3, ("ISS-0002",)),
@@ -182,7 +182,7 @@ class AssessorNodeTests(unittest.TestCase):
         stored = {item.id: item for item in result.evidence_revisions}
         self.assertIs(stored["EV-0001"].strength,
                       EvidenceStrength.CONTRADICTED)
-        self.assertIs(stored["EV-0003"].strength, EvidenceStrength.VERIFIED)
+        self.assertIs(stored["EV-0003"].strength, EvidenceStrength.PARTIAL)
 
 
 if __name__ == "__main__":

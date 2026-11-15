@@ -12,11 +12,13 @@ sys.path.insert(0, str(ROOT))
 from review_agent.domain import (  # noqa: E402
     STAGE_ORDER,
     Evidence,
+    EvidenceAssessment,
     EvidenceKind,
     EvidenceStrength,
     Finding,
     FindingOrigin,
     Location,
+    MatchCheck,
     ReviewProfile,
     RuleRef,
     Severity,
@@ -59,10 +61,15 @@ def external(**over):
 
 
 class AssessRuleTests(unittest.TestCase):
-    def test_quote_with_position_is_verified(self):
+    def test_quote_anchor_is_partial_not_fact_verified(self):
         result = assess_evidence(quote())
-        self.assertIs(result.strength, EvidenceStrength.VERIFIED)
-        self.assertTrue(result.assessment.all_passed)
+        self.assertIs(result.strength, EvidenceStrength.PARTIAL)
+        checks = result.assessment.by_kind()
+        self.assertTrue(checks["source_identity"].passed)
+        self.assertIsNone(checks["subject"].ok)
+        self.assertIsNone(checks["metric"].ok)
+        self.assertIsNone(checks["period"].ok)
+        self.assertFalse(result.assessment.all_passed)
 
     def test_quote_without_position_is_partial(self):
         result = assess_evidence(quote(location=Location("第 1 句", 1)))
@@ -77,6 +84,19 @@ class AssessRuleTests(unittest.TestCase):
         result = assess_evidence(external())
         self.assertIs(result.strength, EvidenceStrength.PARTIAL)
         self.assertFalse(result.assessment.all_passed)
+
+    def test_only_complete_structured_matches_are_verified(self):
+        complete = EvidenceAssessment(
+            assessed_by="structured-source-checker",
+            checks=tuple(MatchCheck(kind, True) for kind in (
+                "source_identity", "subject", "metric", "period")),
+        )
+        result = assess_evidence(quote(
+            strength=EvidenceStrength.VERIFIED,
+            verified_by="structured-source-checker",
+            assessment=complete))
+        self.assertIs(result.strength, EvidenceStrength.VERIFIED)
+        self.assertTrue(result.assessment.all_passed)
 
     def test_contradicted_is_preserved(self):
         result = assess_evidence(quote(contradicted_by=("EV-0002",)))
@@ -116,7 +136,7 @@ class NodeTests(unittest.TestCase):
 
         nxt = advance(state, Stage.EVIDENCE, result, required=frozenset())
         self.assertEqual([e.strength for e in nxt.evidence],
-                         [EvidenceStrength.VERIFIED, EvidenceStrength.PARTIAL])
+                         [EvidenceStrength.PARTIAL, EvidenceStrength.PARTIAL])
 
 
 if __name__ == "__main__":

@@ -10,10 +10,8 @@
     * 评估节点必须先于 CrossReview / 闸门，否则下游读到的是未评估证据。
 
 判定表（保守优先）：
-    QUOTE + ANCHORED + 字符位置
-        → VERIFIED（四项匹配由原文逐字命中与定位共同满足）
-    QUOTE + ANCHORED 但无字符位置
-        → PARTIAL（只能靠子串定位，主体/指标/时间口径没有结构化核验）
+    QUOTE + ANCHORED（无论是否有字符位置）
+        → PARTIAL（只证明「文档写过这句话」，主体/指标/时间口径仍为未判定）
     QUOTE + PLACEHOLDER / 其它
         → UNVERIFIED（占位引用不能当已核验）
     EXTERNAL_SOURCE 有来源
@@ -22,6 +20,9 @@
         → UNVERIFIED
     其它证据类型
         → UNVERIFIED（首次出现不应直接当 VERIFIED）
+
+真正可标 VERIFIED 的前提是证据已经带完整四项结构化匹配结果，且全部明确
+通过；仅有原文锚定绝不满足这个条件。
 
 已带 `contradicted_by` 的证据直接保持 CONTRADICTED：反证不是「更弱」，
 而是必须进入冲突处理。
@@ -59,13 +60,14 @@ def _assessment(*checks: MatchCheck) -> EvidenceAssessment:
     return EvidenceAssessment(checks=tuple(checks), assessed_by=ASSESSOR)
 
 
-def _quote_verified_checks() -> tuple[MatchCheck, ...]:
-    """原文逐字命中且可定位时，四项由引用本身承载。"""
+def _anchored_quote_checks() -> tuple[MatchCheck, ...]:
+    """锚定只确认文本存在性，不能替代主体/指标/时间/事实核验。"""
     return (
-        MatchCheck("source_identity", True, "quote 逐字命中待审原文"),
-        MatchCheck("subject", True, "主体由原文引用直接承载"),
-        MatchCheck("metric", True, "指标由原文引用直接承载"),
-        MatchCheck("period", True, "时间口径由原文引用直接承载"),
+        MatchCheck("source_identity", True,
+                   "quote 逐字命中待审原文（只证明文档写过这句话）"),
+        MatchCheck("subject", None, "文本存在不代表主体与事实对象一致"),
+        MatchCheck("metric", None, "文本存在不代表指标与事实口径一致"),
+        MatchCheck("period", None, "文本存在不代表时间范围与事实一致"),
     )
 
 
@@ -109,23 +111,20 @@ def assess_evidence(evidence: Evidence) -> Evidence:
     if evidence.contradicted_by:
         return replace(evidence, strength=EvidenceStrength.CONTRADICTED)
 
+    structured = bool(evidence.assessment and evidence.assessment.all_passed)
+    if (structured and evidence.kind is EvidenceKind.QUOTE
+            and evidence.verification is Verification.ANCHORED):
+        return replace(evidence, strength=EvidenceStrength.VERIFIED)
+    if (structured and evidence.kind is EvidenceKind.EXTERNAL_SOURCE
+            and evidence.source is not None and evidence.source.is_snapshot):
+        return replace(evidence, strength=EvidenceStrength.VERIFIED)
+
     if evidence.kind is EvidenceKind.QUOTE:
         if evidence.verification is Verification.ANCHORED:
-            if evidence.location.char_start is not None:
-                return replace(
-                    evidence,
-                    strength=EvidenceStrength.VERIFIED,
-                    assessment=_assessment(*_quote_verified_checks()),
-                )
             return replace(
                 evidence,
                 strength=EvidenceStrength.PARTIAL,
-                assessment=_assessment(
-                    MatchCheck("source_identity", True, "quote 逐字命中待审原文"),
-                    MatchCheck("subject", None, "缺少结构化主体核验"),
-                    MatchCheck("metric", None, "缺少结构化指标核验"),
-                    MatchCheck("period", None, "缺少结构化时间核验"),
-                ),
+                assessment=_assessment(*_anchored_quote_checks()),
             )
         return replace(
             evidence,
